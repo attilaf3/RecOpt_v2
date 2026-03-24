@@ -176,6 +176,7 @@ def build_aggregated_inputs(
         else:
             ut_prof = str(ut.get("profile")) if ut.get("profile") is not None else None
             ut_size = float(ut.get("size")) if ut.get("size") is not None else None
+            size_elh_sum += float(ut.get("size", 0.0))
             if ut_prof and ut_prof in df.columns and ut_size is not None:
                 base = _keep_15min(df[ut_prof].to_numpy())
                 p_el_heater_u = _norm_to_annual_energy(base, ut_size, dt=0.25)
@@ -268,10 +269,15 @@ def run_aggregated(
 
     print(f"[AGG] Háztartások száma: {data['n_household']}")
     print(f"[AGG] Összes BESS kapacitás [kWh]: {data['size_bess']:.3f}")
-    print(f"[AGG] Összes ELH teljesítmény [kW]: {data['size_elh']:.3f}")
+
     print(f"[AGG] Összes HSS térfogat [l]: {data['vol_hss_water']:.3f}")
 
     boiler_mode = "thermal_optimized" if use_hss else "electric_load"
+
+    if boiler_mode == "electric_load":
+        print(f"[AGG] Villamos bojler éves energia [kWh]: {data['size_elh']:.3f}")
+    else:
+        print(f"[AGG] Összes ELH teljesítmény [kW]: {data['size_elh']:.3f}")
 
     results, status, objective_detail, n_vars, n_cons, infeas_gap, sum_batt_to_grid = optimize_aggregated(
         p_pv=data["p_pv"],
@@ -331,7 +337,6 @@ def run_aggregated(
         "n_household": int(data["n_household"]),
         "valid_users": data["valid_users"],
         "size_bess_total_kwh": float(data["size_bess"]),
-        "size_elh_total_kw": float(data["size_elh"]),
         "vol_hss_water_total_l": float(data["vol_hss_water"]),
         "T_steps": int(len(data["p_pv"])),
         "dt_hours": 0.25,
@@ -339,6 +344,11 @@ def run_aggregated(
         "boiler_mode": boiler_mode,
         "out_dir": str(out.resolve()),
     }
+
+    if boiler_mode == "electric_load":
+        summary["electric_heater_annual_energy_total_kwh"] = float(data["size_elh"])
+    else:
+        summary["size_elh_total_kw"] = float(data["size_elh"])
 
     with open(out / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)

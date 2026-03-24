@@ -72,7 +72,7 @@ def optimize_aggregated(
     t_bess_min = kwargs.get("t_bess_min", 2.0)
     soc_bess_min = kwargs.get("soc_bess_min", 0.2)
     soc_bess_max = kwargs.get("soc_bess_max", 1.0)
-    soc_bess_init = kwargs.get("soc_bess_init", soc_bess_min)
+    soc_bess_init = kwargs.get("soc_bess_init", 0.5)
 
     # HSS / bojler
     eta_elh = kwargs.get("eta_elh", 1.0)
@@ -236,8 +236,8 @@ def optimize_aggregated(
             prob += p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in) / dt, f"{t}_HSS_max_out"
             prob += p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t]) / dt, f"{t}_HSS_max_in"
 
-            if t == 0:
-                prob += t_hss[t] == T_init, f"{t}_HSS_initial_temp"
+            # if t == 0:
+            #     prob += t_hss[t] == T_init, f"{t}_HSS_initial_temp"
 
     # Éves olcsó/drága tarifa felosztás
     total_import_energy = pulp.lpSum([p_grid_out[t] * dt for t in time_set])
