@@ -32,7 +32,6 @@ def optimize_multi_users_economic(
     dt=1.0,
     size_elh=None,          # scalar or shape (U,)
     size_bess=None,         # scalar or shape (U,)
-    size_hss=None,          # kept for API compatibility
     vol_hss_water=None,     # scalar or shape (U,)
     **kwargs
 ):
@@ -231,7 +230,9 @@ def optimize_multi_users_economic(
         for u in users:
             # PV split
             prob += (
-                p_pv_load[t][u] + p_pv_bess[t][u] + p_pv_rec[t][u] + p_pv_grid[t][u] == p_pv[t, u]
+                    p_pv_load[t][u] + p_pv_bess[t][u] + p_pv_rec[t][u] + p_pv_grid[t][u] + (
+                p_pv_elh[t][u] if hss_flag else 0)
+                    == p_pv[t, u]
             ), f"{t}_{u}_pv_split"
 
             # Battery availability
@@ -565,6 +566,13 @@ def optimize_multi_users_economic(
 
     objective = float(pulp.value(prob.objective))
 
+    # Community-level aggregated battery series (1D, summed across users)
+    p_grid_bess_total_v = np.sum(p_grid_bess_v, axis=1)
+    p_bess_in_total_v = np.sum(p_bess_in_v, axis=1)
+    p_bess_out_total_v = np.sum(p_bess_out_v, axis=1)
+    e_bess_total_v = np.sum(e_bess_v, axis=1)
+    d_bess_any_v = (np.sum(d_bess_v, axis=1) > 0).astype(float)
+
     results = dict(
         # inputs
         p_pv=p_pv,
@@ -638,6 +646,18 @@ def optimize_multi_users_economic(
         total_grid_export_revenue=float(np.sum(grid_export_revenue_user)),
         total_bess_cycle_cost=float(np.sum(bess_cycle_cost_user)),
         objective=objective,
+
+        # aliases expected by caller
+        p_grid_in=p_grid_import_v,
+        p_grid_out=p_grid_export_v,
+
+        # community aggregated battery series
+        p_grid_bess_total=p_grid_bess_total_v,
+        p_bess_in_total=p_bess_in_total_v,
+        p_bess_out_total=p_bess_out_total_v,
+        e_bess_total=e_bess_total_v,
+        d_bess_any=d_bess_any_v,
+
     )
 
     if hss_flag:

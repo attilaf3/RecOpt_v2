@@ -266,18 +266,22 @@ def run_aggregated(
         pv_ratio=pv_ratio,
         use_hss=use_hss,
     )
+    c_hss = 0.00116667  # kWh / kg / °C
+    e_hss_stor_max_theoretical = (
+        data["vol_hss_water"] * c_hss * (data["agg_hss"]["T_max"] - data["agg_hss"]["T_in"])
+        if use_hss else 0.0
+    )
 
     print(f"[AGG] Háztartások száma: {data['n_household']}")
     print(f"[AGG] Összes BESS kapacitás [kWh]: {data['size_bess']:.3f}")
 
-    print(f"[AGG] Összes HSS térfogat [l]: {data['vol_hss_water']:.3f}")
-
     boiler_mode = "thermal_optimized" if use_hss else "electric_load"
-
     if boiler_mode == "electric_load":
         print(f"[AGG] Villamos bojler éves energia [kWh]: {data['size_elh']:.3f}")
     else:
+        print(f"[AGG] Összes HSS térfogat [l]: {data['vol_hss_water']:.3f}")
         print(f"[AGG] Összes ELH teljesítmény [kW]: {data['size_elh']:.3f}")
+        print(f"[AGG] HSS elméleti max tárolt energia [kWh]: {e_hss_stor_max_theoretical:.3f}")
 
     results, status, objective_detail, n_vars, n_cons, infeas_gap, sum_batt_to_grid = optimize_aggregated(
         p_pv=data["p_pv"],
