@@ -29,7 +29,7 @@ def optimize_multi_users_economic(
     p_ue,                   # shape (T, U)
     p_dhw=None,             # shape (T, U), optional
     p_el_heater=None,       # shape (T, U), only used if hss_flag=False
-    dt=1.0,
+    dt=0.25,
     size_elh=None,          # scalar or shape (U,)
     size_bess=None,         # scalar or shape (U,)
     vol_hss_water=None,     # scalar or shape (U,)
@@ -118,9 +118,6 @@ def optimize_multi_users_economic(
 
     # Annual / horizon low-tariff cap per user [kWh]
     grid_low_cap_kwh = _as_vec(kwargs.get("grid_low_cap_kwh", 2523.0), U)
-
-    # Optional battery throughput degradation cost [Ft/kWh throughput]
-    price_bess_cycle = kwargs.get("price_bess_cycle", 0.0)
 
     # -------------------------------------------------------------------------
     # Solver params
@@ -361,29 +358,29 @@ def optimize_multi_users_economic(
             prob += p_grid_import[t] <= M_grid * d_grid[t], f"{t}_grid_import_gate"
             prob += p_grid_export[t] <= M_grid * (1 - d_grid[t]), f"{t}_grid_export_gate"
 
-    # -------------------------------------------------------------------------
-    # Daily ELH optional rules (only if explicitly requested)
-    # -------------------------------------------------------------------------
-    if hss_flag and enforce_daily_cl_rules and not run_lp:
-        n_timesteps_in_a_day = round(24 / dt)
-        assert abs(n_timesteps_in_a_day * dt - 24) < 1e-9, "dt must divide 24h exactly for daily CL rules"
-
-        y_middle_day = [0] * int(round(10 / dt)) + [1] * int(round(6 / dt)) + [0] * (n_timesteps_in_a_day - int(round(16 / dt)))
-        y_middle_day = y_middle_day[:n_timesteps_in_a_day]
-
-        max_on_steps = kwargs.get("cl_max_on_hours_per_day", 12.0) / dt
-        min_mid_steps = kwargs.get("cl_min_midday_hours_per_day", 4.0) / dt
-
-        for j in range(0, T, n_timesteps_in_a_day):
-            day_idx = range(j, min(j + n_timesteps_in_a_day, T))
-            if len(list(day_idx)) < n_timesteps_in_a_day:
-                continue
-
-            for u in users:
-                if not hss_active_u[u]:
-                    continue
-                prob += pulp.lpSum(d_cl[t][u] for t in day_idx) <= max_on_steps, f"day_{j}_{u}_cl_maxon"
-                prob += pulp.lpSum(d_cl[t][u] * y_middle_day[t - j] for t in day_idx) >= min_mid_steps, f"day_{j}_{u}_cl_midmin"
+    # # -------------------------------------------------------------------------
+    # # Daily ELH optional rules (only if explicitly requested)
+    # # -------------------------------------------------------------------------
+    # if hss_flag and enforce_daily_cl_rules and not run_lp:
+    #     n_timesteps_in_a_day = round(24 / dt)
+    #     assert abs(n_timesteps_in_a_day * dt - 24) < 1e-9, "dt must divide 24h exactly for daily CL rules"
+    #
+    #     y_middle_day = [0] * int(round(10 / dt)) + [1] * int(round(6 / dt)) + [0] * (n_timesteps_in_a_day - int(round(16 / dt)))
+    #     y_middle_day = y_middle_day[:n_timesteps_in_a_day]
+    #
+    #     max_on_steps = kwargs.get("cl_max_on_hours_per_day", 12.0) / dt
+    #     min_mid_steps = kwargs.get("cl_min_midday_hours_per_day", 4.0) / dt
+    #
+    #     for j in range(0, T, n_timesteps_in_a_day):
+    #         day_idx = range(j, min(j + n_timesteps_in_a_day, T))
+    #         if len(list(day_idx)) < n_timesteps_in_a_day:
+    #             continue
+    #
+    #         for u in users:
+    #             if not hss_active_u[u]:
+    #                 continue
+    #             prob += pulp.lpSum(d_cl[t][u] for t in day_idx) <= max_on_steps, f"day_{j}_{u}_cl_maxon"
+    #             prob += pulp.lpSum(d_cl[t][u] * y_middle_day[t - j] for t in day_idx) >= min_mid_steps, f"day_{j}_{u}_cl_midmin"
 
     # -------------------------------------------------------------------------
     # Tariff block constraints
@@ -404,9 +401,9 @@ def optimize_multi_users_economic(
     # -------------------------------------------------------------------------
     # Initial SOC anchoring
     # -------------------------------------------------------------------------
-    for u in users:
-        if bess_active_u[u]:
-            prob += e_bess[0][u] == size_bess_u[u] * soc_bess_init[u], f"{u}_bess_init"
+    # for u in users:
+    #     if bess_active_u[u]:
+    #         prob += e_bess[0][u] == size_bess_u[u] * soc_bess_init[u], f"{u}_bess_init"
 
     # -------------------------------------------------------------------------
     # Objective: total net community cost [Ft]
@@ -433,29 +430,13 @@ def optimize_multi_users_economic(
         for t in time_set for u in users
     )
 
-    cost_bess_cycle = pulp.lpSum(
-        price_bess_cycle * (p_bess_in[t][u] + p_bess_out[t][u]) * dt
-        for t in time_set for u in users
-    )
 
-    prob += cost_grid + cost_rec_buy + cost_bess_cycle - revenue_rec_sell - revenue_grid_export
+    prob += cost_grid + cost_rec_buy - revenue_rec_sell - revenue_grid_export
 
     # -------------------------------------------------------------------------
     # Solve
     # -------------------------------------------------------------------------
-    if solver_name.upper() == "GUROBI":
-        solver = pulp.GUROBI_CMD(
-            msg=msg,
-            gapRel=gapRel,
-            timeLimit=timeLimit
-        )
-    else:
-        solver = pulp.PULP_CBC_CMD(
-            msg=msg,
-            gapRel=gapRel,
-            timeLimit=timeLimit
-        )
-
+    solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
     status = prob.solve(solver)
 
     # Accept optimal, and also feasible incumbents if solver stops early
@@ -554,12 +535,9 @@ def optimize_multi_users_economic(
     rec_sell_revenue_user = price_rec_sell * rec_sell_energy_user
     grid_export_revenue_user = price_pv_grid * grid_export_energy_user
 
-    bess_cycle_cost_user = price_bess_cycle * np.sum(p_bess_in_v + p_bess_out_v, axis=0) * dt
-
     net_cost_user = (
         grid_cost_user +
         rec_buy_cost_user +
-        bess_cycle_cost_user -
         rec_sell_revenue_user -
         grid_export_revenue_user
     )
@@ -636,7 +614,6 @@ def optimize_multi_users_economic(
         rec_buy_cost_user=rec_buy_cost_user,
         rec_sell_revenue_user=rec_sell_revenue_user,
         grid_export_revenue_user=grid_export_revenue_user,
-        bess_cycle_cost_user=bess_cycle_cost_user,
         net_cost_user=net_cost_user,
 
         # totals
@@ -644,7 +621,6 @@ def optimize_multi_users_economic(
         total_rec_buy_cost=float(np.sum(rec_buy_cost_user)),
         total_rec_sell_revenue=float(np.sum(rec_sell_revenue_user)),
         total_grid_export_revenue=float(np.sum(grid_export_revenue_user)),
-        total_bess_cycle_cost=float(np.sum(bess_cycle_cost_user)),
         objective=objective,
 
         # aliases expected by caller
@@ -688,7 +664,6 @@ def optimize_multi_users_economic(
         "rec_buy_cost_Ft": rec_buy_cost_user,
         "rec_sell_revenue_Ft": rec_sell_revenue_user,
         "grid_export_revenue_Ft": grid_export_revenue_user,
-        "bess_cycle_cost_Ft": bess_cycle_cost_user,
         "net_cost_Ft": net_cost_user,
     })
     results["user_summary"] = user_summary

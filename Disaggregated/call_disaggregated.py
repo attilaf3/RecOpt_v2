@@ -316,7 +316,7 @@ def run(
         a_hss=a_hss_u,
         eta_elh=eta_elh_u,
         run_lp=run_lp,
-        msg=False,
+        msg=True,
         gapRel=0.01,
         timeLimit=None,
         t_hss_min_in=t_hss_min_in_u,
