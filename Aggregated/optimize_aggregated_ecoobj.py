@@ -91,6 +91,28 @@ def optimize_aggregated(
     c_export = kwargs.get("c_export", 5.0)
     annual_cheap_limit_kwh = kwargs.get("annual_cheap_limit_kwh", 2523.0 * n_household)
 
+    # Controlled-load / bojler vezérlés (15 perces felbontásra skálázva)
+    n_timesteps_in_a_day = int(round(24 / dt))
+    cl_min_on_hours = kwargs.get("cl_min_on_hours", 2.0)       # legalább 2 óra egy bekapcsolás után
+    cl_max_on_hours_per_day = kwargs.get("cl_max_on_hours_per_day", 12.0)
+    cl_midday_min_hours = kwargs.get("cl_midday_min_hours", 4.0)
+
+    cl_midday_start_hour = kwargs.get("cl_midday_start_hour", 10.0)
+    cl_midday_end_hour = kwargs.get("cl_midday_end_hour", 16.0)
+
+    cl_min_on_steps = int(round(cl_min_on_hours / dt))
+    cl_max_on_steps_per_day = int(round(cl_max_on_hours_per_day / dt))
+    cl_midday_min_steps = int(round(cl_midday_min_hours / dt))
+
+    midday_start_step = int(round(cl_midday_start_hour / dt))
+    midday_end_step = int(round(cl_midday_end_hour / dt))
+
+    y_middle_day = (
+        [0] * midday_start_step
+        + [1] * max(0, midday_end_step - midday_start_step)
+        + [0] * max(0, n_timesteps_in_a_day - midday_end_step)
+    )
+
     # Solver
     msg = kwargs.get("msg", True)
     gapRel = kwargs.get("gapRel", None)
@@ -158,6 +180,8 @@ def optimize_aggregated(
         p_hss_out = [pulp.LpVariable(f"Phss_out_{t}", lowBound=0) for t in time_set]
         e_hss_stor = [pulp.LpVariable(f"Ehss_stor_{t}", lowBound=0) for t in time_set]
         t_hss = [pulp.LpVariable(f"Thss_{t}", lowBound=T_min, upBound=T_max) for t in time_set]
+        # ELH + HSS vezérlés
+        d_cl = [pulp.LpVariable(f"Dcl_{t}", cat=pulp.LpBinary) if hss_flag and not run_lp else 0 for t in time_set]
 
     # Éves tarifa bontás
     e_grid_import_cheap = pulp.LpVariable("Egrid_import_cheap", lowBound=0)
@@ -220,7 +244,10 @@ def optimize_aggregated(
         # HSS / ELH
         if hss_flag:
             prob += p_elh_out[t] == eta_elh * p_elh_in[t], f"{t}_ELH_constitutive"
-            prob += p_elh_in[t] <= size_elh, f"{t}_ELH_max"
+            if run_lp:
+                prob += p_elh_in[t] <= size_elh, f"{t}_ELH_max"
+            else:
+                prob += p_elh_in[t] <= size_elh * d_cl[t], f"{t}_ELH_signal"
 
             prob += p_hss_in[t] == p_elh_out[t], f"{t}_ELH_to_HSS"
             prob += p_hss_out[t] == float(p_dhw[t]), f"{t}_DHW_supply"
@@ -238,6 +265,30 @@ def optimize_aggregated(
 
             # if t == 0:
             #     prob += t_hss[t] == T_init, f"{t}_HSS_initial_temp"
+
+    # ------------------------------------------------------------------
+    # Controlled-load / bojler kapcsolási logika
+    # ------------------------------------------------------------------
+    if hss_flag and not run_lp:
+        # Minimum on-time: ha bekapcsol, legalább cl_min_on_steps ideig maradjon bekapcsolva
+        for t in range(1, n_timestep):
+            startup = d_cl[t] - d_cl[t - 1]
+            if t + cl_min_on_steps <= n_timestep:
+                prob += pulp.lpSum(d_cl[k] for k in range(t, t + cl_min_on_steps)) >= cl_min_on_steps * startup, \
+                    f"{t}_CL_min_on_time"
+
+        # Napi maximum összes bekapcsolt idő + napi minimum a középső napszakban
+        for j in range(0, n_timestep, n_timesteps_in_a_day):
+            day_end = min(j + n_timesteps_in_a_day, n_timestep)
+            day_len = day_end - j
+
+            prob += pulp.lpSum(d_cl[t] for t in range(j, day_end)) <= cl_max_on_steps_per_day, \
+                f"day_{j}_CL_daily_max"
+
+            # csak teljes napra erőltessük a nappali minimumot
+            if day_len == n_timesteps_in_a_day:
+                prob += pulp.lpSum(d_cl[t] * y_middle_day[t - j] for t in range(j, day_end)) >= cl_midday_min_steps, \
+                    f"day_{j}_CL_midday_min"
 
     # Éves olcsó/drága tarifa felosztás
     total_import_energy = pulp.lpSum([p_grid_out[t] * dt for t in time_set])
@@ -309,6 +360,7 @@ def optimize_aggregated(
             p_hss_out[t] = _val(p_hss_out[t])
             e_hss_stor[t] = _val(e_hss_stor[t])
             t_hss[t] = _val(t_hss[t])
+            d_cl[t] = _val(d_cl[t])
 
     cheap_import_kwh = _val(e_grid_import_cheap)
     expensive_import_kwh = _val(e_grid_import_expensive)
@@ -328,6 +380,7 @@ def optimize_aggregated(
         p_hss_out = np.zeros(n_timestep)
         e_hss_stor = np.zeros(n_timestep)
         t_hss = np.zeros(n_timestep)
+        d_cl = np.zeros(n_timestep)
     else:
         p_elh_in = np.array(p_elh_in, dtype=float)
         p_elh_out = np.array(p_elh_out, dtype=float)
@@ -335,6 +388,7 @@ def optimize_aggregated(
         p_hss_out = np.array(p_hss_out, dtype=float)
         e_hss_stor = np.array(e_hss_stor, dtype=float)
         t_hss = np.array(t_hss, dtype=float)
+        d_cl = np.array(d_cl, dtype=float)
 
     p_total_load = p_ue + (p_el_heater if boiler_mode == "electric_load" else p_elh_in)
     p_self_consumed_pv = np.array(p_pv_load) + np.array(p_pv_bess)
@@ -375,6 +429,7 @@ def optimize_aggregated(
 
         d_bess=np.array(d_bess, dtype=float),
         d_grid=np.array(d_grid, dtype=float),
+        d_cl=np.array(d_cl, dtype=float),
     )
 
     annual_export_energy = float(np.sum(results["p_grid_in"]) * dt)
