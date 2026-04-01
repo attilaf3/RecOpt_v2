@@ -21,7 +21,12 @@ dist/
 
 # Logs
 *.log
+*.lp
 
 # OS files
 .DS_Store
 Thumbs.db
+/Inputs/
+/Discard/
+results_*/
+run_*
