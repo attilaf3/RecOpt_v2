@@ -271,6 +271,7 @@ def run_case(
     pv_ratio: float,
     include_bess: bool,
     include_boiler: bool,
+    bess_share_pct: float = 100.0,
 ):
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
@@ -323,11 +324,31 @@ def run_case(
     ts_p_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
 
+    pv_annual_kwh = p_pv.sum(axis=0) * DT
+    has_pv_arr = pv_annual_kwh > 1e-9
+
+    bess_enabled_arr = np.zeros(len(user_names), dtype=bool)
+
+    if include_bess:
+        pv_user_idx = np.where(has_pv_arr)[0]
+        n_pv_users = len(pv_user_idx)
+
+        n_bess_users = int(round(n_pv_users * bess_share_pct / 100.0))
+        n_bess_users = max(0, min(n_bess_users, n_pv_users))
+
+        # egyszerű, determinisztikus megoldás:
+        # az első n darab PV-s háztartás kap BESS-t
+        bess_enabled_arr[pv_user_idx[:n_bess_users]] = True
+
+        print(f"[INFO] PV-s háztartások száma: {n_pv_users}")
+        print(f"[INFO] BESS arány: {bess_share_pct}%")
+        print(f"[INFO] BESS-t kapó PV-s háztartások száma: {n_bess_users}")
+
     for u in range(U):
         sim = simulate_one_user_greedy(
             p_load=p_total_load[:, u],
             p_pv=p_pv[:, u],
-            use_bess=include_bess,
+            use_bess=bool(bess_enabled_arr[u]),
             bess_size_kwh=float(size_bess[u]),
             eta_bess_in=float(eta_bess_in_u[u]),
             eta_bess_out=float(eta_bess_out_u[u]),
@@ -346,11 +367,11 @@ def run_case(
         rows.append({
             "user_name": user_names[u],
             "has_pv": bool((p_pv[:, u].sum() * DT) > 1e-9),
-            "has_bess": bool(include_bess and size_bess[u] > 1e-9),
+            "has_bess": bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
             "has_boiler": bool(include_boiler and (p_boiler[:, u].sum() * DT) > 1e-9),
             "group_label": (
-                "PV+BESS" if ((p_pv[:, u].sum() * DT) > 1e-9 and include_bess and size_bess[u] > 1e-9)
-                else "PV" if ((p_pv[:, u].sum() * DT) > 1e-9)
+                "PV+BESS" if (has_pv_arr[u] and bess_enabled_arr[u] and size_bess[u] > 1e-9)
+                else "PV" if has_pv_arr[u]
                 else "Nincs PV"
             ),
             "base_load_kwh": base_load_kwh,
@@ -405,6 +426,9 @@ def run_case(
         "import_cost_ft": float(per_user_df["import_cost_ft"].sum()),
         "export_revenue_ft": float(per_user_df["export_revenue_ft"].sum()),
         "net_bill_ft": float(per_user_df["net_bill_ft"].sum()),
+        "bess_share_pct": float(bess_share_pct),
+        "pv_user_count": int(has_pv_arr.sum()),
+        "bess_enabled_user_count": int(bess_enabled_arr.sum()),
     }
 
     total["self_consumption_ratio"] = (
