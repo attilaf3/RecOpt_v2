@@ -25,6 +25,8 @@ def individual_opt_boiler(
     enforce_cl_rules=True,
     cl_max_on_hours_per_day=8.0,
     cl_min_midday_hours_per_day=4.0,
+    gapRel=None,
+    timeLimit=None,
 ):
     """
     Egy háztartás optimalizálása:
@@ -160,7 +162,7 @@ def individual_opt_boiler(
     # = import + export
     prob += pulp.lpSum((p_grid_load[t] + p_grid_elh[t] + p_pv_grid[t]) * dt for t in time_set)
 
-    solver = pulp.GUROBI_CMD(msg=msg)
+    solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
     status = prob.solve(solver)
 
     status_str = pulp.LpStatus[status]
