@@ -4,3 +4,4 @@ numpy
 PuLP
 gurobipy
 PyYAML
+scipy
