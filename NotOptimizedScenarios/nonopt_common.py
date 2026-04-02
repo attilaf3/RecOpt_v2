@@ -17,17 +17,47 @@ HIGH_TARIFF_FT_PER_KWH = 71.0
 EXPORT_FT_PER_KWH = 5.0
 
 
-def calc_bill(grid_import_kwh: float, injection_kwh: float) -> dict:
-    e_low = min(grid_import_kwh, LOW_TARIFF_LIMIT_KWH)
-    e_high = max(grid_import_kwh - LOW_TARIFF_LIMIT_KWH, 0.0)
+def calc_bill_15min_brutto(p_grid_to_load: np.ndarray, p_inj: np.ndarray, dt: float = 0.25) -> dict:
+    """
+    15 perces bruttó elszámolás.
+    - minden időlépésben külön számoljuk az importot és exportot
+    - export bevétel: 5 Ft/kWh
+    - import díj: 36 Ft/kWh 2523 kWh/év-ig, utána 71 Ft/kWh
 
-    import_cost_ft = e_low * LOW_TARIFF_FT_PER_KWH + e_high * HIGH_TARIFF_FT_PER_KWH
-    export_revenue_ft = injection_kwh * EXPORT_FT_PER_KWH
+    Fontos:
+    itt az ársávos importot éves kumulált import alapján követjük,
+    de maga az elszámolás 15 perces bruttó energiacserére épül.
+    """
+
+    p_grid_to_load = np.asarray(p_grid_to_load, dtype=float)
+    p_inj = np.asarray(p_inj, dtype=float)
+
+    e_import_steps = np.maximum(p_grid_to_load, 0.0) * dt
+    e_export_steps = np.maximum(p_inj, 0.0) * dt
+
+    remaining_low = LOW_TARIFF_LIMIT_KWH
+    import_cost_ft = 0.0
+
+    e_grid_low = 0.0
+    e_grid_high = 0.0
+
+    for e_imp in e_import_steps:
+        low_part = min(e_imp, max(remaining_low, 0.0))
+        high_part = max(e_imp - low_part, 0.0)
+
+        import_cost_ft += low_part * LOW_TARIFF_FT_PER_KWH
+        import_cost_ft += high_part * HIGH_TARIFF_FT_PER_KWH
+
+        e_grid_low += low_part
+        e_grid_high += high_part
+        remaining_low -= low_part
+
+    export_revenue_ft = e_export_steps.sum() * EXPORT_FT_PER_KWH
     net_bill_ft = import_cost_ft - export_revenue_ft
 
     return {
-        "grid_import_low_kwh": e_low,
-        "grid_import_high_kwh": e_high,
+        "grid_import_low_kwh": e_grid_low,
+        "grid_import_high_kwh": e_grid_high,
         "import_cost_ft": import_cost_ft,
         "export_revenue_ft": export_revenue_ft,
         "net_bill_ft": net_bill_ft,
@@ -118,7 +148,11 @@ def simulate_one_user_greedy(
     grid_import_kwh = p_grid_to_load.sum() * DT
     injection_kwh = p_inj.sum() * DT
 
-    bill = calc_bill(grid_import_kwh=grid_import_kwh, injection_kwh=injection_kwh)
+    bill = calc_bill_15min_brutto(
+        p_grid_to_load=p_grid_to_load,
+        p_inj=p_inj,
+        dt=DT,
+    )
 
     self_consumed_pv_kwh = pv_to_load_kwh + pv_to_bess_kwh
     self_consumption_ratio = self_consumed_pv_kwh / pv_kwh if pv_kwh > 1e-12 else 0.0
