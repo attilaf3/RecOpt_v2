@@ -108,7 +108,7 @@ def individual_opt_boiler(
             # Hőtároló dinamika
             prob += (
                 vol_hss_water * c_hss * (t_hss[k] - t_hss[t])
-                == (p_hss_in[t] - p_hss_out[t] - a_hss * (t_hss[t] - T_env)) * dt
+                == p_hss_in[t] - p_hss_out[t] - a_hss * (t_hss[t] - T_env) * dt
             ), f"hss_balance_{t}"
 
             # következő lépésben kivehető max hő
