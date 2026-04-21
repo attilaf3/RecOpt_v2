@@ -170,7 +170,7 @@ def build_inputs(
             # DHW profil: liter → kW (kWh/h), órára aggregálva
             if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
                 base_L_per_step = dhw[str(hss["profile"])].to_numpy()  # L per 15 perc (vagy amit a CSV tartalmaz)
-                base_L_per_h = _keep_15min(base_L_per_step)  # → L/h
+                base_L_per_h = _keep_15min(base_L_per_step)  # → L/ 15perc
                 RHO_WATER_KG_PER_L = 1.0
                 CP_WATER_J_PER_KGK = 4186.0
                 J_PER_KWH = 3_600_000.0
@@ -181,7 +181,7 @@ def build_inputs(
                 dT = max(0.0, T_out - T_in)
 
                 e_kwh_per_step = base_L_per_step * KWH_PER_L_PER_K * dT
-                pth_kW = e_kwh_per_step / 0.25
+                pth_kW = e_kwh_per_step #ez legyen kWh
                 dhw_cols.append(pth_kW.astype(float))
             else:
                 dhw_cols.append(np.zeros(35040, dtype=float))
@@ -342,18 +342,18 @@ def run(
             "household": name,
             "has_pv": int(np.sum(p_pv[:, u]) > 1e-9),
             "has_boiler": int((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9)),
-            "pv_gen_kwh": float(np.sum(p_pv[:, u]) * 0.25),
-            "load_kwh": float(np.sum(p_ue[:, u]) * 0.25),
-            "dhw_kwh_th": float(np.sum(p_dhw[:, u]) * 0.25),
+            "pv_gen_kwh": float(np.sum(p_pv[:, u])),
+            "load_kwh": float(np.sum(p_ue[:, u])),
+            "dhw_kwh_th": float(np.sum(p_dhw[:, u])),
             "grid_import_low_kwh": res["e_grid_low"],
             "grid_import_high_kwh": res["e_grid_high"],
             "grid_import_total_kwh": res["e_grid_total"],
             "grid_export_kwh": res["e_grid_export"],
-            "pv_to_load_kwh": float(np.sum(res["p_pv_load"]) * 0.25),
-            "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"]) * 0.25),
-            "grid_to_load_kwh": float(np.sum(res["p_grid_load"]) * 0.25),
-            "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"]) * 0.25),
-            "boiler_el_input_kwh": float(np.sum(res["p_elh_in"]) * 0.25),
+            "pv_to_load_kwh": float(np.sum(res["p_pv_load"])),
+            "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"])),
+            "grid_to_load_kwh": float(np.sum(res["p_grid_load"])),
+            "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"])),
+            "boiler_el_input_kwh": float(np.sum(res["p_elh_in"])),
             "final_hss_energy_kwh": float(res["e_hss_stor"][-1]) if len(res["e_hss_stor"]) else 0.0,
             "objective_grid_interaction_kwh": res["objective_grid_interaction_kwh"],
             "status": res["status"],

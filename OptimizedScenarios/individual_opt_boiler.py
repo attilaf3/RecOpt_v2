@@ -27,6 +27,7 @@ def individual_opt_boiler(
     cl_min_midday_hours_per_day=4.0,
     gapRel=None,
     timeLimit=None,
+    objective="economic"
 ):
     """
     Egy háztartás optimalizálása:
@@ -65,7 +66,7 @@ def individual_opt_boiler(
 
     # HSS / ELH
     if hss_active:
-        p_elh_in = [pulp.LpVariable(f"p_elh_in_{t}", lowBound=0, upBound=size_elh) for t in time_set]
+        p_elh_in = [pulp.LpVariable(f"p_elh_in_{t}", lowBound=0, upBound=size_elh*dt) for t in time_set]
         p_hss_in = [pulp.LpVariable(f"p_hss_in_{t}", lowBound=0) for t in time_set]
         p_hss_out = [pulp.LpVariable(f"p_hss_out_{t}", lowBound=0) for t in time_set]
         t_hss = [pulp.LpVariable(f"t_hss_{t}", lowBound=T_min, upBound=T_max) for t in time_set]
@@ -78,8 +79,10 @@ def individual_opt_boiler(
         d_cl = [0.0] * T
 
     # Tarifa blokk
-    e_grid_low = pulp.LpVariable("e_grid_low", lowBound=0)
-    e_grid_high = pulp.LpVariable("e_grid_high", lowBound=0)
+    # 15 perces bruttó elszámolás
+    e_grid_low_step = [pulp.LpVariable(f"e_grid_low_step_{t}", lowBound=0) for t in time_set]
+    e_grid_high_step = [pulp.LpVariable(f"e_grid_high_step_{t}", lowBound=0) for t in time_set]
+    rem_low = [pulp.LpVariable(f"rem_low_{t}", lowBound=0, upBound=grid_low_cap_kwh) for t in time_set]
 
     for t in time_set:
         k = (t + 1) % T
@@ -110,16 +113,16 @@ def individual_opt_boiler(
 
             # következő lépésben kivehető max hő
             prob += (
-                p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in) / dt
+                p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in)
             ), f"hss_max_out_{t}"
 
             # töltési hely
             prob += (
-                p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t]) / dt
+                p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t])
             ), f"hss_charge_space_{t}"
 
             if not run_lp:
-                prob += p_elh_in[t] <= size_elh * d_cl[t], f"elh_onoff_{t}"
+                prob += p_elh_in[t] <= size_elh * dt * d_cl[t], f"elh_onoff_{t}"
 
             if not run_lp and t != 0 and t != T - 1:
                 prob += d_cl[t + 1] >= d_cl[t] - d_cl[t - 1], f"cl_min_on_time_{t}"
@@ -128,6 +131,17 @@ def individual_opt_boiler(
             prob += p_pv_elh[t] == 0, f"no_hss_pv_elh_{t}"
             prob += p_grid_elh[t] == 0, f"no_hss_grid_elh_{t}"
 
+        # 15 perces import felosztása kedvezményes és piaci részre
+        e_imp_t = p_grid_load[t] + p_grid_elh[t]
+
+        prob += e_grid_low_step[t] + e_grid_high_step[t] == e_imp_t, f"grid_step_split_{t}"
+
+        if t == 0:
+            prob += rem_low[t] == grid_low_cap_kwh - e_grid_low_step[t], "rem_low_init"
+            prob += e_grid_low_step[t] <= grid_low_cap_kwh, f"grid_low_step_cap_{t}"
+        else:
+            prob += rem_low[t] == rem_low[t - 1] - e_grid_low_step[t], f"rem_low_balance_{t}"
+            prob += e_grid_low_step[t] <= rem_low[t - 1], f"grid_low_step_cap_{t}"
 
     if hss_active and enforce_cl_rules and not run_lp:
         n_timesteps_in_a_day = round(24 / dt)
@@ -152,15 +166,18 @@ def individual_opt_boiler(
             prob += pulp.lpSum(d_cl[t] for t in day_idx) <= max_on_steps, f"day_{j}_cl_maxon"
             prob += pulp.lpSum(d_cl[t] * y_middle_day[t - j] for t in day_idx) >= min_mid_steps, f"day_{j}_cl_midmin"
 
+    if objective == "economic":
+        cost_grid = pulp.lpSum(
+            price_grid_low * e_grid_low_step[t] + price_grid_high * e_grid_high_step[t]
+            for t in time_set
+        )
+        revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] for t in time_set)
+        prob += cost_grid - revenue_export
+    elif objective == "grid":
+        prob += pulp.lpSum((p_grid_load[t] + p_grid_elh[t] + p_pv_grid[t]) for t in time_set)
+    else:
+        raise ValueError("objective must be 'economic' or 'grid'")
 
-    # Grid energia blokk
-    total_grid_energy = pulp.lpSum((p_grid_load[t] + p_grid_elh[t]) * dt for t in time_set)
-    prob += e_grid_low + e_grid_high == total_grid_energy, "grid_block_sum"
-    prob += e_grid_low <= grid_low_cap_kwh, "grid_low_cap"
-
-    # Célfüggvény: hálózati interakció minimalizálása
-    # = import + export
-    prob += pulp.lpSum((p_grid_load[t] + p_grid_elh[t] + p_pv_grid[t]) * dt for t in time_set)
 
     solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
     status = prob.solve(solver)
@@ -193,13 +210,19 @@ def individual_opt_boiler(
     else:
         d_cl_v = np.zeros(T)
 
-    e_grid_low_v = float(pulp.value(e_grid_low))
-    e_grid_high_v = float(pulp.value(e_grid_high))
-    e_grid_total_v = e_grid_low_v + e_grid_high_v
-    e_grid_export_v = float(np.sum(p_pv_grid_v) * dt)
+    e_grid_low_step_v = np.array([float(pulp.value(v) or 0.0) for v in e_grid_low_step], dtype=float)
+    e_grid_high_step_v = np.array([float(pulp.value(v) or 0.0) for v in e_grid_high_step], dtype=float)
+    rem_low_v = np.array([float(pulp.value(v) or 0.0) for v in rem_low], dtype=float)
 
-    grid_cost = price_grid_low * e_grid_low_v + price_grid_high * e_grid_high_v
-    export_revenue = price_pv_grid * e_grid_export_v
+    e_grid_low_v = float(np.sum(e_grid_low_step_v))
+    e_grid_high_v = float(np.sum(e_grid_high_step_v))
+    e_grid_total_v = e_grid_low_v + e_grid_high_v
+    e_grid_export_v = float(np.sum(p_pv_grid_v))
+
+    grid_cost = float(np.sum(
+        price_grid_low * e_grid_low_step_v + price_grid_high * e_grid_high_step_v
+    ))
+    export_revenue = float(price_pv_grid * e_grid_export_v)
     net_cost = grid_cost - export_revenue
 
     results = {
@@ -220,10 +243,14 @@ def individual_opt_boiler(
         "grid_cost_Ft": grid_cost,
         "grid_export_revenue_Ft": export_revenue,
         "net_cost_Ft": net_cost,
-        "objective_grid_interaction_kwh": float(pulp.value(prob.objective)),
+        "objective_value": float(pulp.value(prob.objective)),
+        "objective_type": objective,
         "status": status_str,
         "hss_active": int(hss_active),
         "d_cl": d_cl_v,
+        "e_grid_low_step": e_grid_low_step_v,
+        "e_grid_high_step": e_grid_high_step_v,
+        "remaining_low_block_kwh": rem_low_v,
     }
 
     return results
