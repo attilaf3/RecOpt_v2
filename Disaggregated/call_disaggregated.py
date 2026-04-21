@@ -11,11 +11,14 @@ import numpy as np
 import pandas as pd
 import yaml
 
+
+DT = 1.0
+
 # --- import optimizer locally ---------------------------------------------------
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.append(str(HERE))
-from optimize_disaggregated_ecoobj import \
+from optimize_disaggregated import \
     optimize_multi_users_economic  # expects (T,U) arrays, sizes, etc. :contentReference[oaicite:1]{index=1}
 
 
@@ -25,6 +28,14 @@ def _keep_15min(v: np.ndarray) -> np.ndarray:
     if v.size != 35040:
         raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
     return v
+
+def _aggregate_to_hourly(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=float).ravel()
+    if v.size == 8760:
+        return v
+    if v.size != 35040:
+        raise ValueError(f"A profil hossza {v.size}, de itt 35040 vagy 8760 kell.")
+    return v.reshape(8760, 4).sum(axis=1)
 
 def _norm_to_annual(profile: np.ndarray, annual_kwh: float | None) -> np.ndarray:
     p = np.maximum(np.asarray(profile, float), 0.0)
@@ -53,10 +64,10 @@ def build_inputs(
         use_hss: bool = True,
         search_roots: Iterable[os.PathLike] | None = None,
 ) -> Tuple[
-    np.ndarray,  # p_pv (35040, U)
-    np.ndarray,  # p_ue (35040, U)
-    np.ndarray,  # p_dhw (35040, U)
-    np.ndarray,  # p_el_heater (35040, U)
+    np.ndarray,  # p_pv (8760, U)
+    np.ndarray,  # p_ue (8760, U)
+    np.ndarray,  # p_dhw (8760, U)
+    np.ndarray,  # p_el_heater (8760, U)
     np.ndarray,  # size_elh (U,)
     np.ndarray,  # vol_hss_water (U,)
     list[float], # T_env_u
@@ -69,7 +80,7 @@ def build_inputs(
 ]:
     """
     Return:
-      p_pv, p_ue, p_ut: np.ndarray (35040, U)
+      p_pv, p_ue, p_ut: np.ndarray (8760, U)
       size_elh: np.ndarray (U,)
       vol_hss_water: np.ndarray (U,)
       user_names: list[str]
@@ -136,20 +147,20 @@ def build_inputs(
         ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
         ue_size = float(ue.get("size")) if ue.get("size") is not None else None
         if ue_prof and ue_prof in df.columns and ue_size is not None:
-            base = _keep_15min(df[ue_prof].to_numpy())
+            base = _aggregate_to_hourly(df[ue_prof].to_numpy())
             p_ue_cols.append(_norm_to_annual(base, ue_size))
         else:
-            p_ue_cols.append(np.zeros(35040))
+            p_ue_cols.append(np.zeros(8760))
 
         # --- PV (termelés) ---
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
         pv_size = float(pv.get("size")) if pv.get("size") is not None else None
         if pv_prof and pv_prof in df.columns and pv_size is not None:
-            base = _keep_15min(df[pv_prof].to_numpy())
+            base = _aggregate_to_hourly(df[pv_prof].to_numpy())
             p_pv_cols.append(_norm_to_annual(base, pv_size * float(pv_ratio)))
         else:
-            p_pv_cols.append(np.zeros(35040))
+            p_pv_cols.append(np.zeros(8760))
 
         # BESS
 
@@ -169,8 +180,9 @@ def build_inputs(
         if use_hss:
             # DHW profil: liter → kW (kWh/h), órára aggregálva
             if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-                base_L_per_step = dhw[str(hss["profile"])].to_numpy()  # L per 15 perc (vagy amit a CSV tartalmaz)
-                base_L_per_h = _keep_15min(base_L_per_step)  # → L/h
+                base_L_per_step = dhw[str(hss["profile"])].to_numpy()
+                base_L_per_hour = _aggregate_to_hourly(base_L_per_step)
+
                 RHO_WATER_KG_PER_L = 1.0
                 CP_WATER_J_PER_KGK = 4186.0
                 J_PER_KWH = 3_600_000.0
@@ -180,20 +192,20 @@ def build_inputs(
                 T_out = float(hss.get("T_out", 55))
                 dT = max(0.0, T_out - T_in)
 
-                e_kwh_per_step = base_L_per_step * KWH_PER_L_PER_K * dT
-                pth_kW = e_kwh_per_step / 0.25
-                dhw_cols.append(pth_kW.astype(float))
+                # órás energiaigény [kWh / óra-lépés]
+                e_kwh_per_hour = base_L_per_hour * KWH_PER_L_PER_K * dT
+                dhw_cols.append(e_kwh_per_hour.astype(float))
             else:
-                dhw_cols.append(np.zeros(35040, dtype=float))
+                dhw_cols.append(np.zeros(8760, dtype=float))
         else:
             # Ha nincs HSS, de van UT profil éves energiával (elektromos betét profil)
             p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
             heater_number = float(heater.get("size")) if heater.get("size") is not None else None
             if p_el_heater_prof and p_el_heater_prof in df.columns and heater_number is not None:
-                base = _keep_15min(df[p_el_heater_prof].to_numpy())
+                base = _aggregate_to_hourly(df[p_el_heater_prof].to_numpy())
                 p_el_heater_cols.append(_norm_to_annual(base, heater_number))
             else:
-                p_el_heater_cols.append(np.zeros(35040, dtype=float))
+                p_el_heater_cols.append(np.zeros(8760, dtype=float))
 
         # Ha nincs HSS, akkor nulla méretű bojlert feltételezünk
         size_elh.append(float(hss.get("size_elh", 0.0)))
@@ -221,11 +233,11 @@ def build_inputs(
     p_ue = np.column_stack(p_ue_cols).astype(float)
 
     if use_hss:
-        p_dhw = np.column_stack(dhw_cols).astype(float) if dhw_cols else np.zeros((35040, U), float)
-        p_el_heater = np.zeros((35040, U), float)  # HSS módban nem használjuk az ELH profilt
+        p_dhw = np.column_stack(dhw_cols).astype(float) if dhw_cols else np.zeros((8760, U), float)
+        p_el_heater = np.zeros((8760, U), float)  # HSS módban nem használjuk az ELH profilt
     else:
-        p_dhw = np.zeros((35040, U), float)
-        p_el_heater = np.column_stack(p_el_heater_cols).astype(float) if p_el_heater_cols else np.zeros((35040, U),
+        p_dhw = np.zeros((8760, U), float)
+        p_el_heater = np.column_stack(p_el_heater_cols).astype(float) if p_el_heater_cols else np.zeros((8760, U),
                                                                                                         float)
 
     return (
@@ -298,7 +310,7 @@ def run(
         p_ue=p_ue,
         p_dhw=p_dhw,
         p_el_heater=p_el_heater,
-        dt=0.25,
+        dt=1.0,
         hss_flag=use_hss,
         size_elh=size_elh,
         vol_hss_water=vol_hss_water,
@@ -366,6 +378,15 @@ def run(
     pd.DataFrame([results["e_grid_low"]], columns=user_names).to_csv(out / "e_grid_low.csv", index=False)
     pd.DataFrame([results["e_grid_high"]], columns=user_names).to_csv(out / "e_grid_high.csv", index=False)
 
+    pd.DataFrame({
+        "user_name": user_names,
+        "grid_cost_Ft": results["grid_cost_user"],
+        "rec_buy_cost_Ft": results["rec_buy_cost_user"],
+        "rec_sell_revenue_Ft": results["rec_sell_revenue_user"],
+        "grid_export_revenue_Ft": results["grid_export_revenue_user"],
+        "net_cost_Ft": results["net_cost_user"],
+    }).to_csv(out / "user_bills.csv", index=False)
+
     summary = {
         "status": int(status),
         "objective": float(objective),
@@ -383,6 +404,21 @@ def run(
 
 # --- CLI -----------------------------------------------------------------------
 def main(argv: list[str] | None = None):
+    # Ha nincs argumentum, kattintásos mód
+    if argv is None and len(sys.argv) == 1:
+        summary = run(
+            sim_yaml="../Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml",
+            profiles_csv="../Inputs/measurements_disaggregated_pv_original_increase_1.0.csv",
+            dhw_profiles_csv="../Inputs/dhw.csv",
+            out_dir=r".\results_disaggregated_hourly",
+            max_users=105,
+            run_lp=False,
+            pv_ratio=1.0,
+            use_hss=True,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return
+
     ap = argparse.ArgumentParser(description="Optimize multi-user from YAMLs (subset).")
     ap.add_argument("--sim", required=True, help="Path to simulation_config YAML.")
     ap.add_argument("--profiles", required=True, help="Path to disaggregated profiles CSV.")

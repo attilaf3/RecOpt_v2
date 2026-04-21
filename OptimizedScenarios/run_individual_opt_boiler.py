@@ -186,7 +186,7 @@ def build_inputs(
             else:
                 dhw_cols.append(np.zeros(35040, dtype=float))
         else:
-            # Ha nincs HSS, de van UT profil éves energiával (elektromos betét profil)
+            # Ha nincs HSS, de van UT profil éves energiával (fűtőszál profil)
             p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
             heater_number = float(heater.get("size")) if heater.get("size") is not None else None
             if p_el_heater_prof and p_el_heater_prof in df.columns and heater_number is not None:
@@ -198,7 +198,7 @@ def build_inputs(
         # Ha nincs HSS, akkor nulla méretű bojlert feltételezünk
         size_elh.append(float(hss.get("size_elh", 0.0)))
         vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
-        # kiegészítő HSS paraméterek (nem kötelezőek)
+        # HSS paraméterek
         T_env_u.append(float(hss.get("T_env", 20)))
         T_max_u.append(float(hss.get("T_max", 65)))
         T_min_u.append(float(hss.get("T_min", 10)))

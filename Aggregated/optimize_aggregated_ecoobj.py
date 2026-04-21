@@ -263,8 +263,8 @@ def optimize_aggregated(
             prob += p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in) / dt, f"{t}_HSS_max_out"
             prob += p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t]) / dt, f"{t}_HSS_max_in"
 
-            # if t == 0:
-            #     prob += t_hss[t] == T_init, f"{t}_HSS_initial_temp"
+            if t == 0:
+                prob += t_hss[t] == T_init, f"{t}_HSS_initial_temp"
 
     # ------------------------------------------------------------------
     # Controlled-load / bojler kapcsolási logika

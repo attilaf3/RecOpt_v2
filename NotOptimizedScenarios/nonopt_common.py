@@ -282,7 +282,7 @@ def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataF
             pass
 
     x_lo = np.percentile(df["net_bill_ft"], 1)
-    x_hi = np.percentile(df["net_bill_ft"], 99)
+    x_hi = np.percentile(df["net_bill_ft"], 100)
     plt.xlim(x_lo, x_hi)
 
     plt.xlabel("Éves nettó villanyszámla [Ft/év]")
