@@ -355,7 +355,8 @@ def run(
             "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"])),
             "boiler_el_input_kwh": float(np.sum(res["p_elh_in"])),
             "final_hss_energy_kwh": float(res["e_hss_stor"][-1]) if len(res["e_hss_stor"]) else 0.0,
-            "objective_grid_interaction_kwh": res["objective_grid_interaction_kwh"],
+            "objective_value": res["objective_value"],
+            "objective_type": res["objective_type"],
             "status": res["status"],
         })
 

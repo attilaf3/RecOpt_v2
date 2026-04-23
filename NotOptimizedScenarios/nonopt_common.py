@@ -17,23 +17,17 @@ HIGH_TARIFF_FT_PER_KWH = 71.0
 EXPORT_FT_PER_KWH = 5.0
 
 
-def calc_bill_15min_brutto(p_grid_to_load: np.ndarray, p_inj: np.ndarray, dt: float = 0.25) -> dict:
+def calc_bill_15min_brutto(e_grid_to_load: np.ndarray, e_inj: np.ndarray) -> dict:
     """
     15 perces bruttó elszámolás.
-    - minden időlépésben külön számoljuk az importot és exportot
-    - export bevétel: 5 Ft/kWh
-    - import díj: 36 Ft/kWh 2523 kWh/év-ig, utána 71 Ft/kWh
-
-    Fontos:
-    itt az ársávos importot éves kumulált import alapján követjük,
-    de maga az elszámolás 15 perces bruttó energiacserére épül.
+    A bemenetek már kWh / időlépés egységűek.
     """
 
-    p_grid_to_load = np.asarray(p_grid_to_load, dtype=float)
-    p_inj = np.asarray(p_inj, dtype=float)
+    e_grid_to_load = np.asarray(e_grid_to_load, dtype=float)
+    e_inj = np.asarray(e_inj, dtype=float)
 
-    e_import_steps = np.maximum(p_grid_to_load, 0.0) * dt
-    e_export_steps = np.maximum(p_inj, 0.0) * dt
+    e_import_steps = np.maximum(e_grid_to_load, 0.0)
+    e_export_steps = np.maximum(e_inj, 0.0)
 
     remaining_low = LOW_TARIFF_LIMIT_KWH
     import_cost_ft = 0.0
@@ -63,10 +57,9 @@ def calc_bill_15min_brutto(p_grid_to_load: np.ndarray, p_inj: np.ndarray, dt: fl
         "net_bill_ft": net_bill_ft,
     }
 
-
 def simulate_one_user_greedy(
-    p_load: np.ndarray,
-    p_pv: np.ndarray,
+    e_load: np.ndarray,
+    e_pv: np.ndarray,
     use_bess: bool,
     bess_size_kwh: float,
     eta_bess_in: float,
@@ -76,22 +69,22 @@ def simulate_one_user_greedy(
     soc_bess_max: float,
     t_bess_min_h: float,
 ) -> dict:
-    T = len(p_load)
+    T = len(e_load)
 
-    p_load = np.asarray(p_load, dtype=float)
-    p_pv = np.asarray(p_pv, dtype=float)
+    e_load = np.asarray(e_load, dtype=float)
+    e_pv = np.asarray(e_pv, dtype=float)
 
-    p_pv_to_load = np.zeros(T, dtype=float)
-    p_pv_to_bess = np.zeros(T, dtype=float)
-    p_bess_to_load = np.zeros(T, dtype=float)
-    p_grid_to_load = np.zeros(T, dtype=float)
-    p_inj = np.zeros(T, dtype=float)
+    e_pv_to_load = np.zeros(T, dtype=float)
+    e_pv_to_bess = np.zeros(T, dtype=float)
+    e_bess_to_load = np.zeros(T, dtype=float)
+    e_grid_to_load = np.zeros(T, dtype=float)
+    e_inj = np.zeros(T, dtype=float)
     e_bess = np.zeros(T, dtype=float)
 
     if not use_bess or bess_size_kwh <= 1e-12:
-        p_pv_to_load = np.minimum(p_load, p_pv)
-        p_grid_to_load = np.maximum(p_load - p_pv_to_load, 0.0)
-        p_inj = np.maximum(p_pv - p_pv_to_load, 0.0)
+        e_pv_to_load = np.minimum(e_load, e_pv)
+        e_grid_to_load = np.maximum(e_load - e_pv_to_load, 0.0)
+        e_inj = np.maximum(e_pv - e_pv_to_load, 0.0)
         e_bess[:] = 0.0
     else:
         soc_min_kwh = max(0.0, soc_bess_min) * bess_size_kwh
@@ -102,13 +95,15 @@ def simulate_one_user_greedy(
         else:
             p_bess_max_kw = bess_size_kwh / t_bess_min_h
 
+        e_bess_max_step = p_bess_max_kw * DT
+
         soc = soc_min_kwh
 
         for t in range(T):
             soc *= eta_bess_stor
 
-            load_t = max(p_load[t], 0.0)
-            pv_t = max(p_pv[t], 0.0)
+            load_t = max(e_load[t], 0.0)
+            pv_t = max(e_pv[t], 0.0)
 
             pv_to_load = min(load_t, pv_t)
             deficit = load_t - pv_to_load
@@ -117,41 +112,37 @@ def simulate_one_user_greedy(
             charge = 0.0
             if surplus > 1e-12:
                 room_kwh = max(soc_max_kwh - soc, 0.0)
-                max_charge_by_capacity_kw = room_kwh / max(eta_bess_in * DT, 1e-12)
-                charge = min(surplus, p_bess_max_kw, max_charge_by_capacity_kw)
-                soc += charge * eta_bess_in * DT
+                max_charge_by_soc = room_kwh / max(eta_bess_in, 1e-12)
+                charge = min(surplus, e_bess_max_step, max_charge_by_soc)
+                soc += charge * eta_bess_in
                 surplus -= charge
 
             discharge = 0.0
             if deficit > 1e-12:
                 avail_kwh = max(soc - soc_min_kwh, 0.0)
-                max_discharge_by_energy_kw = avail_kwh * eta_bess_out / DT
-                discharge = min(deficit, p_bess_max_kw, max_discharge_by_energy_kw)
-                soc -= (discharge / max(eta_bess_out, 1e-12)) * DT
+                max_discharge_by_soc = avail_kwh * eta_bess_out
+                discharge = min(deficit, e_bess_max_step, max_discharge_by_soc)
+                soc -= discharge / max(eta_bess_out, 1e-12)
                 deficit -= discharge
 
-            grid_to_load = max(deficit, 0.0)
-            inj = max(surplus, 0.0)
-
-            p_pv_to_load[t] = pv_to_load
-            p_pv_to_bess[t] = charge
-            p_bess_to_load[t] = discharge
-            p_grid_to_load[t] = grid_to_load
-            p_inj[t] = inj
+            e_pv_to_load[t] = pv_to_load
+            e_pv_to_bess[t] = charge
+            e_bess_to_load[t] = discharge
+            e_grid_to_load[t] = max(deficit, 0.0)
+            e_inj[t] = max(surplus, 0.0)
             e_bess[t] = soc
 
-    load_kwh = p_load.sum() * DT
-    pv_kwh = p_pv.sum() * DT
-    pv_to_load_kwh = p_pv_to_load.sum() * DT
-    pv_to_bess_kwh = p_pv_to_bess.sum() * DT
-    bess_to_load_kwh = p_bess_to_load.sum() * DT
-    grid_import_kwh = p_grid_to_load.sum() * DT
-    injection_kwh = p_inj.sum() * DT
+    load_kwh = e_load.sum()
+    pv_kwh = e_pv.sum()
+    pv_to_load_kwh = e_pv_to_load.sum()
+    pv_to_bess_kwh = e_pv_to_bess.sum()
+    bess_to_load_kwh = e_bess_to_load.sum()
+    grid_import_kwh = e_grid_to_load.sum()
+    injection_kwh = e_inj.sum()
 
     bill = calc_bill_15min_brutto(
-        p_grid_to_load=p_grid_to_load,
-        p_inj=p_inj,
-        dt=DT,
+        e_grid_to_load=e_grid_to_load,
+        e_inj=e_inj,
     )
 
     self_consumed_pv_kwh = pv_to_load_kwh + pv_to_bess_kwh
@@ -160,15 +151,16 @@ def simulate_one_user_greedy(
 
     return {
         "timeseries": {
-            "p_load": p_load,
-            "p_pv": p_pv,
-            "p_pv_to_load": p_pv_to_load,
-            "p_pv_to_bess": p_pv_to_bess,
-            "p_bess_to_load": p_bess_to_load,
-            "p_grid_to_load": p_grid_to_load,
-            "p_inj": p_inj,
+            "e_load": e_load,
+            "e_pv": e_pv,
+            "e_pv_to_load": e_pv_to_load,
+            "e_pv_to_bess": e_pv_to_bess,
+            "e_bess_to_load": e_bess_to_load,
+            "e_grid_to_load": e_grid_to_load,
+            "e_inj": e_inj,
             "e_bess": e_bess,
         },
+
         "annual": {
             "load_kwh": load_kwh,
             "pv_kwh": pv_kwh,
@@ -311,10 +303,10 @@ def run_case(
     out_case.mkdir(parents=True, exist_ok=True)
 
     (
-        p_pv,
-        p_ue,
-        p_dhw,
-        p_el_heater,
+        e_pv,
+        e_ue,
+        e_dhw,
+        e_el_heater,
         size_elh,
         vol_hss_water,
         size_bess,
@@ -341,24 +333,29 @@ def run_case(
         use_hss=False,
     )
 
+    p_pv = e_pv / DT
+    p_ue = e_ue / DT
+    p_dhw = e_dhw / DT
+    p_el_heater = e_el_heater / DT
+
     U = len(user_names)
     T = p_ue.shape[0]
 
-    p_boiler = p_el_heater if include_boiler else np.zeros_like(p_el_heater)
-    p_total_load = p_ue + p_boiler
+    e_boiler = e_el_heater if include_boiler else np.zeros_like(e_el_heater)
+    e_total_load = e_ue + e_boiler
 
     rows = []
 
-    ts_p_load = np.zeros((T, U), dtype=float)
-    ts_p_pv = np.zeros((T, U), dtype=float)
-    ts_p_pv_to_load = np.zeros((T, U), dtype=float)
-    ts_p_pv_to_bess = np.zeros((T, U), dtype=float)
-    ts_p_bess_to_load = np.zeros((T, U), dtype=float)
-    ts_p_grid_to_load = np.zeros((T, U), dtype=float)
-    ts_p_inj = np.zeros((T, U), dtype=float)
+    ts_e_load = np.zeros((T, U), dtype=float)
+    ts_e_pv = np.zeros((T, U), dtype=float)
+    ts_e_pv_to_load = np.zeros((T, U), dtype=float)
+    ts_e_pv_to_bess = np.zeros((T, U), dtype=float)
+    ts_e_bess_to_load = np.zeros((T, U), dtype=float)
+    ts_e_grid_to_load = np.zeros((T, U), dtype=float)
+    ts_e_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
 
-    pv_annual_kwh = p_pv.sum(axis=0) * DT
+    pv_annual_kwh = p_pv.sum(axis=0)
     has_pv_arr = pv_annual_kwh > 1e-9
 
     bess_enabled_arr = np.zeros(len(user_names), dtype=bool)
@@ -380,8 +377,8 @@ def run_case(
 
     for u in range(U):
         sim = simulate_one_user_greedy(
-            p_load=p_total_load[:, u],
-            p_pv=p_pv[:, u],
+            e_load=e_total_load[:, u],
+            e_pv=e_pv[:, u],
             use_bess=bool(bess_enabled_arr[u]),
             bess_size_kwh=float(size_bess[u]),
             eta_bess_in=float(eta_bess_in_u[u]),
@@ -395,14 +392,17 @@ def run_case(
         annual = sim["annual"]
         times = sim["timeseries"]
 
-        base_load_kwh = p_ue[:, u].sum() * DT
-        boiler_kwh = p_boiler[:, u].sum() * DT
+        pv_annual_kwh = e_pv.sum(axis=0)
+        has_pv_arr = pv_annual_kwh > 1e-9
+
+        base_load_kwh = e_ue[:, u].sum()
+        boiler_kwh = e_boiler[:, u].sum()
 
         rows.append({
             "user_name": user_names[u],
-            "has_pv": bool((p_pv[:, u].sum() * DT) > 1e-9),
+            "has_pv": bool((p_pv[:, u].sum()) > 1e-9),
             "has_bess": bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
-            "has_boiler": bool(include_boiler and (p_boiler[:, u].sum() * DT) > 1e-9),
+            "has_boiler": bool(include_boiler and e_boiler[:, u].sum() > 1e-9),
             "group_label": (
                 "PV+BESS" if (has_pv_arr[u] and bess_enabled_arr[u] and size_bess[u] > 1e-9)
                 else "PV" if has_pv_arr[u]
@@ -427,13 +427,13 @@ def run_case(
             "net_bill_ft": annual["net_bill_ft"],
         })
 
-        ts_p_load[:, u] = times["p_load"]
-        ts_p_pv[:, u] = times["p_pv"]
-        ts_p_pv_to_load[:, u] = times["p_pv_to_load"]
-        ts_p_pv_to_bess[:, u] = times["p_pv_to_bess"]
-        ts_p_bess_to_load[:, u] = times["p_bess_to_load"]
-        ts_p_grid_to_load[:, u] = times["p_grid_to_load"]
-        ts_p_inj[:, u] = times["p_inj"]
+        ts_e_load[:, u] = times["e_load"]
+        ts_e_pv[:, u] = times["e_pv"]
+        ts_e_pv_to_load[:, u] = times["e_pv_to_load"]
+        ts_e_pv_to_bess[:, u] = times["e_pv_to_bess"]
+        ts_e_bess_to_load[:, u] = times["e_bess_to_load"]
+        ts_e_grid_to_load[:, u] = times["e_grid_to_load"]
+        ts_e_inj[:, u] = times["e_inj"]
         ts_e_bess[:, u] = times["e_bess"]
 
     per_user_df = pd.DataFrame(rows)
@@ -482,23 +482,23 @@ def run_case(
     def save_ts(arr: np.ndarray, filename: str):
         pd.DataFrame(arr, columns=user_names).to_csv(out_case / filename, index=False)
 
-    save_ts(ts_p_load, "p_load.csv")
-    save_ts(ts_p_pv, "p_pv.csv")
-    save_ts(ts_p_pv_to_load, "p_pv_to_load.csv")
-    save_ts(ts_p_pv_to_bess, "p_pv_to_bess.csv")
-    save_ts(ts_p_bess_to_load, "p_bess_to_load.csv")
-    save_ts(ts_p_grid_to_load, "p_grid_to_load.csv")
-    save_ts(ts_p_inj, "p_inj.csv")
+    save_ts(ts_e_load, "e_load.csv")
+    save_ts(ts_e_pv, "e_pv.csv")
+    save_ts(ts_e_pv_to_load, "e_pv_to_load.csv")
+    save_ts(ts_e_pv_to_bess, "e_pv_to_bess.csv")
+    save_ts(ts_e_bess_to_load, "e_bess_to_load.csv")
+    save_ts(ts_e_grid_to_load, "e_grid_to_load.csv")
+    save_ts(ts_e_inj, "e_inj.csv")
     save_ts(ts_e_bess, "e_bess.csv")
 
     community_ts = pd.DataFrame({
-        "p_load_total": ts_p_load.sum(axis=1),
-        "p_pv_total": ts_p_pv.sum(axis=1),
-        "p_pv_to_load_total": ts_p_pv_to_load.sum(axis=1),
-        "p_pv_to_bess_total": ts_p_pv_to_bess.sum(axis=1),
-        "p_bess_to_load_total": ts_p_bess_to_load.sum(axis=1),
-        "p_grid_to_load_total": ts_p_grid_to_load.sum(axis=1),
-        "p_inj_total": ts_p_inj.sum(axis=1),
+        "e_load_total": ts_e_load.sum(axis=1),
+        "e_pv_total": ts_e_pv.sum(axis=1),
+        "e_pv_to_load_total": ts_e_pv_to_load.sum(axis=1),
+        "e_pv_to_bess_total": ts_e_pv_to_bess.sum(axis=1),
+        "e_bess_to_load_total": ts_e_bess_to_load.sum(axis=1),
+        "e_grid_to_load_total": ts_e_grid_to_load.sum(axis=1),
+        "e_inj_total": ts_e_inj.sum(axis=1),
         "e_bess_total": ts_e_bess.sum(axis=1),
     })
     community_ts.to_csv(out_case / "community_timeseries.csv", index=False)
