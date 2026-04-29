@@ -205,7 +205,7 @@ def plot_household_fourpack_seasons(
 if __name__ == "__main__":
     plot_household_fourpack_seasons(
         results_dir="results_individual_opt_boiler",
-        household_name="0420144653458813",
+        household_name="0420144888439778",
         window_days=3,
         dt=DT,
         p_are_kwh_per_step=False,
