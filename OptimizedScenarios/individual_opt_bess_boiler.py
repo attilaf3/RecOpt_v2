@@ -176,7 +176,7 @@ def individual_opt_bess_boiler(
             # no HSS -> no boiler power
             prob += p_pv_elh[t] == 0, f"no_hss_pv_elh_{t}"
             prob += p_grid_elh[t] == 0, f"no_hss_grid_elh_{t}"
-            prob += p_dhw[t] == 0, f"no_hss_dhw_{t}"
+
 
         # Battery relations
         if not bess_active:
