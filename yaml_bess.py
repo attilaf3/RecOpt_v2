@@ -11,8 +11,8 @@ BESS_BLOCK = {
     "eta_bess_out": "0.96",
     "eta_bess_stor": "0.995",
     "eta_self_discharge": "1.0",
-    "soc_bess_max": "1",
-    "soc_bess_min": "0.2",
+    "soc_bess_max": "0.9",
+    "soc_bess_min": "0.1",
     "t_bess_min": "2",
 }
 
