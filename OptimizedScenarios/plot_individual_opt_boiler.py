@@ -1,222 +1,212 @@
+"""
+plot_household_boiler_fourpack.py
+---------------------------------
+1 háztartás bojleres eredményeinek kirajzolása plot_multi stílusban:
+
+Évszakonként külön kép:
+  - [0,0] Electric hub (stackelt bar, + befolyók, - kifolyók)
+  - [0,1] Electric legenda
+  - [1,0] Thermal (T_hss + d_cl)
+  - [1,1] Thermal legenda
+
+Forrás: results_individual_opt_boiler/timeseries_<household>.csv
+"""
+
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+import matplotlib.patheffects as pe
 
 
-def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataFrame, out_case: Path):
-    df = per_user_df.copy()
+# =========================
+# BEÁLLÍTÁSOK
+# =========================
+RESULTS_DIR = r"results_individual_opt_boiler"
+HOUSEHOLD_NAME = "0420144653422463"   # timeseries_<...>.csv-ben a <...> rész
+WINDOW_DAYS = 3                       # 2 vagy 3
+DT = 0.25                             # 15 perc (óra)
+P_ARE_KWH_PER_STEP = True             # True: p_* oszlopok kWh/lépés; False: kW
 
-    if "net_bill_ft" not in df.columns:
-        raise ValueError("Hiányzik a 'net_bill_ft' oszlop.")
+dpi = 300
+fontsize = 24
+# =========================
 
-    if "group_label" not in df.columns:
-        raise ValueError("Hiányzik a 'group_label' oszlop.")
+plt.rcParams.update({"font.size": fontsize - 2})
 
-    df = df.sort_values("net_bill_ft").reset_index(drop=True)
-    n = len(df)
 
-    if n == 0:
-        return
+def _path_effect(lw: float):
+    return [pe.Stroke(linewidth=1.5 * lw, foreground="w"), pe.Normal()]
 
-    df["percentile"] = 100.0 * (np.arange(n) + 0.5) / n
 
-    marker_map = {
-        "Nincs PV": "o",
-        "PV": "s",
-        "PV+BESS": "^",
-    }
+def _to_kwh_step(x: np.ndarray, dt: float, already_kwh_step: bool) -> np.ndarray:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    return x if already_kwh_step else x * dt
 
-    plt.figure(figsize=(9, 5.5))
 
-    # pontok csoportonként
-    for group in ["Nincs PV", "PV", "PV+BESS"]:
-        sub = df[df["group_label"] == group].copy()
-        if len(sub) == 0:
+def _load_timeseries(out_dir: Path, household: str) -> tuple[pd.DataFrame, Path]:
+    p = out_dir / f"timeseries_{household}.csv"
+    if p.exists():
+        return pd.read_csv(p), p
+
+    matches = list(out_dir.glob(f"timeseries_*{household}*.csv"))
+    if len(matches) == 1:
+        return pd.read_csv(matches[0]), matches[0]
+
+    raise FileNotFoundError(f"Nem találom egyértelműen a timeseries fájlt: {p} (találatok: {len(matches)})")
+
+
+def plot_household_fourpack_seasons(
+    results_dir: str | Path,
+    household_name: str,
+    window_days: int = 3,
+    dt: float = 0.25,
+    p_are_kwh_per_step: bool = True,
+):
+    out_dir = Path(results_dir)
+    ts, ts_path = _load_timeseries(out_dir, household_name)
+
+    # a run menti ezeket :contentReference[oaicite:2]{index=2}
+    needed = [
+        "p_pv", "p_ue",
+        "p_grid_load", "p_grid_elh",
+        "p_pv_grid",
+        "p_elh_in",
+        "t_hss",
+        "d_cl",
+    ]
+    missing = [c for c in needed if c not in ts.columns]
+    if missing:
+        raise ValueError(f"Hiányzó oszlop(ok) a timeseries-ben: {missing}")
+
+    # Egységesítés kWh/lépésre
+    p_pv       = _to_kwh_step(ts["p_pv"].to_numpy(), dt, p_are_kwh_per_step)
+    p_ue       = _to_kwh_step(ts["p_ue"].to_numpy(), dt, p_are_kwh_per_step)
+    p_grid_load= _to_kwh_step(ts["p_grid_load"].to_numpy(), dt, p_are_kwh_per_step)
+    p_grid_elh = _to_kwh_step(ts["p_grid_elh"].to_numpy(), dt, p_are_kwh_per_step)
+    p_pv_grid  = _to_kwh_step(ts["p_pv_grid"].to_numpy(), dt, p_are_kwh_per_step)
+    p_elh_in   = _to_kwh_step(ts["p_elh_in"].to_numpy(), dt, p_are_kwh_per_step)
+
+    t_hss = ts["t_hss"].to_numpy(dtype=float)
+    d_cl  = ts["d_cl"].to_numpy(dtype=float)
+
+    # Villamos csomópont komponensek
+    p_grid_import = p_grid_load + p_grid_elh
+
+    T = len(ts)
+    steps_per_day = int(round(24 / dt))
+    window_steps = int(round(window_days * steps_per_day))
+
+    # plot_multi-szerű évszak ablakok (órás indexek skálázva 15 percre)
+    # plot_multi: t0s=[0,2184,4368,6552], dt=72 óra :contentReference[oaicite:3]{index=3}
+    t0s_hourly = [0, 2184, 4368, 6552]
+    t0s = [int(t0 * (1 / dt)) for t0 in t0s_hourly]  # 15 perces lépésekre
+    season_keys = ["winter", "spring", "summer", "autumn"]
+    titles = ["Tél", "Tavasz", "Nyár", "Ősz"]
+
+    bar_kw = dict(width=0.8 * dt)
+    plot_kw = dict(lw=3, path_effects=_path_effect(3))
+
+    for season, title, t0 in zip(season_keys, titles, t0s):
+        tf = min(t0 + window_steps, T)
+        if tf <= t0 + 1:
             continue
 
-        plt.scatter(
-            sub["net_bill_ft"],
-            sub["percentile"],
-            s=28,
-            marker=marker_map.get(group, "o"),
-            alpha=0.8,
-            label=group,
+        time = np.arange(t0, tf) * dt  # óra az év elejétől
+
+        # szeletek
+        pv = p_pv[t0:tf]
+        grid_imp = p_grid_import[t0:tf]
+        ue = p_ue[t0:tf]
+        elh = p_elh_in[t0:tf]
+        pv_exp = p_pv_grid[t0:tf]
+        temp = t_hss[t0:tf]
+        cl = d_cl[t0:tf]
+
+        # ====== 2x2: bal oldalon plotok, jobb oldalon 2 legend axes ======
+        fig, axes = plt.subplots(
+            nrows=2,
+            ncols=2,
+            figsize=(20, 12),
+            sharex=True,
+            gridspec_kw=dict(width_ratios=[0.8, 0.2]),
         )
 
-    # egyetlen globális S-görbe az összes háztartásra
-    x = df["net_bill_ft"].to_numpy(dtype=float)
-    y = df["percentile"].to_numpy(dtype=float)
+        ax_e = axes[0, 0]
+        leg_e = axes[0, 1]
 
-    def logistic(x_, x0, k):
-        return 100.0 / (1.0 + np.exp(-k * (x_ - x0)))
+        ax_t = axes[1, 0]
+        leg_t = axes[1, 1]
 
-    if len(df) >= 4 and np.nanstd(x) > 0:
-        x0_init = np.nanmedian(x)
-        spread = max(np.nanstd(x), 1.0)
-        k_init = 1.0 / spread
+        # ======================
+        # 1) Electric hub (pozitív be, negatív ki)
+        # ======================
+        bottom = np.zeros_like(time, dtype=float)
+        ax_e.bar(time, pv, bottom=bottom, label=r"$PV$", **bar_kw); bottom += pv
+        ax_e.bar(time, grid_imp, bottom=bottom, label=r"$Grid\ import$", **bar_kw)
 
-        try:
-            popt, _ = curve_fit(logistic, x, y, p0=[x0_init, k_init], maxfev=20000)
-            x_grid = np.linspace(np.nanmin(x), np.nanmax(x), 400)
-            y_fit = logistic(x_grid, *popt)
-            plt.plot(
-                x_grid,
-                y_fit,
-                color="darkred",
-                linewidth=2,
-                label="Illesztett S-görbe (összes háztartás)",
-            )
-        except Exception:
-            pass
+        bottom = np.zeros_like(time, dtype=float)
+        ax_e.bar(time, -ue, bottom=bottom, label=r"$Load$", **bar_kw); bottom -= ue
+        ax_e.bar(time, -elh, bottom=bottom, label=r"$Boiler\ (opt.)$", **bar_kw); bottom -= elh
+        ax_e.bar(time, -pv_exp, bottom=bottom, label=r"$PV\ export$", **bar_kw)
 
-    x_lo = np.percentile(df["net_bill_ft"], 0)
-    x_hi = np.percentile(df["net_bill_ft"], 100)
-    if x_lo == x_hi:
-        x_lo = x_lo - 1
-        x_hi = x_hi + 1
+        ax_e.axhline(0.0, color="black", lw=1.0)
+        ax_e.set_title(f"{title} – Villamos csomópont", fontsize=fontsize)
+        ax_e.set_ylabel("Energia (kWh / 15 perc)" if p_are_kwh_per_step else "Energia (kWh / lépés)", fontsize=fontsize)
+        ax_e.grid(True, alpha=0.3)
+        ax_e.tick_params(labelsize=fontsize)
 
-    plt.xlim(x_lo, x_hi)
-    plt.xlabel("Éves nettó villanyszámla [Ft/év]")
-    plt.ylabel("Háztartások aránya [%]")
-    plt.title("Háztartások villanyszámla szerinti eloszlása")
-    plt.ylim(0, 100)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_case / "household_bill_percentiles_by_group_global_scurve.png", dpi=200)
-    plt.close()
+        # Szép szimmetrikus y-limit
+        y_pos = pv + grid_imp
+        y_neg = ue + elh + pv_exp
+        ymax = max(float(np.nanmax(y_pos)), float(np.nanmax(y_neg)), 1e-6)
+        ax_e.set_ylim(-1.15 * ymax, 1.15 * ymax)
 
+        h_e, l_e = ax_e.get_legend_handles_labels()
+        leg_e.legend(h_e, l_e, loc="center", fontsize=fontsize, ncol=1)
+        leg_e.axis("off")
 
-def compute_community_sci_ssi(df: pd.DataFrame) -> dict:
-    """
-    Közösségi szintű SCI és SSI számítás megosztott energia nélkül.
+        # ======================
+        # 2) Thermal: T_hss + d_cl (vékony szürke)
+        # ======================
+        ln_T, = ax_t.plot(time, temp, label=r"$T_{hss}$", **plot_kw)
 
-    SCI = helyben felhasznált PV / összes PV termelés
-        = (PV termelés - hálózati export) / PV termelés
+        ax_t.set_title(f"{title} – Bojler hőmérséklet + vezérlés", fontsize=fontsize)
+        ax_t.set_xlabel("Idő (h)", fontsize=fontsize)
+        ax_t.set_ylabel(r"$T_{hss}$ (°C)", fontsize=fontsize)
+        ax_t.grid(True, alpha=0.3)
+        ax_t.tick_params(labelsize=fontsize)
 
-    SSI = helyben fedezett villamos energiaigény / összes villamos energiaigény
-        = (összes villamos igény - hálózati import) / összes villamos igény
+        ax_t2 = ax_t.twinx()
+        ln_cl, = ax_t2.step(time, cl, where="post", color="gray", lw=1.0, alpha=0.9, label=r"$d_{cl}$")
+        ax_t2.set_ylim(-0.05, 1.05)
+        ax_t2.set_ylabel(r"$d_{cl}$ (-)", fontsize=fontsize, color="gray")
+        ax_t2.tick_params(axis="y", labelsize=fontsize - 2, colors="gray")
 
-    A bojleres esetben az összes villamos igény:
-        általános fogyasztás + bojler villamos input
-    """
-    required_cols = [
-        "pv_gen_kwh",
-        "grid_export_kwh",
-        "grid_import_total_kwh",
-        "load_kwh",
-        "boiler_el_input_kwh",
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Hiányzó oszlopok az SCI/SSI számításhoz: {missing}")
+        # Thermal legend a jobb alsó axes-en
+        h1, l1 = ax_t.get_legend_handles_labels()
+        h2, l2 = ax_t2.get_legend_handles_labels()
+        leg_t.legend(h1 + h2, l1 + l2, loc="center", fontsize=fontsize, ncol=1)
+        leg_t.axis("off")
 
-    total_pv_gen = float(df["pv_gen_kwh"].sum())
-    total_grid_export = float(df["grid_export_kwh"].sum())
-    total_grid_import = float(df["grid_import_total_kwh"].sum())
-    total_load = float(df["load_kwh"].sum())
-    total_boiler_el = float(df["boiler_el_input_kwh"].sum())
+        fig.suptitle(f"Háztartás: {household_name}", fontsize=fontsize + 2)
+        fig.tight_layout()
+        out_png = out_dir / f"household_{household_name}_{season}_{window_days}days.png"
+        plt.savefig(out_png, dpi=dpi)
+        plt.close(fig)
+        print(f"Mentve: {out_png}")
 
-    total_electric_demand = total_load + total_boiler_el
-    total_pv_self_consumed = total_pv_gen - total_grid_export
+    print(f"Forrás: {ts_path}")
 
-    sci = total_pv_self_consumed / total_pv_gen if total_pv_gen > 0 else np.nan
-    ssi = (total_electric_demand - total_grid_import) / total_electric_demand if total_electric_demand > 0 else np.nan
-
-    return {
-        "total_pv_gen_kwh": total_pv_gen,
-        "total_grid_export_kwh": total_grid_export,
-        "total_grid_import_kwh": total_grid_import,
-        "total_load_kwh": total_load,
-        "total_boiler_el_input_kwh": total_boiler_el,
-        "total_electric_demand_kwh": total_electric_demand,
-        "total_pv_self_consumed_kwh": total_pv_self_consumed,
-        "SCI": sci,
-        "SSI": ssi,
-    }
-
-
-def prepare_per_user_df_for_plot(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    # villanyszámla oszlop egységesítése
-    if "net_cost_Ft" in out.columns:
-        out["net_bill_ft"] = out["net_cost_Ft"]
-    elif "net_bill_ft" not in out.columns:
-        raise ValueError("Nincs net_cost_Ft vagy net_bill_ft oszlop a bemeneti táblában.")
-
-    # csoportok
-    has_pv = out["has_pv"] if "has_pv" in out.columns else pd.Series(0, index=out.index)
-    has_bess = out["has_bess"] if "has_bess" in out.columns else pd.Series(0, index=out.index)
-
-    group_label = np.where(
-        has_pv.astype(int) == 0,
-        "Nincs PV",
-        np.where(has_bess.astype(int) == 1, "PV+BESS", "PV")
-    )
-    out["group_label"] = group_label
-
-    return out
-
-
-def analyze_boiler_results(results_dir: str | Path):
-    out_case = Path(results_dir)
-
-    combined_path = out_case / "household_summary_combined.csv"
-    energy_path = out_case / "household_energy_summary.csv"
-    finance_path = out_case / "household_finance_summary.csv"
-
-    if combined_path.exists():
-        df = pd.read_csv(combined_path)
-    elif energy_path.exists() and finance_path.exists():
-        energy_df = pd.read_csv(energy_path)
-        finance_df = pd.read_csv(finance_path)
-        df = energy_df.merge(finance_df, on="household", how="left")
-    else:
-        raise FileNotFoundError(
-            "Nem található sem a household_summary_combined.csv, "
-            "sem az energy + finance summary fájl."
-        )
-
-    # Plothoz szükséges tábla
-    per_user_df = prepare_per_user_df_for_plot(df)
-
-    # S-görbe
-    plot_household_percentiles_by_group_with_global_scurve(per_user_df, out_case)
-
-    # SCI / SSI
-    community = compute_community_sci_ssi(df)
-
-    # plusz pár egyszerű stat
-    community.update({
-        "n_households": int(len(df)),
-        "mean_net_bill_ft": float(per_user_df["net_bill_ft"].mean()),
-        "median_net_bill_ft": float(per_user_df["net_bill_ft"].median()),
-        "min_net_bill_ft": float(per_user_df["net_bill_ft"].min()),
-        "max_net_bill_ft": float(per_user_df["net_bill_ft"].max()),
-    })
-
-    # mentés JSON
-    with open(out_case / "community_indicators.json", "w", encoding="utf-8") as f:
-        json.dump(community, f, indent=2, ensure_ascii=False)
-
-    # mentés CSV
-    pd.DataFrame([community]).to_csv(out_case / "community_indicators.csv", index=False)
-
-    print("Elemzés kész.")
-    print(f"SCI = {community['SCI']:.4f}")
-    print(f"SSI = {community['SSI']:.4f}")
-    print(f"Plot mentve: {out_case / 'household_bill_percentiles_by_group_global_scurve.png'}")
-    print(f"Indikátorok mentve: {out_case / 'community_indicators.json'}")
-
-    return community
 
 
 if __name__ == "__main__":
-    analyze_boiler_results("results_individual_opt_boiler")
+    plot_household_fourpack_seasons(
+        results_dir="results_individual_opt_boiler",
+        household_name="0420144888439778",
+        window_days=3,
+        dt=DT,
+        p_are_kwh_per_step=False,
+    )

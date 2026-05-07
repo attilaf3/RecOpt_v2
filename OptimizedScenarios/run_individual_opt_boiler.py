@@ -26,12 +26,7 @@ def _keep_15min(v: np.ndarray) -> np.ndarray:
         raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
     return v
 
-def _norm_to_annual(profile: np.ndarray, annual_kwh: float | None) -> np.ndarray:
-    p = np.maximum(np.asarray(profile, float), 0.0)
-    if annual_kwh is None:
-        return np.zeros_like(p)
-    s = p.sum()
-    return np.zeros_like(p) if s <= 0 else p / s * float(annual_kwh)
+
 
 
 def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
