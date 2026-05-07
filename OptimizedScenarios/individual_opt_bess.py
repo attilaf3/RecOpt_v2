@@ -59,13 +59,13 @@ def individual_opt_bess(
         soc_bess_init = soc_bess_min
 
     battery_power = float(size_bess) / max(float(t_bess_min), 1e-9) if bess_active else 0.0
-    battery_step_cap = battery_power * dt
+
 
     prob = pulp.LpProblem("individual_opt_bess_fixed_boiler", pulp.LpMinimize)
 
     # Big-M
     M_pv = float(np.max(p_pv)) + 1.0 if T > 0 else 1.0
-    M_grid = float(np.max(total_load) + battery_step_cap) + 1.0 if T > 0 else 1.0
+    M_grid = float(np.max(total_load) + battery_power) + 1.0 if T > 0 else 1.0
 
     # ------------------------------------------------------------------
     # Változók
@@ -161,26 +161,25 @@ def individual_opt_bess(
             ), f"bess_out_def_{t}"
 
             # dinamika
-            prob += (
-                e_bess[k]
-                == e_bess[t] * eta_bess_stor
-                + (p_bess_in[t] * eta_bess_in - p_bess_out[t] / max(eta_bess_out, 1e-9))
-            ), f"bess_balance_{t}"
+            prob += e_bess[k] == (
+                    e_bess[t] * eta_bess_stor
+                    + dt * (p_bess_in[t] * eta_bess_in - p_bess_out[t] / max(eta_bess_out, 1e-9))
+            )
 
             # teljesítménykorlát
             if run_lp:
-                prob += p_bess_in[t] <= battery_step_cap, f"bess_in_cap_{t}"
-                prob += p_bess_out[t] <= battery_step_cap, f"bess_out_cap_{t}"
+                prob += p_bess_in[t] <= battery_power, f"bess_in_cap_{t}"
+                prob += p_bess_out[t] <= battery_power, f"bess_out_cap_{t}"
             else:
-                prob += p_bess_in[t] <= d_bess[t] * battery_step_cap, f"bess_in_gate_{t}"
-                prob += p_bess_out[t] <= (1 - d_bess[t]) * battery_step_cap, f"bess_out_gate_{t}"
+                prob += p_bess_in[t] <= d_bess[t] * battery_power, f"bess_in_gate_{t}"
+                prob += p_bess_out[t] <= (1 - d_bess[t]) * battery_power, f"bess_out_gate_{t}"
 
             # SOC korlát külön is
             prob += e_bess[t] >= float(size_bess) * float(soc_bess_min), f"soc_min_{t}"
             prob += e_bess[t] <= float(size_bess) * float(soc_bess_max), f"soc_max_{t}"
 
         # 15 perces bruttó import felosztása
-        e_imp_t = p_grid_import[t]
+        e_imp_t = p_grid_import[t] * dt
 
         prob += e_grid_low_step[t] + e_grid_high_step[t] == e_imp_t, f"grid_step_split_{t}"
 
@@ -212,7 +211,7 @@ def individual_opt_bess(
         price_grid_low * e_grid_low_step[t] + price_grid_high * e_grid_high_step[t]
         for t in time_set
     )
-    revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] for t in time_set)
+    revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] * dt for t in time_set)
 
     prob += cost_grid - revenue_export
     # ------------------------------------------------------------------
@@ -263,7 +262,7 @@ def individual_opt_bess(
     grid_cost = float(np.sum(
         price_grid_low * e_grid_low_step_v + price_grid_high * e_grid_high_step_v
     ))
-    export_revenue = float(np.sum(p_pv_grid_v) * price_pv_grid)
+    export_revenue = float(np.sum(p_pv_grid_v) * dt * price_pv_grid)
     net_cost = grid_cost - export_revenue
 
     results = {
@@ -275,7 +274,6 @@ def individual_opt_bess(
 
         "size_bess": float(size_bess),
         "battery_power": float(battery_power),
-        "battery_step_cap_kwh": float(battery_step_cap),
         "soc_bess_min": float(soc_bess_min),
         "soc_bess_max": float(soc_bess_max),
         "soc_bess_init": float(soc_bess_init),

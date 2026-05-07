@@ -28,7 +28,6 @@ RESULTS_DIR = r"results_individual_opt_boiler"
 HOUSEHOLD_NAME = "0420144653422463"   # timeseries_<...>.csv-ben a <...> rész
 WINDOW_DAYS = 3                       # 2 vagy 3
 DT = 0.25                             # 15 perc (óra)
-P_ARE_KWH_PER_STEP = True             # True: p_* oszlopok kWh/lépés; False: kW
 
 dpi = 300
 fontsize = 24
@@ -39,11 +38,6 @@ plt.rcParams.update({"font.size": fontsize - 2})
 
 def _path_effect(lw: float):
     return [pe.Stroke(linewidth=1.5 * lw, foreground="w"), pe.Normal()]
-
-
-def _to_kwh_step(x: np.ndarray, dt: float, already_kwh_step: bool) -> np.ndarray:
-    x = np.asarray(x, dtype=float).reshape(-1)
-    return x if already_kwh_step else x * dt
 
 
 def _load_timeseries(out_dir: Path, household: str) -> tuple[pd.DataFrame, Path]:
@@ -63,7 +57,6 @@ def plot_household_fourpack_seasons(
     household_name: str,
     window_days: int = 3,
     dt: float = 0.25,
-    p_are_kwh_per_step: bool = True,
 ):
     out_dir = Path(results_dir)
     ts, ts_path = _load_timeseries(out_dir, household_name)
@@ -81,13 +74,13 @@ def plot_household_fourpack_seasons(
     if missing:
         raise ValueError(f"Hiányzó oszlop(ok) a timeseries-ben: {missing}")
 
-    # Egységesítés kWh/lépésre
-    p_pv       = _to_kwh_step(ts["p_pv"].to_numpy(), dt, p_are_kwh_per_step)
-    p_ue       = _to_kwh_step(ts["p_ue"].to_numpy(), dt, p_are_kwh_per_step)
-    p_grid_load= _to_kwh_step(ts["p_grid_load"].to_numpy(), dt, p_are_kwh_per_step)
-    p_grid_elh = _to_kwh_step(ts["p_grid_elh"].to_numpy(), dt, p_are_kwh_per_step)
-    p_pv_grid  = _to_kwh_step(ts["p_pv_grid"].to_numpy(), dt, p_are_kwh_per_step)
-    p_elh_in   = _to_kwh_step(ts["p_elh_in"].to_numpy(), dt, p_are_kwh_per_step)
+    # Teljesítmények [kW]
+    p_pv = ts["p_pv"].to_numpy(dtype=float)
+    p_ue = ts["p_ue"].to_numpy(dtype=float)
+    p_grid_load = ts["p_grid_load"].to_numpy(dtype=float)
+    p_grid_elh = ts["p_grid_elh"].to_numpy(dtype=float)
+    p_pv_grid = ts["p_pv_grid"].to_numpy(dtype=float)
+    p_elh_in = ts["p_elh_in"].to_numpy(dtype=float)
 
     t_hss = ts["t_hss"].to_numpy(dtype=float)
     d_cl  = ts["d_cl"].to_numpy(dtype=float)
@@ -154,7 +147,7 @@ def plot_household_fourpack_seasons(
 
         ax_e.axhline(0.0, color="black", lw=1.0)
         ax_e.set_title(f"{title} – Villamos csomópont", fontsize=fontsize)
-        ax_e.set_ylabel("Energia (kWh / 15 perc)" if p_are_kwh_per_step else "Energia (kWh / lépés)", fontsize=fontsize)
+        ax_e.set_ylabel("Teljesítmény (kW)", fontsize=fontsize)
         ax_e.grid(True, alpha=0.3)
         ax_e.tick_params(labelsize=fontsize)
 
@@ -208,5 +201,4 @@ if __name__ == "__main__":
         household_name="0420144888439778",
         window_days=3,
         dt=DT,
-        p_are_kwh_per_step=False,
     )

@@ -26,7 +26,19 @@ def _keep_15min(v: np.ndarray) -> np.ndarray:
         raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
     return v
 
+def _energy_profile_kwh_step(v: np.ndarray) -> np.ndarray:
+    """
+    Beolvasott idősor energiaként kezelve: e [kWh/lépés].
+    """
+    return np.maximum(_keep_15min(v), 0.0)
 
+
+def _power_profile_kw_from_energy(v: np.ndarray, dt: float) -> np.ndarray:
+    """
+    e [kWh/lépés] -> p [kW].
+    """
+    e_kwh_step = _energy_profile_kwh_step(v)
+    return e_kwh_step / float(dt)
 
 
 def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
@@ -47,6 +59,7 @@ def build_inputs(
         pv_ratio: float = 1.0,
         use_hss: bool = True,
         search_roots: Iterable[os.PathLike] | None = None,
+        dt: float = 0.25,
 ) -> Tuple[
     np.ndarray,  # p_pv (35040, U)
     np.ndarray,  # p_ue (35040, U)
@@ -129,32 +142,33 @@ def build_inputs(
         # --- UE (villamos fogyasztás) ---
         ue = units.get("ue") or {}
         ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
-        ue_size = float(ue.get("size")) if ue.get("size") is not None else None
-        if ue_prof and ue_prof in df.columns and ue_size is not None:
-            base = _keep_15min(df[ue_prof].to_numpy())
-            p_ue_cols.append(_norm_to_annual(base, ue_size))
+
+        if ue_prof and ue_prof in df.columns:
+            e_ue_kwh_step = _energy_profile_kwh_step(df[ue_prof].to_numpy())
+            p_ue_kw = e_ue_kwh_step / dt
+            p_ue_cols.append(p_ue_kw)
         else:
-            p_ue_cols.append(np.zeros(35040))
+            p_ue_cols.append(np.zeros(35040, dtype=float))
 
         # --- PV (termelés) ---
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
-        pv_size = float(pv.get("size")) if pv.get("size") is not None else None
-        if pv_prof and pv_prof in df.columns and pv_size is not None:
-            base = _keep_15min(df[pv_prof].to_numpy())
-            p_pv_cols.append(_norm_to_annual(base, pv_size * float(pv_ratio)))
+
+        if pv_prof and pv_prof in df.columns:
+            e_pv_kwh_step = _energy_profile_kwh_step(df[pv_prof].to_numpy()) * float(pv_ratio)
+            p_pv_kw = e_pv_kwh_step / dt
+            p_pv_cols.append(p_pv_kw)
         else:
-            p_pv_cols.append(np.zeros(35040))
+            p_pv_cols.append(np.zeros(35040, dtype=float))
 
         # BESS
-
         bess = units.get("bess") or {}
         size_bess.append(float(bess.get("bess_size", 0.0)))
         eta_bess_in_u.append(float(bess.get("eta_bess_in", 0.98)))
         eta_bess_out_u.append(float(bess.get("eta_bess_out", 0.96)))
         eta_bess_stor_u.append(float(bess.get("eta_bess_stor", 0.995)))
-        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.2)))
-        soc_bess_max_u.append(float(bess.get("soc_bess_max", 1.0)))
+        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.1)))
+        soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.9)))
         t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
 
         # --- HSS / UT (bojleres hőtároló, ELH szolgálja ki) ---
@@ -162,10 +176,10 @@ def build_inputs(
         heater = units.get("ut") or {}
 
         if use_hss:
-            # DHW profil: liter → kW (kWh/h), órára aggregálva
+            # DHW profil: liter/lépés -> e_dhw [kWh/lépés] -> p_dhw [kW]
             if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-                base_L_per_step = dhw[str(hss["profile"])].to_numpy()  # L per 15 perc (vagy amit a CSV tartalmaz)
-                base_L_per_h = _keep_15min(base_L_per_step)  # → L/ 15perc
+                L_dhw_step = np.maximum(_keep_15min(dhw[str(hss["profile"])].to_numpy()), 0.0)
+
                 RHO_WATER_KG_PER_L = 1.0
                 CP_WATER_J_PER_KGK = 4186.0
                 J_PER_KWH = 3_600_000.0
@@ -175,18 +189,19 @@ def build_inputs(
                 T_out = float(hss.get("T_out", 55))
                 dT = max(0.0, T_out - T_in)
 
-                e_kwh_per_step = base_L_per_step * KWH_PER_L_PER_K * dT
-                pth_kW = e_kwh_per_step #ez legyen kWh
-                dhw_cols.append(pth_kW.astype(float))
+                e_dhw_kwh_step = L_dhw_step * KWH_PER_L_PER_K * dT
+                p_dhw_kw = e_dhw_kwh_step / dt
+
+                dhw_cols.append(p_dhw_kw.astype(float))
             else:
                 dhw_cols.append(np.zeros(35040, dtype=float))
         else:
             # Ha nincs HSS, de van UT profil éves energiával (fűtőszál profil)
             p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-            heater_number = float(heater.get("size")) if heater.get("size") is not None else None
-            if p_el_heater_prof and p_el_heater_prof in df.columns and heater_number is not None:
-                base = _keep_15min(df[p_el_heater_prof].to_numpy())
-                p_el_heater_cols.append(_norm_to_annual(base, heater_number))
+            if p_el_heater_prof and p_el_heater_prof in df.columns:
+                e_el_heater_kwh_step = _energy_profile_kwh_step(df[p_el_heater_prof].to_numpy())
+                p_el_heater_kw = e_el_heater_kwh_step / dt
+                p_el_heater_cols.append(p_el_heater_kw)
             else:
                 p_el_heater_cols.append(np.zeros(35040, dtype=float))
 
@@ -260,6 +275,7 @@ def run(
         pv_ratio: float = 1.0,
         use_hss: bool = True,
 ) -> dict:
+    dt = 0.25
     (
         p_pv, p_ue, p_dhw, p_el_heater,
         size_elh, vol_hss_water,
@@ -274,6 +290,7 @@ def run(
         max_users=max_users,
         pv_ratio=pv_ratio,
         use_hss=use_hss,
+        dt=dt,
     )
 
     out = Path(out_dir)
@@ -337,18 +354,18 @@ def run(
             "household": name,
             "has_pv": int(np.sum(p_pv[:, u]) > 1e-9),
             "has_boiler": int((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9)),
-            "pv_gen_kwh": float(np.sum(p_pv[:, u])),
-            "load_kwh": float(np.sum(p_ue[:, u])),
-            "dhw_kwh_th": float(np.sum(p_dhw[:, u])),
+            "pv_gen_kwh": float(np.sum(p_pv[:, u]) * dt),
+            "load_kwh": float(np.sum(p_ue[:, u]) * dt),
+            "dhw_kwh_th": float(np.sum(p_dhw[:, u]) * dt),
             "grid_import_low_kwh": res["e_grid_low"],
             "grid_import_high_kwh": res["e_grid_high"],
             "grid_import_total_kwh": res["e_grid_total"],
             "grid_export_kwh": res["e_grid_export"],
-            "pv_to_load_kwh": float(np.sum(res["p_pv_load"])),
-            "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"])),
-            "grid_to_load_kwh": float(np.sum(res["p_grid_load"])),
-            "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"])),
-            "boiler_el_input_kwh": float(np.sum(res["p_elh_in"])),
+            "pv_to_load_kwh": float(np.sum(res["p_pv_load"]) * dt),
+            "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"]) * dt),
+            "grid_to_load_kwh": float(np.sum(res["p_grid_load"]) * dt),
+            "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"]) * dt),
+            "boiler_el_input_kwh": float(np.sum(res["p_elh_in"]) * dt),
             "final_hss_energy_kwh": float(res["e_hss_stor"][-1]) if len(res["e_hss_stor"]) else 0.0,
             "objective_value": res["objective_value"],
             "objective_type": res["objective_type"],

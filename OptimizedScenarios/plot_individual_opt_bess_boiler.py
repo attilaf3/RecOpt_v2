@@ -28,7 +28,7 @@ RESULTS_DIR = r"results_individual_opt_bess_boiler"
 HOUSEHOLD_NAME = "0420144653422463"   # timeseries_<...>.csv-ben a <...> rész
 WINDOW_DAYS = 3                       # 2 vagy 3
 DT = 0.25                             # 15 perc (óra)
-P_ARE_KWH_PER_STEP = False            # True: p_* oszlopok kWh/lépés; False: kW
+
 
 DPI = 300
 FONTSIZE = 22
@@ -39,12 +39,6 @@ plt.rcParams.update({"font.size": FONTSIZE - 2})
 
 def _path_effect(lw: float):
     return [pe.Stroke(linewidth=1.5 * lw, foreground="w"), pe.Normal()]
-
-
-def _to_kwh_step(x: np.ndarray, dt: float, already_kwh_step: bool) -> np.ndarray:
-    """p oszlopok egységesítése kWh/lépésre."""
-    x = np.asarray(x, dtype=float).reshape(-1)
-    return x if already_kwh_step else x * dt
 
 
 def _load_timeseries(out_dir: Path, household: str) -> tuple[pd.DataFrame, Path]:
@@ -97,56 +91,51 @@ def plot_household_sixpack_seasons(
     household_name: str,
     window_days: int = 3,
     dt: float = 0.25,
-    p_are_kwh_per_step: bool = False,
 ):
     out_dir = Path(results_dir)
     ts, ts_path = _load_timeseries(out_dir, household_name)
 
     # Minimálisan szükséges oszlopok / alternatívák
     required_any = [
-        ["p_pv"],
-        ["p_ue", "p_total_load"],
-        ["p_elh_in"],
-        ["p_bess_in"],
-        ["p_bess_out", "p_bess_load"],
-        ["e_bess"],
+        ["p_pv_kw"],
+        ["p_ue_kw"],
+        ["p_elh_in_kw"],
+        ["p_bess_in_kw"],
+        ["p_bess_out_kw", "p_bess_load_kw"],
+        ["e_bess_kwh"],
         ["d_bess"],
-        ["t_hss"],
+        ["t_hss_C"],
         ["d_cl"],
     ]
     for alternatives in required_any:
         if not any(c in ts.columns for c in alternatives):
             raise ValueError(f"Hiányzó oszlop. Ezek közül legalább az egyik kellene: {alternatives}")
 
-    # -------- Villamos csomópont komponensek, kWh/lépésben --------
-    p_pv = _to_kwh_step(_first_existing_col(ts, ["p_pv"]), dt, p_are_kwh_per_step)
-    p_ue = _to_kwh_step(_first_existing_col(ts, ["p_ue", "p_total_load"]), dt, p_are_kwh_per_step)
+    # -------- Villamos csomópont komponensek, teljesítmények [kW] --------
+    p_pv = _first_existing_col(ts, ["p_pv_kw"])
+    p_ue = _first_existing_col(ts, ["p_ue_kw"])
 
-    p_elh_in = _to_kwh_step(_first_existing_col(ts, ["p_elh_in"]), dt, p_are_kwh_per_step)
-    p_bess_in = _to_kwh_step(_first_existing_col(ts, ["p_bess_in"]), dt, p_are_kwh_per_step)
-    p_bess_out = _to_kwh_step(_first_existing_col(ts, ["p_bess_out", "p_bess_load"]), dt, p_are_kwh_per_step)
+    p_elh_in = _first_existing_col(ts, ["p_elh_in_kw"])
+    p_bess_in = _first_existing_col(ts, ["p_bess_in_kw"])
+    p_bess_out = _first_existing_col(ts, ["p_bess_out_kw", "p_bess_load_kw"])
 
     # Import: ha van direkt p_grid_import, azt használjuk; ha nincs, splitből rakjuk össze.
-    if "p_grid_import" in ts.columns:
-        p_grid_import = _to_kwh_step(ts["p_grid_import"].to_numpy(dtype=float), dt, p_are_kwh_per_step)
+    if "p_grid_import_kw" in ts.columns:
+        p_grid_import = ts["p_grid_import_kw"].to_numpy(dtype=float)
     else:
-        p_grid_import = _to_kwh_step(
-            _col(ts, "p_grid_load") + _col(ts, "p_grid_elh") + _col(ts, "p_grid_bess"),
-            dt,
-            p_are_kwh_per_step,
+        p_grid_import = (
+                _col(ts, "p_grid_load_kw")
+                + _col(ts, "p_grid_elh_kw")
+                + _col(ts, "p_grid_bess_kw")
         )
 
     # Export: kombinált kódban általában p_grid_export és p_pv_grid is ugyanaz.
-    p_pv_export = _to_kwh_step(
-        _first_existing_col(ts, ["p_grid_export", "p_pv_grid"]),
-        dt,
-        p_are_kwh_per_step,
-    )
+    p_pv_export = _first_existing_col(ts, ["p_grid_export_kw", "p_pv_grid_kw"])
 
     # -------- Állapotok / bináris jelek --------
-    soc = _first_existing_col(ts, ["e_bess"])      # kWh, nem szorozzuk dt-vel
+    soc = _first_existing_col(ts, ["e_bess_kwh"])
     d_bess = _first_existing_col(ts, ["d_bess"])
-    t_hss = _first_existing_col(ts, ["t_hss"])     # °C
+    t_hss = _first_existing_col(ts, ["t_hss_C"])
     d_cl = _first_existing_col(ts, ["d_cl"])
 
     T = len(ts)
@@ -223,10 +212,7 @@ def plot_household_sixpack_seasons(
 
         ax_e.axhline(0.0, color="black", lw=1.0)
         ax_e.set_title(f"{title} – Villamos csomópont", fontsize=FONTSIZE)
-        ax_e.set_ylabel(
-            "Energia (kWh / 15 perc)" if abs(dt - 0.25) < 1e-9 else "Energia (kWh / lépés)",
-            fontsize=FONTSIZE,
-        )
+        ax_e.set_ylabel("Teljesítmény (kW)", fontsize=FONTSIZE)
         ax_e.grid(True, alpha=0.3)
         ax_e.tick_params(labelsize=FONTSIZE)
 
@@ -314,9 +300,8 @@ def plot_household_sixpack_seasons(
 
 if __name__ == "__main__":
     plot_household_sixpack_seasons(
-        RESULTS_DIR=r"results_individual_opt_bess_boiler",
-        HOUSEHOLD_NAME = "0420144653422463",
-        WINDOW_DAYS = 3,
-        DT = 0.25,
-        P_ARE_KWH_PER_STEP = False,
+        results_dir=RESULTS_DIR,
+        household_name=HOUSEHOLD_NAME,
+        window_days=WINDOW_DAYS,
+        dt=DT,
     )

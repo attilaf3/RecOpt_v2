@@ -1,6 +1,5 @@
 import numpy as np
 import pulp
-import pandas as pd
 
 
 def individual_opt_boiler(
@@ -12,7 +11,7 @@ def individual_opt_boiler(
     vol_hss_water=0.0,      # liter
     T_env=20.0,
     T_max=65.0,
-    T_min=10.0,
+    T_min=38.0,
     T_in=10.0,
     a_hss=0.01275,
     eta_elh=0.95,
@@ -52,7 +51,7 @@ def individual_opt_boiler(
 
     prob = pulp.LpProblem("individual_boiler_grid_min", pulp.LpMinimize)
 
-    # Villamos energiaáramok
+    # Villamos teljesítményáramok
     p_pv_load = [pulp.LpVariable(f"p_pv_load_{t}", lowBound=0) for t in time_set]
     p_pv_elh  = [pulp.LpVariable(f"p_pv_elh_{t}", lowBound=0) for t in time_set]
     p_pv_grid = [pulp.LpVariable(f"p_pv_grid_{t}", lowBound=0) for t in time_set]
@@ -66,7 +65,7 @@ def individual_opt_boiler(
 
     # HSS / ELH
     if hss_active:
-        p_elh_in = [pulp.LpVariable(f"p_elh_in_{t}", lowBound=0, upBound=size_elh*dt) for t in time_set]
+        p_elh_in = [pulp.LpVariable(f"p_elh_in_{t}", lowBound=0, upBound=size_elh) for t in time_set]
         p_hss_in = [pulp.LpVariable(f"p_hss_in_{t}", lowBound=0) for t in time_set]
         p_hss_out = [pulp.LpVariable(f"p_hss_out_{t}", lowBound=0) for t in time_set]
         t_hss = [pulp.LpVariable(f"t_hss_{t}", lowBound=T_min, upBound=T_max) for t in time_set]
@@ -107,22 +106,23 @@ def individual_opt_boiler(
 
             # Hőtároló dinamika
             prob += (
-                vol_hss_water * c_hss * (t_hss[k] - t_hss[t])
-                == p_hss_in[t] - p_hss_out[t] - a_hss * (t_hss[t] - T_env) * dt
+                    vol_hss_water * c_hss * (t_hss[k] - t_hss[t])
+                    == dt * (p_hss_in[t] - p_hss_out[t])
+                    - a_hss * (t_hss[t] - T_env) * dt
             ), f"hss_balance_{t}"
 
             # következő lépésben kivehető max hő
             prob += (
-                p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in)
+                p_hss_out[k] <= vol_hss_water * c_hss * (t_hss[t] - T_in) / dt
             ), f"hss_max_out_{t}"
 
-            # töltési hely
+            # max betöltés
             prob += (
-                p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t])
-            ), f"hss_charge_space_{t}"
+                p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t]) / dt
+            ), f"hss_max_in_{t}"
 
             if not run_lp:
-                prob += p_elh_in[t] <= size_elh * dt * d_cl[t], f"elh_onoff_{t}"
+                prob += p_elh_in[t] <= size_elh * d_cl[t], f"elh_onoff_{t}"
 
             if not run_lp and t != 0 and t != T - 1:
                 prob += d_cl[t + 1] >= d_cl[t] - d_cl[t - 1], f"cl_min_on_time_{t}"
@@ -132,7 +132,7 @@ def individual_opt_boiler(
             prob += p_grid_elh[t] == 0, f"no_hss_grid_elh_{t}"
 
         # 15 perces import felosztása kedvezményes és piaci részre
-        e_imp_t = p_grid_load[t] + p_grid_elh[t]
+        e_imp_t = dt * (p_grid_load[t] + p_grid_elh[t])
 
         prob += e_grid_low_step[t] + e_grid_high_step[t] == e_imp_t, f"grid_step_split_{t}"
 
@@ -171,10 +171,10 @@ def individual_opt_boiler(
             price_grid_low * e_grid_low_step[t] + price_grid_high * e_grid_high_step[t]
             for t in time_set
         )
-        revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] for t in time_set)
+        revenue_export = pulp.lpSum(price_pv_grid * dt * p_pv_grid[t] for t in time_set)
         prob += cost_grid - revenue_export
     elif objective == "grid":
-        prob += pulp.lpSum((p_grid_load[t] + p_grid_elh[t] + p_pv_grid[t]) for t in time_set)
+        prob += pulp.lpSum(dt * (p_grid_load[t] + p_grid_elh[t] + p_pv_grid[t]) for t in time_set)
     else:
         raise ValueError("objective must be 'economic' or 'grid'")
 
@@ -217,7 +217,7 @@ def individual_opt_boiler(
     e_grid_low_v = float(np.sum(e_grid_low_step_v))
     e_grid_high_v = float(np.sum(e_grid_high_step_v))
     e_grid_total_v = e_grid_low_v + e_grid_high_v
-    e_grid_export_v = float(np.sum(p_pv_grid_v))
+    e_grid_export_v = float(np.sum(p_pv_grid_v) * dt)
 
     grid_cost = float(np.sum(
         price_grid_low * e_grid_low_step_v + price_grid_high * e_grid_high_step_v
