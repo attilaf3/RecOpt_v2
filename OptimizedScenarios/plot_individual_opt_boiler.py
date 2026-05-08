@@ -79,14 +79,20 @@ def plot_household_fourpack_seasons(
     p_ue = ts["p_ue"].to_numpy(dtype=float)
     p_grid_load = ts["p_grid_load"].to_numpy(dtype=float)
     p_grid_elh = ts["p_grid_elh"].to_numpy(dtype=float)
-    p_pv_grid = ts["p_pv_grid"].to_numpy(dtype=float)
+    if "p_grid_export" in ts.columns:
+        p_pv_grid = ts["p_grid_export"].to_numpy(dtype=float)
+    else:
+        p_pv_grid = ts["p_pv_grid"].to_numpy(dtype=float)
     p_elh_in = ts["p_elh_in"].to_numpy(dtype=float)
 
     t_hss = ts["t_hss"].to_numpy(dtype=float)
     d_cl  = ts["d_cl"].to_numpy(dtype=float)
 
     # Villamos csomópont komponensek
-    p_grid_import = p_grid_load + p_grid_elh
+    if "p_grid_import" in ts.columns:
+        p_grid_import = ts["p_grid_import"].to_numpy(dtype=float)
+    else:
+        p_grid_import = p_grid_load + p_grid_elh
 
     T = len(ts)
     steps_per_day = int(round(24 / dt))

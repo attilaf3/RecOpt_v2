@@ -335,17 +335,32 @@ def run(
             "p_pv": p_pv[:, u],
             "p_ue": p_ue[:, u],
             "p_dhw": p_dhw[:, u],
+
             "p_pv_load": res["p_pv_load"],
             "p_pv_elh": res["p_pv_elh"],
             "p_pv_grid": res["p_pv_grid"],
+
             "p_grid_load": res["p_grid_load"],
             "p_grid_elh": res["p_grid_elh"],
+
+            # explicit grid idősorok, BESS modellhez hasonlóan
+            "p_grid_import": res["p_grid_import"],
+            "p_grid_export": res["p_grid_export"],
+
             "p_elh_in": res["p_elh_in"],
             "p_hss_in": res["p_hss_in"],
             "p_hss_out": res["p_hss_out"],
+
             "t_hss": res["t_hss"],
             "e_hss_stor": res["e_hss_stor"],
+
             "d_cl": res["d_cl"],
+            "d_export": res["d_export"],
+
+            # tarifa bontás idősorosan is
+            "e_grid_low_step": res["e_grid_low_step"],
+            "e_grid_high_step": res["e_grid_high_step"],
+            "remaining_low_block_kwh": res["remaining_low_block_kwh"],
         })
         safe_name = str(name).replace("/", "_").replace("\\", "_")
         ts.to_csv(out / f"timeseries_{safe_name}.csv", index=False)
@@ -354,19 +369,28 @@ def run(
             "household": name,
             "has_pv": int(np.sum(p_pv[:, u]) > 1e-9),
             "has_boiler": int((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9)),
+
             "pv_gen_kwh": float(np.sum(p_pv[:, u]) * dt),
             "load_kwh": float(np.sum(p_ue[:, u]) * dt),
             "dhw_kwh_th": float(np.sum(p_dhw[:, u]) * dt),
+
             "grid_import_low_kwh": res["e_grid_low"],
             "grid_import_high_kwh": res["e_grid_high"],
-            "grid_import_total_kwh": res["e_grid_total"],
-            "grid_export_kwh": res["e_grid_export"],
+            "grid_import_total_kwh": float(np.sum(res["p_grid_import"]) * dt),
+            "grid_export_kwh": float(np.sum(res["p_grid_export"]) * dt),
+
             "pv_to_load_kwh": float(np.sum(res["p_pv_load"]) * dt),
             "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"]) * dt),
+
             "grid_to_load_kwh": float(np.sum(res["p_grid_load"]) * dt),
             "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"]) * dt),
+
             "boiler_el_input_kwh": float(np.sum(res["p_elh_in"]) * dt),
+            "boiler_th_input_kwh": float(np.sum(res["p_hss_in"]) * dt),
+            "boiler_th_output_kwh": float(np.sum(res["p_hss_out"]) * dt),
+
             "final_hss_energy_kwh": float(res["e_hss_stor"][-1]) if len(res["e_hss_stor"]) else 0.0,
+
             "objective_value": res["objective_value"],
             "objective_type": res["objective_type"],
             "status": res["status"],

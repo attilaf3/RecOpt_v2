@@ -303,7 +303,7 @@ def individual_opt_bess(
         "grid_cost_Ft": float(grid_cost),
         "grid_export_revenue_Ft": float(export_revenue),
         "net_cost_Ft": float(net_cost),
-        "objective_Ft": float(_val(prob.objective)),
+        "objective_Ft": float(pulp.value(prob.objective)),
         "status": status_str,
 
         "e_grid_low_step": e_grid_low_step_v,

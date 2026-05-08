@@ -34,7 +34,8 @@ def individual_opt_boiler(
     - BESS nincs
     - energiamegosztás nincs
     - bojler/HSS optimalizált
-    - cél: hálózati interakció minimalizálása = import + export minimum
+    - # cél: alapértelmezetten éves nettó villanyszámla minimalizálása;
+      # objective="grid" esetén hálózati interakció minimalizálása
     """
 
     p_pv = np.asarray(p_pv, dtype=float).ravel()
@@ -186,17 +187,25 @@ def individual_opt_boiler(
     if status_str not in {"Optimal", "Not Solved", "Integer Feasible", "Undefined"}:
         raise RuntimeError(f"Hiba: {status_str}")
 
-    p_pv_load_v = np.array([pulp.value(v) for v in p_pv_load], dtype=float)
-    p_pv_elh_v = np.array([pulp.value(v) for v in p_pv_elh], dtype=float)
-    p_pv_grid_v = np.array([pulp.value(v) for v in p_pv_grid], dtype=float)
-    p_grid_load_v = np.array([pulp.value(v) for v in p_grid_load], dtype=float)
-    p_grid_elh_v = np.array([pulp.value(v) for v in p_grid_elh], dtype=float)
+    def _val(x):
+        v = pulp.value(x)
+        return 0.0 if v is None else float(v)
+
+    p_pv_load_v = np.array([_val(v) for v in p_pv_load], dtype=float)
+    p_pv_elh_v = np.array([_val(v) for v in p_pv_elh], dtype=float)
+    p_pv_grid_v = np.array([_val(v) for v in p_pv_grid], dtype=float)
+    p_grid_load_v = np.array([_val(v) for v in p_grid_load], dtype=float)
+    p_grid_elh_v = np.array([_val(v) for v in p_grid_elh], dtype=float)
+
+    # Explicit grid import/export idősorok, hogy ugyanúgy legyen, mint a BESS modellben
+    p_grid_import_v = p_grid_load_v + p_grid_elh_v
+    p_grid_export_v = p_pv_grid_v
 
     if hss_active:
-        p_elh_in_v = np.array([pulp.value(v) for v in p_elh_in], dtype=float)
-        p_hss_in_v = np.array([pulp.value(v) for v in p_hss_in], dtype=float)
-        p_hss_out_v = np.array([pulp.value(v) for v in p_hss_out], dtype=float)
-        t_hss_v = np.array([pulp.value(v) for v in t_hss], dtype=float)
+        p_elh_in_v = np.array([_val(v) for v in p_elh_in], dtype=float)
+        p_hss_in_v = np.array([_val(v) for v in p_hss_in], dtype=float)
+        p_hss_out_v = np.array([_val(v) for v in p_hss_out], dtype=float)
+        t_hss_v = np.array([_val(v) for v in t_hss], dtype=float)
         e_hss_stor_v = vol_hss_water * c_hss * (t_hss_v - T_in)
     else:
         p_elh_in_v = np.zeros(T)
@@ -206,9 +215,14 @@ def individual_opt_boiler(
         e_hss_stor_v = np.zeros(T)
 
     if hss_active and not run_lp:
-        d_cl_v = np.array([pulp.value(v) for v in d_cl], dtype=float)
+        d_cl_v = np.array([_val(v) for v in d_cl], dtype=float)
     else:
         d_cl_v = np.zeros(T)
+
+    if not run_lp:
+        d_export_v = np.array([_val(v) for v in d_export], dtype=float)
+    else:
+        d_export_v = np.zeros(T)
 
     e_grid_low_step_v = np.array([float(pulp.value(v) or 0.0) for v in e_grid_low_step], dtype=float)
     e_grid_high_step_v = np.array([float(pulp.value(v) or 0.0) for v in e_grid_high_step], dtype=float)
@@ -231,6 +245,8 @@ def individual_opt_boiler(
         "p_pv_grid": p_pv_grid_v,
         "p_grid_load": p_grid_load_v,
         "p_grid_elh": p_grid_elh_v,
+        "p_grid_import": p_grid_import_v,
+        "p_grid_export": p_grid_export_v,
         "p_elh_in": p_elh_in_v,
         "p_hss_in": p_hss_in_v,
         "p_hss_out": p_hss_out_v,
@@ -243,11 +259,12 @@ def individual_opt_boiler(
         "grid_cost_Ft": grid_cost,
         "grid_export_revenue_Ft": export_revenue,
         "net_cost_Ft": net_cost,
-        "objective_value": float(pulp.value(prob.objective)),
+        "objective_value": float(_val(prob.objective)),
         "objective_type": objective,
         "status": status_str,
         "hss_active": int(hss_active),
         "d_cl": d_cl_v,
+        "d_export": d_export_v,
         "e_grid_low_step": e_grid_low_step_v,
         "e_grid_high_step": e_grid_high_step_v,
         "remaining_low_block_kwh": rem_low_v,

@@ -25,7 +25,7 @@ import matplotlib.patheffects as pe
 # BEÁLLÍTÁSOK
 # =========================
 RESULTS_DIR = r"results_individual_opt_bess"
-HOUSEHOLD_NAME = "0420144653422463"   # timeseries_<...>.csv-ben a <...> rész (ha nem pontos, keres fallbackkal)
+HOUSEHOLD_NAME = "420144653458813"   # timeseries_<...>.csv-ben a <...> rész (ha nem pontos, keres fallbackkal)
 WINDOW_DAYS = 3                       # 2 vagy 3
 DT = 0.25                             # 15 perc (óra) – az ablakok skálázásához kell
 P_ARE_KWH_PER_STEP = True             # True: p_* oszlopok kWh/lépés; False: kW
