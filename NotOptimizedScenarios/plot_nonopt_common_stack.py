@@ -61,8 +61,13 @@ def _load_household_series(
         "e_pv": "e_pv.csv",
         "e_bess_to_load": "e_bess_to_load.csv",
         "e_grid_to_load": "e_grid_to_load.csv",
+        "e_grid_to_base": "e_grid_to_base.csv",
+        "e_grid_to_boiler": "e_grid_to_boiler.csv",
         "e_inj": "e_inj.csv",
         "e_pv_to_bess": "e_pv_to_bess.csv",
+        "e_bess": "e_bess.csv",
+        "d_bess_ch": "d_bess_ch.csv",
+        "d_bess_dis": "d_bess_dis.csv",
     }
 
     out: dict[str, np.ndarray] = {}
@@ -130,6 +135,10 @@ def _plot_one_season(
     e_grid_to_load = series["e_grid_to_load"][sl]
     e_inj = series["e_inj"][sl]
     e_pv_to_bess = series["e_pv_to_bess"][sl]
+    e_bess = series["e_bess"][sl]
+    d_bess_ch = series["d_bess_ch"][sl]
+    d_bess_dis = series["d_bess_dis"][sl]
+
 
     # --- teljesítmény [kW] ---
     p_load = _energy_to_power(e_load, dt)
@@ -146,14 +155,20 @@ def _plot_one_season(
     bar_width = 0.8 * dt
 
     fig, axes = plt.subplots(
-        nrows=1,
+        nrows=2,
         ncols=2,
-        figsize=FIGSIZE,
-        gridspec_kw={"width_ratios": [0.82, 0.18]},
+        figsize=(22, 11),
+        gridspec_kw={
+            "width_ratios": [0.82, 0.18],
+            "height_ratios": [0.5, 0.5],
+        },
+        sharex="col",
     )
 
-    ax = axes[0]
-    ax_leg = axes[1]
+    ax = axes[0, 0]
+    ax_leg = axes[0, 1]
+    ax_soc = axes[1, 0]
+    ax_soc_leg = axes[1, 1]
 
     # ======================
     # 0 FELETT: bejövő teljesítmények
@@ -250,6 +265,54 @@ def _plot_one_season(
     ax_leg.legend(handles, labels, loc="center", frameon=False)
     ax_leg.axis("off")
 
+
+    # Alsó
+    h_soc, = ax_soc.plot(
+        time_h,
+        e_bess,
+        linewidth=2.0,
+        label="BESS SOC",
+    )
+
+    ax_ctrl = ax_soc.twinx()
+
+    h_ch, = ax_ctrl.step(
+        time_h,
+        d_bess_ch,
+        where="post",
+        linewidth=1.5,
+        color="gray",
+        alpha=0.8,
+        label="Töltés jel",
+    )
+
+    h_dis, = ax_ctrl.step(
+        time_h,
+        d_bess_dis,
+        where="post",
+        linewidth=1.5,
+        color="lightgray",
+        alpha=0.9,
+        label="Kisütés jel",
+    )
+
+    ax_soc.set_ylabel("BESS energiaszint [kWh]")
+    ax_soc.set_xlabel("Idő [h]")
+    ax_soc.grid(True, alpha=0.3)
+
+    ax_ctrl.set_ylabel("Vezérlőjel [-]")
+    ax_ctrl.set_ylim(-0.05, 1.05)
+    ax_ctrl.set_yticks([0, 1])
+
+    ax_soc_leg.legend(
+        [h_soc, h_ch, h_dis],
+        ["BESS SOC [kWh]", "Töltés jel", "Kisütés jel"],
+        loc="center",
+        frameon=False,
+    )
+    ax_soc_leg.axis("off")
+
+
     fig.tight_layout()
 
     out_png = results_dir / f"household_{household_name}_{season_key}_{WINDOW_DAYS}days_power_stack.png"
@@ -301,7 +364,7 @@ def plot_household_power_stack_seasons(
 
 if __name__ == "__main__":
     plot_household_power_stack_seasons(
-        results_dir=r"results_base_pv_bess_boiler",
+        results_dir=r"results_base_with_bess",
         household_name="0420144888439778",
         window_days=3,
         dt=DT,

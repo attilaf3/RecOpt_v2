@@ -14,16 +14,6 @@ import matplotlib.pyplot as plt
 
 DT = 0.25  # 15 perc
 
-# --- 15 perces input builder ---------------------------------------------------
-def _ensure_15min(v: np.ndarray) -> np.ndarray:
-
-    v = np.asarray(v, dtype=float).ravel()
-    if v.size == 35040:
-        return v
-    if v.size == 8760:
-        return np.repeat(v / 4.0, 4)
-    raise ValueError(f"A profil hossza {v.size}, de itt 35040.")
-
 
 def _as_15min_energy(profile: np.ndarray) -> np.ndarray:
 
@@ -47,16 +37,11 @@ def build_inputs(
     profiles_csv_path: os.PathLike,
     dhw_profile_path: os.PathLike,
     max_users: int = 10,
-    pv_ratio: float = 1.0,
-    use_hss: bool = True,
     search_roots: Iterable[os.PathLike] | None = None,
 ) -> Tuple[
     np.ndarray,  # e_pv (35040, U) [kWh / 15 perc]
     np.ndarray,  # e_ue (35040, U) [kWh / 15 perc]
-    np.ndarray,  # e_dhw (35040, U) [kWh / 15 perc]
     np.ndarray,  # e_el_heater (35040, U) [kWh / 15 perc]
-    np.ndarray,  # size_elh (U,)
-    np.ndarray,  # vol_hss_water (U,)
     np.ndarray,  # size_bess (U,)
     np.ndarray,  # eta_bess_in (U,)
     np.ndarray,  # eta_bess_out (U,)
@@ -76,7 +61,6 @@ def build_inputs(
 
     sim_yaml_path = Path(sim_yaml_path)
     profiles_csv_path = Path(profiles_csv_path)
-    dhw_profile_path = Path(dhw_profile_path)
 
     if search_roots is None:
         search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
@@ -93,25 +77,11 @@ def build_inputs(
     df.columns = [str(c) for c in df.columns]
     df = df[[c for c in df.columns if c.lower() not in EXCLUDE]]
 
-    dhw = pd.read_csv(dhw_profile_path, index_col=0)
-    dhw.columns = [str(c) for c in dhw.columns]
-
     e_pv_cols: list[np.ndarray] = []
     e_ue_cols: list[np.ndarray] = []
-    e_dhw_cols: list[np.ndarray] = []
     e_el_heater_cols: list[np.ndarray] = []
 
-    size_elh = []
-    vol_hss_water = []
     user_names = []
-
-    T_env_u = []
-    T_min_u = []
-    T_max_u = []
-    a_hss_u = []
-    T_in_u = []
-    eta_elh_u = []
-    t_hss_min_in_u = []
 
     size_bess = []
     eta_bess_in_u = []
@@ -141,10 +111,11 @@ def build_inputs(
             e_ue_cols.append(np.zeros(35040, dtype=float))
 
         # --- PV (termelés), 15 perc [kWh / lépés] ---
+        n_pv = 7
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
         if pv_prof and pv_prof in df.columns:
-            e_pv_cols.append(_as_15min_energy(df[pv_prof].to_numpy()) * float(pv_ratio))
+            e_pv_cols.append(_as_15min_energy(df[pv_prof].to_numpy()) / n_pv)
         else:
             e_pv_cols.append(np.zeros(35040, dtype=float))
 
@@ -158,44 +129,15 @@ def build_inputs(
         soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.9)))
         t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
 
-        # --- HSS / UT ---
-        hss = units.get("hss") or {}
+        # nincs HSS, az UT profil is 15 perces energia [kWh / lépés]
         heater = units.get("ut") or {}
 
-        if use_hss:
-            # DHW profil: liter / 15 perc → hőenergia [kWh / 15 perc]
-            if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-                base_l_per_step = _ensure_15min(dhw[str(hss["profile"])].to_numpy())
-
-                rho_water_kg_per_l = 1.0
-                cp_water_j_per_kgk = 4186.0
-                j_per_kwh = 3_600_000.0
-                kwh_per_l_per_k = rho_water_kg_per_l * cp_water_j_per_kgk / j_per_kwh
-
-                T_in = float(hss.get("T_in", 10))
-                T_out = float(hss.get("T_out", 55))
-                dT = max(0.0, T_out - T_in)
-
-                e_dhw_cols.append((base_l_per_step * kwh_per_l_per_k * dT).astype(float))
-            else:
-                e_dhw_cols.append(np.zeros(35040, dtype=float))
+        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
+        if p_el_heater_prof and p_el_heater_prof in df.columns:
+            e_el_heater_cols.append(_as_15min_energy(df[p_el_heater_prof].to_numpy()))
         else:
-            # Ha nincs HSS, az UT profil is 15 perces energia [kWh / lépés].
-            p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-            if p_el_heater_prof and p_el_heater_prof in df.columns:
-                e_el_heater_cols.append(_as_15min_energy(df[p_el_heater_prof].to_numpy()))
-            else:
-                e_el_heater_cols.append(np.zeros(35040, dtype=float))
+            e_el_heater_cols.append(np.zeros(35040, dtype=float))
 
-        size_elh.append(float(hss.get("size_elh", 0.0)))
-        vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
-        T_env_u.append(float(hss.get("T_env", 20)))
-        T_max_u.append(float(hss.get("T_max", 65)))
-        T_min_u.append(float(hss.get("T_min", 38)))
-        T_in_u.append(float(hss.get("T_in", 10)))
-        a_hss_u.append(float(hss.get("a_hss", 0.01275)))
-        eta_elh_u.append(float(hss.get("eta_elh", 0.95)))
-        t_hss_min_in_u.append(float(hss.get("t_hss_min_in", 0.0)))
 
     if not user_names:
         raise RuntimeError("Nincs érvényes felhasználó.")
@@ -205,24 +147,16 @@ def build_inputs(
     e_pv = np.column_stack(e_pv_cols).astype(float)
     e_ue = np.column_stack(e_ue_cols).astype(float)
 
-    if use_hss:
-        e_dhw = np.column_stack(e_dhw_cols).astype(float) if e_dhw_cols else np.zeros((35040, U), dtype=float)
-        e_el_heater = np.zeros((35040, U), dtype=float)
-    else:
-        e_dhw = np.zeros((35040, U), dtype=float)
-        e_el_heater = (
-            np.column_stack(e_el_heater_cols).astype(float)
-            if e_el_heater_cols
-            else np.zeros((35040, U), dtype=float)
-        )
+    e_el_heater = (
+        np.column_stack(e_el_heater_cols).astype(float)
+        if e_el_heater_cols
+        else np.zeros((35040, U), dtype=float)
+    )
 
     return (
         e_pv,
         e_ue,
-        e_dhw,
         e_el_heater,
-        np.asarray(size_elh, dtype=float),
-        np.asarray(vol_hss_water, dtype=float),
         np.asarray(size_bess, dtype=float),
         np.asarray(eta_bess_in_u, dtype=float),
         np.asarray(eta_bess_out_u, dtype=float),
@@ -230,13 +164,6 @@ def build_inputs(
         np.asarray(soc_bess_min_u, dtype=float),
         np.asarray(soc_bess_max_u, dtype=float),
         np.asarray(t_bess_min_u, dtype=float),
-        T_env_u,
-        T_max_u,
-        T_min_u,
-        T_in_u,
-        a_hss_u,
-        eta_elh_u,
-        t_hss_min_in_u,
         user_names,
     )
 
@@ -403,6 +330,9 @@ def simulate_one_user_greedy(
     e_grid_to_load = np.zeros(T, dtype=float)
     e_inj = np.zeros(T, dtype=float)
     e_bess = np.zeros(T, dtype=float)
+    d_bess_ch = np.zeros(T, dtype=float)
+    d_bess_dis = np.zeros(T, dtype=float)
+
 
     if not use_bess or bess_size_kwh <= 1e-12:
         e_pv_to_load = np.minimum(e_load, e_pv)
@@ -420,7 +350,8 @@ def simulate_one_user_greedy(
 
         e_bess_max_step = p_bess_max_kw * DT
 
-        soc = soc_min_kwh
+        soc = 0.5 * bess_size_kwh
+        soc = min(max(soc, soc_min_kwh), soc_max_kwh)
 
         for t in range(T):
             soc *= eta_bess_stor
@@ -455,6 +386,9 @@ def simulate_one_user_greedy(
             e_inj[t] = max(surplus, 0.0)
             e_bess[t] = soc
 
+            d_bess_ch[t] = 1.0 if charge > 1e-12 else 0.0
+            d_bess_dis[t] = 1.0 if discharge > 1e-12 else 0.0
+
     load_kwh = e_load.sum()
     pv_kwh = e_pv.sum()
     pv_to_load_kwh = e_pv_to_load.sum()
@@ -477,14 +411,22 @@ def simulate_one_user_greedy(
     )
 
     # SCI: önfogyasztási index.
-    # A helyben termelt PV hányadát használjuk fel közvetlenül az adott időlépésben.
-    # A BESS-be töltött PV itt nem számít közvetlen felhasználásnak.
-    self_consumed_pv_kwh = pv_to_load_kwh
+    # A megtermelt PV mekkora része marad helyben:
+    # - közvetlen PV -> fogyasztás
+    # - PV -> BESS töltés
+    #
+    # Fontos: SCI-ben a PV->BESS töltést számoljuk,
+    # nem a későbbi BESS->load kisütést, mert az már veszteségekkel csökkentett energia.
+    self_consumed_pv_kwh = pv_to_load_kwh + pv_to_bess_kwh
     self_consumption_ratio = self_consumed_pv_kwh / pv_kwh if pv_kwh > 1e-12 else 0.0
+    self_consumption_ratio = min(max(self_consumption_ratio, 0.0), 1.0)
 
     # SSI: önellátási index.
-    # A helyi igény hányadát fedezzük helyben termelt energiából.
-    # A PV-ből töltött BESS későbbi kisütése beleszámít, mert helyi termelésből ered.
+    # A fogyasztás mekkora részét fedezi helyi energia:
+    # - közvetlen PV -> fogyasztás
+    # - BESS -> fogyasztás
+    #
+    # Itt a BESS kisütés számít, mert ez ténylegesen fogyasztást lát el.
     locally_supplied_load_kwh = pv_to_load_kwh + bess_to_load_kwh
     self_sufficiency_ratio = locally_supplied_load_kwh / load_kwh if load_kwh > 1e-12 else 0.0
     self_sufficiency_ratio = min(max(self_sufficiency_ratio, 0.0), 1.0)
@@ -503,6 +445,8 @@ def simulate_one_user_greedy(
             "e_local_to_boiler": split["e_local_to_boiler"],
             "e_inj": e_inj,
             "e_bess": e_bess,
+            "d_bess_ch": d_bess_ch,
+            "d_bess_dis": d_bess_dis,
         },
 
         "annual": {
@@ -641,9 +585,7 @@ def run_case(
     dhw_profiles_csv: str,
     out_dir: str,
     max_users: int,
-    pv_ratio: float,
     include_bess: bool,
-    include_boiler: bool,
     bess_share_pct: float = 100.0,
 ):
     out_case = Path(out_dir)
@@ -652,10 +594,7 @@ def run_case(
     (
         e_pv,
         e_ue,
-        e_dhw,
         e_el_heater,
-        size_elh,
-        vol_hss_water,
         size_bess,
         eta_bess_in_u,
         eta_bess_out_u,
@@ -663,27 +602,18 @@ def run_case(
         soc_bess_min_u,
         soc_bess_max_u,
         t_bess_min_u,
-        T_env_u,
-        T_max_u,
-        T_min_u,
-        T_in_u,
-        a_hss_u,
-        eta_elh_u,
-        t_hss_min_in_u,
         user_names,
     ) = build_inputs(
         sim_yaml_path=sim_yaml,
         profiles_csv_path=profiles_csv,
         dhw_profile_path=dhw_profiles_csv,
         max_users=max_users,
-        pv_ratio=pv_ratio,
-        use_hss=False,
     )
 
     U = len(user_names)
     T = e_ue.shape[0]
 
-    e_boiler = e_el_heater if include_boiler else np.zeros_like(e_el_heater)
+    e_boiler = e_el_heater
     e_total_load = e_ue + e_boiler
 
     rows = []
@@ -698,6 +628,8 @@ def run_case(
     ts_e_grid_to_boiler = np.zeros((T, U), dtype=float)
     ts_e_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
+    ts_d_bess_ch = np.zeros((T, U), dtype=float)
+    ts_d_bess_dis = np.zeros((T, U), dtype=float)
 
     pv_annual_kwh = e_pv.sum(axis=0)
     has_pv_arr = pv_annual_kwh > 1e-9
@@ -737,9 +669,6 @@ def run_case(
         annual = sim["annual"]
         times = sim["timeseries"]
 
-        pv_annual_kwh = e_pv.sum(axis=0)
-        has_pv_arr = pv_annual_kwh > 1e-9
-
         base_load_kwh = e_ue[:, u].sum()
         boiler_kwh = e_boiler[:, u].sum()
 
@@ -747,7 +676,7 @@ def run_case(
             "user_name": user_names[u],
             "has_pv": bool(e_pv[:, u].sum() > 1e-9),
             "has_bess": bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
-            "has_boiler": bool(include_boiler and e_boiler[:, u].sum() > 1e-9),
+            "has_boiler": bool(e_boiler[:, u].sum() > 1e-9),
             "group_label": (
                 "PV+BESS" if (has_pv_arr[u] and bess_enabled_arr[u] and size_bess[u] > 1e-9)
                 else "PV" if has_pv_arr[u]
@@ -793,6 +722,8 @@ def run_case(
         ts_e_grid_to_boiler[:, u] = times["e_grid_to_boiler"]
         ts_e_inj[:, u] = times["e_inj"]
         ts_e_bess[:, u] = times["e_bess"]
+        ts_d_bess_ch[:, u] = times["d_bess_ch"]
+        ts_d_bess_dis[:, u] = times["d_bess_dis"]
 
     per_user_df = pd.DataFrame(rows)
     per_user_df.to_csv(out_case / "per_user_summary.csv", index=False)
@@ -831,14 +762,21 @@ def run_case(
         "bess_enabled_user_count": int(bess_enabled_arr.sum()),
     }
 
+    total["self_consumed_pv_kwh"] = (
+            total["pv_to_load_kwh"] + total["pv_to_bess_kwh"]
+    )
+
     total["self_consumption_ratio"] = (
-        total["pv_to_load_kwh"] / total["pv_kwh"]
+        total["self_consumed_pv_kwh"] / total["pv_kwh"]
         if total["pv_kwh"] > 1e-12 else 0.0
     )
+
+    total["self_consumption_ratio"] = min(max(total["self_consumption_ratio"], 0.0), 1.0)
     total["self_sufficiency_ratio"] = (
         total["locally_supplied_load_kwh"] / total["total_load_kwh"]
         if total["total_load_kwh"] > 1e-12 else 0.0
     )
+
     total["self_sufficiency_ratio"] = min(max(total["self_sufficiency_ratio"], 0.0), 1.0)
     total["SCI"] = total["self_consumption_ratio"]
     total["SSI"] = total["self_sufficiency_ratio"]
@@ -861,6 +799,8 @@ def run_case(
     save_ts(ts_e_grid_to_boiler, "e_grid_to_boiler.csv")
     save_ts(ts_e_inj, "e_inj.csv")
     save_ts(ts_e_bess, "e_bess.csv")
+    save_ts(ts_d_bess_ch, "d_bess_ch.csv")
+    save_ts(ts_d_bess_dis, "d_bess_dis.csv")
 
     community_ts = pd.DataFrame({
         "e_load_total": ts_e_load.sum(axis=1),
