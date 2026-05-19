@@ -57,7 +57,6 @@ def build_inputs(
         dhw_profile_path: os.PathLike,
         max_users: int = 10,
         pv_ratio: float = 1.0,
-        use_hss: bool = True,
         search_roots: Iterable[os.PathLike] | None = None,
         dt: float = 0.25,
 ) -> Tuple[
@@ -120,14 +119,6 @@ def build_inputs(
     eta_elh_u = []
     t_hss_min_in_u = []
 
-    size_bess = []
-    eta_bess_in_u = []
-    eta_bess_out_u = []
-    eta_bess_stor_u = []
-    soc_bess_min_u = []
-    soc_bess_max_u = []
-    t_bess_min_u = []
-
     for user_key in users_list:
         ypath = _find_user_yaml(search_roots, user_key)
         if not ypath:
@@ -161,49 +152,38 @@ def build_inputs(
         else:
             p_pv_cols.append(np.zeros(35040, dtype=float))
 
-        # BESS
-        bess = units.get("bess") or {}
-        size_bess.append(float(bess.get("bess_size", 0.0)))
-        eta_bess_in_u.append(float(bess.get("eta_bess_in", 0.98)))
-        eta_bess_out_u.append(float(bess.get("eta_bess_out", 0.96)))
-        eta_bess_stor_u.append(float(bess.get("eta_bess_stor", 0.995)))
-        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.1)))
-        soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.9)))
-        t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
 
-        # --- HSS / UT (bojleres hőtároló, ELH szolgálja ki) ---
+        # --- HSS / bojler adatok ---
         hss = units.get("hss") or {}
         heater = units.get("ut") or {}
 
-        if use_hss:
-            # DHW profil: liter/lépés -> e_dhw [kWh/lépés] -> p_dhw [kW]
-            if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-                L_dhw_step = np.maximum(_keep_15min(dhw[str(hss["profile"])].to_numpy()), 0.0)
+        # DHW profil: liter/lépés -> e_dhw [kWh/lépés] -> p_dhw [kW]
+        if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
+            L_dhw_step = np.maximum(_keep_15min(dhw[str(hss["profile"])].to_numpy()), 0.0)
 
-                RHO_WATER_KG_PER_L = 1.0
-                CP_WATER_J_PER_KGK = 4186.0
-                J_PER_KWH = 3_600_000.0
-                KWH_PER_L_PER_K = RHO_WATER_KG_PER_L * CP_WATER_J_PER_KGK / J_PER_KWH
+            RHO_WATER_KG_PER_L = 1.0
+            CP_WATER_J_PER_KGK = 4186.0
+            J_PER_KWH = 3_600_000.0
+            KWH_PER_L_PER_K = RHO_WATER_KG_PER_L * CP_WATER_J_PER_KGK / J_PER_KWH
 
-                T_in = float(hss.get("T_in", 10))
-                T_out = float(hss.get("T_out", 55))
-                dT = max(0.0, T_out - T_in)
+            T_in = float(hss.get("T_in", 10))
+            T_out = float(hss.get("T_out", 55))
+            dT = max(0.0, T_out - T_in)
 
-                e_dhw_kwh_step = L_dhw_step * KWH_PER_L_PER_K * dT
-                p_dhw_kw = e_dhw_kwh_step / dt
-
-                dhw_cols.append(p_dhw_kw.astype(float))
-            else:
-                dhw_cols.append(np.zeros(35040, dtype=float))
+            e_dhw_kwh_step = L_dhw_step * KWH_PER_L_PER_K * dT
+            p_dhw_kw = e_dhw_kwh_step / dt
+            dhw_cols.append(p_dhw_kw.astype(float))
         else:
-            # Ha nincs HSS, de van UT profil éves energiával (fűtőszál profil)
-            p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-            if p_el_heater_prof and p_el_heater_prof in df.columns:
-                e_el_heater_kwh_step = _energy_profile_kwh_step(df[p_el_heater_prof].to_numpy())
-                p_el_heater_kw = e_el_heater_kwh_step / dt
-                p_el_heater_cols.append(p_el_heater_kw)
-            else:
-                p_el_heater_cols.append(np.zeros(35040, dtype=float))
+            dhw_cols.append(np.zeros(35040, dtype=float))
+
+        # Fix villamos bojlerprofil / UT profil
+        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
+        if p_el_heater_prof and p_el_heater_prof in df.columns:
+            p_el_heater_cols.append(
+                _power_profile_kw_from_energy(df[p_el_heater_prof].to_numpy(), dt)
+            )
+        else:
+            p_el_heater_cols.append(np.zeros(35040, dtype=float))
 
         # Ha nincs HSS, akkor nulla méretű bojlert feltételezünk
         size_elh.append(float(hss.get("size_elh", 0.0)))
@@ -230,13 +210,8 @@ def build_inputs(
     p_pv = np.column_stack(p_pv_cols).astype(float)
     p_ue = np.column_stack(p_ue_cols).astype(float)
 
-    if use_hss:
-        p_dhw = np.column_stack(dhw_cols).astype(float) if dhw_cols else np.zeros((35040, U), float)
-        p_el_heater = np.zeros((35040, U), float)  # HSS módban nem használjuk az ELH profilt
-    else:
-        p_dhw = np.zeros((35040, U), float)
-        p_el_heater = np.column_stack(p_el_heater_cols).astype(float) if p_el_heater_cols else np.zeros((35040, U),
-                                                                                                        float)
+    p_dhw = np.column_stack(dhw_cols).astype(float)
+    p_el_heater = np.column_stack(p_el_heater_cols).astype(float)
 
     return (
         p_pv,
@@ -245,13 +220,6 @@ def build_inputs(
         p_el_heater,
         np.asarray(size_elh, float),
         np.asarray(vol_hss_water, float),
-        np.asarray(size_bess, float),
-        np.asarray(eta_bess_in_u, float),
-        np.asarray(eta_bess_out_u, float),
-        np.asarray(eta_bess_stor_u, float),
-        np.asarray(soc_bess_min_u, float),
-        np.asarray(soc_bess_max_u, float),
-        np.asarray(t_bess_min_u, float),
         T_env_u,
         T_max_u,
         T_min_u,
@@ -273,14 +241,11 @@ def run(
         max_users: int = 10,
         run_lp: bool = True,
         pv_ratio: float = 1.0,
-        use_hss: bool = True,
 ) -> dict:
     dt = 0.25
     (
         p_pv, p_ue, p_dhw, p_el_heater,
         size_elh, vol_hss_water,
-        size_bess, eta_bess_in_u, eta_bess_out_u, eta_bess_stor_u,
-        soc_bess_min_u, soc_bess_max_u, t_bess_min_u,
         T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
         user_names
     ) = build_inputs(
@@ -289,7 +254,6 @@ def run(
         dhw_profile_path=dhw_profiles_csv,
         max_users=max_users,
         pv_ratio=pv_ratio,
-        use_hss=use_hss,
         dt=dt,
     )
 
@@ -304,23 +268,53 @@ def run(
     for u, name in enumerate(user_names):
         print(f"[INFO] Optimalizálás: {u+1}/{len(user_names)} - {name}")
 
+        has_pv = bool(np.sum(p_pv[:, u]) > 1e-9)
+        has_boiler = bool((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9))
+
+        if has_pv and has_boiler:
+            # PV + bojler: optimalizált HSS modell
+            p_dhw_eff = p_dhw[:, u]
+            p_el_heater_fixed_eff = np.zeros_like(p_ue[:, u])
+            size_elh_eff = float(size_elh[u])
+            vol_hss_water_eff = float(vol_hss_water[u])
+
+        elif has_boiler and not has_pv:
+            # Bojler van, PV nincs: nincs mit optimalizálni, fix villamos bojlerprofil
+            p_dhw_eff = np.zeros_like(p_ue[:, u])
+            p_el_heater_fixed_eff = p_el_heater[:, u]
+            size_elh_eff = 0.0
+            vol_hss_water_eff = 0.0
+
+        else:
+            # Nincs bojler
+            p_dhw_eff = np.zeros_like(p_ue[:, u])
+            p_el_heater_fixed_eff = np.zeros_like(p_ue[:, u])
+            size_elh_eff = 0.0
+            vol_hss_water_eff = 0.0
+
         res = individual_opt_boiler(
             p_pv=p_pv[:, u],
             p_ue=p_ue[:, u],
-            p_dhw=p_dhw[:, u],
-            dt=0.25,
-            size_elh=float(size_elh[u]),
-            vol_hss_water=float(vol_hss_water[u]),
+            p_dhw=p_dhw_eff,
+            dt=dt,
+            size_elh=size_elh_eff,
+            vol_hss_water=vol_hss_water_eff,
             T_env=float(T_env_u[u]),
             T_max=float(T_max_u[u]),
             T_min=float(T_min_u[u]),
             T_in=float(T_in_u[u]),
             a_hss=float(a_hss_u[u]),
             eta_elh=float(eta_elh_u[u]),
-            price_grid_low=36.0,
-            price_grid_high=71.0,
+            p_el_heater_fixed=p_el_heater_fixed_eff,
+
+            price_grid_a_low=36.0,
+            price_grid_a_high=71.0,
+            price_grid_b_low=23.0,
+            price_grid_b_high=61.0,
             price_pv_grid=5.0,
-            grid_low_cap_kwh=2523.0,
+            grid_a_low_cap_kwh=2523.0,
+            grid_b_low_cap_kwh=2523.0,
+
             run_lp=run_lp,
             msg=False,
             enforce_cl_rules=True,
@@ -328,13 +322,14 @@ def run(
             cl_min_midday_hours_per_day=4.0,
             gapRel=0.005,
             timeLimit=None,
+            objective="grid",
         )
 
         # opcionális: külön idősor mentés háztartásonként
         ts = pd.DataFrame({
             "p_pv": p_pv[:, u],
             "p_ue": p_ue[:, u],
-            "p_dhw": p_dhw[:, u],
+            "p_dhw": p_dhw_eff,
 
             "p_pv_load": res["p_pv_load"],
             "p_pv_elh": res["p_pv_elh"],
@@ -358,10 +353,22 @@ def run(
             "d_export": res["d_export"],
 
             # tarifa bontás idősorosan is
-            "e_grid_low_step": res["e_grid_low_step"],
-            "e_grid_high_step": res["e_grid_high_step"],
-            "remaining_low_block_kwh": res["remaining_low_block_kwh"],
+            "p_el_heater_fixed": p_el_heater_fixed_eff,
+            "p_pv_elh_fixed": res["p_pv_elh_fixed"],
+            "p_grid_elh_fixed": res["p_grid_elh_fixed"],
+            "p_grid_to_base": res["p_grid_to_base"],
+            "p_grid_to_boiler": res["p_grid_to_boiler"],
+            "p_el_heater_total": res["p_el_heater_total"],
+            "p_pv_to_boiler": res["p_pv_to_boiler"],
+
+            "e_grid_a_low_step": res["e_grid_a_low_step"],
+            "e_grid_a_high_step": res["e_grid_a_high_step"],
+            "e_grid_b_low_step": res["e_grid_b_low_step"],
+            "e_grid_b_high_step": res["e_grid_b_high_step"],
+            "remaining_a_low_block_kwh": res["remaining_a_low_block_kwh"],
+            "remaining_b_low_block_kwh": res["remaining_b_low_block_kwh"],
         })
+
         safe_name = str(name).replace("/", "_").replace("\\", "_")
         ts.to_csv(out / f"timeseries_{safe_name}.csv", index=False)
 
@@ -372,24 +379,33 @@ def run(
 
             "pv_gen_kwh": float(np.sum(p_pv[:, u]) * dt),
             "load_kwh": float(np.sum(p_ue[:, u]) * dt),
-            "dhw_kwh_th": float(np.sum(p_dhw[:, u]) * dt),
+            "dhw_kwh_th": float(np.sum(p_dhw_eff) * dt),
 
-            "grid_import_low_kwh": res["e_grid_low"],
-            "grid_import_high_kwh": res["e_grid_high"],
+            "grid_import_a_low_kwh": res["grid_import_a_low_kwh"],
+            "grid_import_a_high_kwh": res["grid_import_a_high_kwh"],
+            "grid_import_b_low_kwh": res["grid_import_b_low_kwh"],
+            "grid_import_b_high_kwh": res["grid_import_b_high_kwh"],
+
+            "grid_import_low_kwh": res["grid_import_low_kwh"],
+            "grid_import_high_kwh": res["grid_import_high_kwh"],
+            "grid_import_a_kwh": res["grid_import_a_kwh"],
+            "grid_import_b_kwh": res["grid_import_b_kwh"],
             "grid_import_total_kwh": float(np.sum(res["p_grid_import"]) * dt),
             "grid_export_kwh": float(np.sum(res["p_grid_export"]) * dt),
 
             "pv_to_load_kwh": float(np.sum(res["p_pv_load"]) * dt),
-            "pv_to_boiler_kwh": float(np.sum(res["p_pv_elh"]) * dt),
+            "pv_to_boiler_kwh": float(np.sum(res["p_pv_to_boiler"]) * dt),
 
             "grid_to_load_kwh": float(np.sum(res["p_grid_load"]) * dt),
-            "grid_to_boiler_kwh": float(np.sum(res["p_grid_elh"]) * dt),
+            "grid_to_boiler_kwh": float(np.sum(res["p_grid_to_boiler"]) * dt),
 
-            "boiler_el_input_kwh": float(np.sum(res["p_elh_in"]) * dt),
+            "boiler_el_input_kwh": float(np.sum(res["p_el_heater_total"]) * dt),
             "boiler_th_input_kwh": float(np.sum(res["p_hss_in"]) * dt),
             "boiler_th_output_kwh": float(np.sum(res["p_hss_out"]) * dt),
 
             "final_hss_energy_kwh": float(res["e_hss_stor"][-1]) if len(res["e_hss_stor"]) else 0.0,
+            "fixed_boiler_el_kwh": float(np.sum(p_el_heater_fixed_eff) * dt),
+            "hss_active": int(res["hss_active"]),
 
             "objective_value": res["objective_value"],
             "objective_type": res["objective_type"],
@@ -398,8 +414,11 @@ def run(
 
         finance_rows.append({
             "household": name,
-            "grid_cost_Ft": res["grid_cost_Ft"],
-            "export_revenue_Ft": res["grid_export_revenue_Ft"],
+            "import_cost_a_ft": res["import_cost_a_ft"],
+            "import_cost_b_ft": res["import_cost_b_ft"],
+            "import_cost_ft": res["import_cost_ft"],
+            "export_revenue_ft": res["export_revenue_ft"],
+            "brt_bill_ft": res["brt_bill_ft"],
             "net_cost_Ft": res["net_cost_Ft"],
         })
 
@@ -418,7 +437,9 @@ def run(
         "out_dir": str(out),
         "total_grid_import_kwh": float(energy_df["grid_import_total_kwh"].sum()),
         "total_grid_export_kwh": float(energy_df["grid_export_kwh"].sum()),
-        "total_net_cost_Ft": float(finance_df["net_cost_Ft"].sum()),
+        "total_brt_bill_ft": float(finance_df["brt_bill_ft"].sum()),
+        "total_import_cost_ft": float(finance_df["import_cost_ft"].sum()),
+        "total_export_revenue_ft": float(finance_df["export_revenue_ft"].sum()),
     }
 
     (out / "summary.json").write_text(
@@ -439,8 +460,6 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--max-users", type=int, default=10, help="Első N user a users_list-ből.")
     ap.add_argument("--pv-ratio", type=float, default=1.0, help="PV éves energia szorzó.")
     ap.add_argument("--use-hss", action="store_true", help="HSS logika (ΔT·c_víz) használata.")
-    ap.add_argument("--no-use-hss", dest="use_hss", action="store_false")
-    ap.set_defaults(use_hss=True)
     ap.add_argument("--mip", action="store_true", help="Bináris változók bekapcsolása (alap: LP).")
     args = ap.parse_args(argv)
 
@@ -451,7 +470,6 @@ def main(argv: list[str] | None = None):
         max_users=args.max_users,
         run_lp=not args.mip,
         pv_ratio=args.pv_ratio,
-        use_hss=args.use_hss,
         dhw_profiles_csv=args.dhw_profiles,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -466,6 +484,5 @@ if __name__ == "__main__":
         max_users=105,
         run_lp=False,
         pv_ratio=1.0,
-        use_hss=True,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
