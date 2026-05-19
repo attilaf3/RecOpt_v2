@@ -111,7 +111,7 @@ def build_inputs(
             e_ue_cols.append(np.zeros(35040, dtype=float))
 
         # --- PV (termelés), 15 perc [kWh / lépés] ---
-        n_pv = 7.0
+        n_pv = 1.0
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
         if pv_prof and pv_prof in df.columns:

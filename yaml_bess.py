@@ -3,7 +3,7 @@ import re
 import yaml
 
 # ---- Beállítások ----
-USERS_DIR = Path(r"Inputs/Users")   # ezt módosítsd, ha más a mappa útvonala
+USERS_DIR = Path(r"Input/Users")
 
 BESS_BLOCK = {
     "bess_size": "12.0",

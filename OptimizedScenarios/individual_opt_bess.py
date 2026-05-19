@@ -86,10 +86,6 @@ def individual_opt_bess(
     p_grid_ue = [pulp.LpVariable(f"p_grid_ue_{t}", lowBound=0) for t in time_set]
     p_grid_elh = [pulp.LpVariable(f"p_grid_elh_{t}", lowBound=0) for t in time_set]
 
-    # Load supply split
-    p_bess_load = [pulp.LpVariable(f"p_bess_load_{t}", lowBound=0) for t in time_set]
-    p_grid_load = [pulp.LpVariable(f"p_grid_load_{t}", lowBound=0) for t in time_set]
-
     # Battery
     p_bess_in = [pulp.LpVariable(f"p_bess_in_{t}", lowBound=0) for t in time_set]
     p_bess_out = [pulp.LpVariable(f"p_bess_out_{t}", lowBound=0) for t in time_set]
@@ -147,11 +143,6 @@ def individual_opt_bess(
                 p_pv_elh[t] + p_bess_elh[t] + p_grid_elh[t] == p_el_heater[t]
         ), f"fixed_boiler_balance_{t}"
 
-        # Grid mérleg
-        prob += (
-            p_grid_import[t] == p_grid_load[t] + p_grid_bess[t]
-        ), f"grid_import_def_{t}"
-
         prob += (
             p_grid_export[t] == p_pv_grid[t]
         ), f"grid_export_def_{t}"
@@ -168,7 +159,8 @@ def individual_opt_bess(
         # Akku logika
         if not bess_active:
             prob += p_pv_bess[t] == 0, f"no_bess_pv_bess_{t}"
-            prob += p_bess_load[t] == 0, f"no_bess_load_{t}"
+            prob += p_bess_ue[t] == 0, f"no_bess_ue_{t}"
+            prob += p_bess_elh[t] == 0, f"no_bess_elh_{t}"
             prob += p_bess_in[t] == 0, f"no_bess_in_{t}"
             prob += p_bess_out[t] == 0, f"no_bess_out_{t}"
             prob += p_grid_bess[t] == 0, f"no_bess_grid_bess_{t}"
@@ -179,13 +171,11 @@ def individual_opt_bess(
             ), f"bess_in_def_{t}"
 
             # kisütés csak a loadra
-            prob += (
-                p_bess_out[t] == p_bess_load[t]
-            ), f"bess_out_def_{t}"
 
             prob += (
-                    p_bess_load[t] == p_bess_ue[t] + p_bess_elh[t]
-            ), f"bess_load_split_{t}"
+                    p_bess_out[t] == p_bess_ue[t] + p_bess_elh[t]
+            ), f"bess_out_def_{t}"
+
 
             # dinamika
             prob += e_bess[k] == (
@@ -206,8 +196,6 @@ def individual_opt_bess(
             prob += e_bess[t] <= float(size_bess) * float(soc_bess_max), f"soc_max_{t}"
 
         # 15 perces bruttó import felosztása
-        e_imp_t = p_grid_import[t] * dt
-
         e_imp_a_t = dt * (p_grid_ue[t] + p_grid_bess[t])
         e_imp_b_t = dt * p_grid_elh[t]
 
@@ -261,12 +249,15 @@ def individual_opt_bess(
         v = pulp.value(x)
         return 0.0 if v is None else float(v)
 
-    p_pv_load_v = np.array([_val(v) for v in p_pv_load], dtype=float)
+    p_pv_ue_v = np.array([_val(v) for v in p_pv_ue], dtype=float)
+    p_pv_elh_v = np.array([_val(v) for v in p_pv_elh], dtype=float)
     p_pv_bess_v = np.array([_val(v) for v in p_pv_bess], dtype=float)
     p_pv_grid_v = np.array([_val(v) for v in p_pv_grid], dtype=float)
 
-    p_bess_load_v = np.array([_val(v) for v in p_bess_load], dtype=float)
-    p_grid_load_v = np.array([_val(v) for v in p_grid_load], dtype=float)
+    p_bess_ue_v = np.array([_val(v) for v in p_bess_ue], dtype=float)
+    p_bess_elh_v = np.array([_val(v) for v in p_bess_elh], dtype=float)
+    p_grid_ue_v = np.array([_val(v) for v in p_grid_ue], dtype=float)
+    p_grid_elh_v = np.array([_val(v) for v in p_grid_elh], dtype=float)
 
     p_bess_in_v = np.array([_val(v) for v in p_bess_in], dtype=float)
     p_bess_out_v = np.array([_val(v) for v in p_bess_out], dtype=float)
@@ -284,19 +275,33 @@ def individual_opt_bess(
 
     d_grid_v = np.array([_val(v) if not run_lp else 0.0 for v in d_grid], dtype=float)
 
-    e_grid_low_step_v = np.array([_val(v) for v in e_grid_low_step], dtype=float)
-    e_grid_high_step_v = np.array([_val(v) for v in e_grid_high_step], dtype=float)
-    rem_low_v = np.array([_val(v) for v in rem_low], dtype=float)
+    e_grid_a_low_step_v = np.array([_val(v) for v in e_grid_a_low_step], dtype=float)
+    e_grid_a_high_step_v = np.array([_val(v) for v in e_grid_a_high_step], dtype=float)
 
-    e_grid_low_v = float(np.sum(e_grid_low_step_v))
-    e_grid_high_v = float(np.sum(e_grid_high_step_v))
-    e_grid_total_v = e_grid_low_v + e_grid_high_v
+    e_grid_b_low_step_v = np.array([_val(v) for v in e_grid_b_low_step], dtype=float)
+    e_grid_b_high_step_v = np.array([_val(v) for v in e_grid_b_high_step], dtype=float)
 
-    grid_cost = float(np.sum(
-        price_grid_low * e_grid_low_step_v + price_grid_high * e_grid_high_step_v
-    ))
+    e_grid_a_low_v = float(np.sum(e_grid_a_low_step_v))
+    e_grid_a_high_v = float(np.sum(e_grid_a_high_step_v))
+
+    e_grid_b_low_v = float(np.sum(e_grid_b_low_step_v))
+    e_grid_b_high_v = float(np.sum(e_grid_b_high_step_v))
+
+    import_cost_a_ft = (
+            price_grid_a_low * e_grid_a_low_v
+            + price_grid_a_high * e_grid_a_high_v
+    )
+
+    import_cost_b_ft = (
+            price_grid_b_low * e_grid_b_low_v
+            + price_grid_b_high * e_grid_b_high_v
+    )
+
     export_revenue = float(np.sum(p_pv_grid_v) * dt * price_pv_grid)
-    net_cost = grid_cost - export_revenue
+
+    import_cost_ft = import_cost_a_ft + import_cost_b_ft
+
+    net_cost = import_cost_ft - export_revenue
 
     results = {
         "p_pv": p_pv,
@@ -319,10 +324,10 @@ def individual_opt_bess(
         "p_pv_grid": p_pv_grid_v,
 
         "p_bess_load": p_bess_ue_v + p_bess_elh_v,
+        "p_grid_load": p_grid_ue_v + p_grid_elh_v,
         "p_bess_ue": p_bess_ue_v,
         "p_bess_elh": p_bess_elh_v,
 
-        "p_grid_load": p_grid_ue_v + p_grid_elh_v,
         "p_grid_ue": p_grid_ue_v,
         "p_grid_elh": p_grid_elh_v,
         "p_grid_to_base": p_grid_ue_v,
@@ -338,26 +343,27 @@ def individual_opt_bess(
         "p_grid_export": p_grid_export_v,
         "d_grid": d_grid_v,
 
-        "e_grid_low": e_grid_low_v,
-        "e_grid_high": e_grid_high_v,
-        "e_grid_total": e_grid_total_v,
+        "grid_import_total_kwh":
+            e_grid_a_low_v
+            + e_grid_a_high_v
+            + e_grid_b_low_v
+            + e_grid_b_high_v,
 
-        "grid_cost_Ft": float(grid_cost),
-        "grid_export_revenue_Ft": float(export_revenue),
-        "net_cost_Ft": float(net_cost),
         "objective_Ft": float(pulp.value(prob.objective)),
         "status": status_str,
 
-        "e_grid_low_step": e_grid_low_step_v,
-        "e_grid_high_step": e_grid_high_step_v,
-        "remaining_low_block_kwh": rem_low_v,
+        "grid_import_low_kwh":
+            e_grid_a_low_v + e_grid_b_low_v,
 
-        "grid_import_a_kwh": float(np.sum(p_grid_ue_v + p_grid_bess_v) * dt),
-        "grid_import_b_kwh": float(np.sum(p_grid_elh_v) * dt),
+        "grid_import_high_kwh":
+            e_grid_a_high_v + e_grid_b_high_v,
+
         "grid_import_a_low_kwh": e_grid_a_low_v,
         "grid_import_a_high_kwh": e_grid_a_high_v,
+
         "grid_import_b_low_kwh": e_grid_b_low_v,
         "grid_import_b_high_kwh": e_grid_b_high_v,
+
         "import_cost_a_ft": import_cost_a_ft,
         "import_cost_b_ft": import_cost_b_ft,
         "import_cost_ft": import_cost_a_ft + import_cost_b_ft,

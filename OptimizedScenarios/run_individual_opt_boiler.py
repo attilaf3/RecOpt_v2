@@ -56,6 +56,7 @@ def build_inputs(
         profiles_csv_path: os.PathLike,
         dhw_profile_path: os.PathLike,
         max_users: int = 10,
+        target_user: str | None = None,
         search_roots: Iterable[os.PathLike] | None = None,
         dt: float = 0.25,
 ) -> Tuple[
@@ -86,13 +87,27 @@ def build_inputs(
         search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
 
     sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
-    users_list = list(sim.get("users_list", []))[: int(max_users)]
+    users_list_all = list(sim.get("users_list", []))
 
-    # exclude some pseudo users by name (optional)
     EXCLUDE = {"battery", "bess", "community"}
-    users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
-    if not users_list:
-        raise RuntimeError("A simulation YAML nem tartalmaz users_list-et vagy max_users=0.")
+    users_list_all = [
+        u for u in users_list_all
+        if str(u).strip().lower() not in EXCLUDE
+    ]
+
+    if target_user is not None:
+        target_user = str(target_user).strip()
+        users_list = [
+            u for u in users_list_all
+            if str(u).strip() == target_user
+        ]
+
+        if not users_list:
+            raise RuntimeError(
+                f"A megadott háztartás nem található a users_list-ben: {target_user}"
+            )
+    else:
+        users_list = users_list_all[: int(max_users)]
 
     df = pd.read_csv(profiles_csv_path, index_col=0)
     df.columns = [str(c) for c in df.columns]  # oszlopnevek legyenek stringek
@@ -144,7 +159,7 @@ def build_inputs(
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
 
-        n_pv = 7.0
+        n_pv = 1.0
         if pv_prof and pv_prof in df.columns:
             e_pv_kwh_step = _energy_profile_kwh_step(df[pv_prof].to_numpy()) / n_pv
             p_pv_kw = e_pv_kwh_step / dt
@@ -239,6 +254,7 @@ def run(
         dhw_profiles_csv: os.PathLike,
         out_dir: os.PathLike,
         max_users: int = 10,
+        target_user: str | None = None,
         run_lp: bool = True,
 ) -> dict:
     dt = 0.25
@@ -253,6 +269,7 @@ def run(
         dhw_profile_path=dhw_profiles_csv,
         max_users=max_users,
         dt=dt,
+        target_user=target_user,
     )
 
     out = Path(out_dir)
@@ -474,9 +491,9 @@ def main(argv: list[str] | None = None):
 
 if __name__ == "__main__":
     summary = run(
-        sim_yaml="../Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml",
-        profiles_csv="../Inputs/measurements_disaggregated_pv_original_increase_1.0.csv",
-        dhw_profiles_csv="../Inputs/dhw.csv",
+        sim_yaml="../Input/simulation_config_disaggregated_with_userlist.yaml",
+        profiles_csv="../Input/measurements_disaggregated.csv",
+        dhw_profiles_csv="../Input/dhw_v2.csv",
         out_dir="results_individual_opt_boiler",
         max_users=105,
         run_lp=False,

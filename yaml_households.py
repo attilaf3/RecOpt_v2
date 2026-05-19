@@ -125,7 +125,7 @@ def run_yaml_inventory(
 
 
 if __name__ == "__main__":
-    SIM_YAML = "Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml"
+    SIM_YAML = "Input/simulation_config_disaggregated_with_userlist.yaml"
     OUT_DIR = "results_yaml_inventory"
 
 
