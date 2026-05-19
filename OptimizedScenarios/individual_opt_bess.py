@@ -15,10 +15,14 @@ def individual_opt_bess(
     soc_bess_max=0.90,
     soc_bess_init=None,
     t_bess_min=2.0,         # h -> max teljesítmény = size_bess / t_bess_min
-    price_grid_low=36.0,    # Ft/kWh
-    price_grid_high=71.0,   # Ft/kWh
-    price_pv_grid=5.0,      # Ft/kWh
-    grid_low_cap_kwh=2523.0,
+    price_grid_a_low=36.0,
+    price_grid_a_high=71.0,
+    price_grid_b_low=23.0,
+    price_grid_b_high=61.0,
+    price_pv_grid=5.0,
+    grid_a_low_cap_kwh=2523.0,
+    grid_b_low_cap_kwh=2523.0,
+    objective="grid",
     run_lp=False,
     msg=False,
     gapRel=None,
@@ -71,9 +75,16 @@ def individual_opt_bess(
     # Változók
     # ------------------------------------------------------------------
     # PV split
-    p_pv_load = [pulp.LpVariable(f"p_pv_load_{t}", lowBound=0) for t in time_set]
+    p_pv_ue = [pulp.LpVariable(f"p_pv_ue_{t}", lowBound=0) for t in time_set]
+    p_pv_elh = [pulp.LpVariable(f"p_pv_elh_{t}", lowBound=0) for t in time_set]
     p_pv_bess = [pulp.LpVariable(f"p_pv_bess_{t}", lowBound=0) for t in time_set]
     p_pv_grid = [pulp.LpVariable(f"p_pv_grid_{t}", lowBound=0) for t in time_set]
+
+    p_bess_ue = [pulp.LpVariable(f"p_bess_ue_{t}", lowBound=0) for t in time_set]
+    p_bess_elh = [pulp.LpVariable(f"p_bess_elh_{t}", lowBound=0) for t in time_set]
+
+    p_grid_ue = [pulp.LpVariable(f"p_grid_ue_{t}", lowBound=0) for t in time_set]
+    p_grid_elh = [pulp.LpVariable(f"p_grid_elh_{t}", lowBound=0) for t in time_set]
 
     # Load supply split
     p_bess_load = [pulp.LpVariable(f"p_bess_load_{t}", lowBound=0) for t in time_set]
@@ -108,9 +119,13 @@ def individual_opt_bess(
 
     # Tariff blocks
     # 15 perces bruttó elszámolás
-    e_grid_low_step = [pulp.LpVariable(f"e_grid_low_step_{t}", lowBound=0) for t in time_set]
-    e_grid_high_step = [pulp.LpVariable(f"e_grid_high_step_{t}", lowBound=0) for t in time_set]
-    rem_low = [pulp.LpVariable(f"rem_low_{t}", lowBound=0, upBound=grid_low_cap_kwh) for t in time_set]
+    e_grid_a_low_step = [pulp.LpVariable(f"e_grid_a_low_step_{t}", lowBound=0) for t in time_set]
+    e_grid_a_high_step = [pulp.LpVariable(f"e_grid_a_high_step_{t}", lowBound=0) for t in time_set]
+    rem_a_low = [pulp.LpVariable(f"rem_a_low_{t}", lowBound=0, upBound=grid_a_low_cap_kwh) for t in time_set]
+
+    e_grid_b_low_step = [pulp.LpVariable(f"e_grid_b_low_step_{t}", lowBound=0) for t in time_set]
+    e_grid_b_high_step = [pulp.LpVariable(f"e_grid_b_high_step_{t}", lowBound=0) for t in time_set]
+    rem_b_low = [pulp.LpVariable(f"rem_b_low_{t}", lowBound=0, upBound=grid_b_low_cap_kwh) for t in time_set]
 
     # ------------------------------------------------------------------
     # Korlátok
@@ -120,13 +135,17 @@ def individual_opt_bess(
 
         # PV split
         prob += (
-            p_pv_load[t] + p_pv_bess[t] + p_pv_grid[t] == p_pv[t]
+                p_pv_ue[t] + p_pv_elh[t] + p_pv_bess[t] + p_pv_grid[t] == p_pv[t]
         ), f"pv_split_{t}"
 
         # Fogyasztás kiszolgálása
         prob += (
-            p_pv_load[t] + p_bess_load[t] + p_grid_load[t] == total_load[t]
-        ), f"load_balance_{t}"
+                p_pv_ue[t] + p_bess_ue[t] + p_grid_ue[t] == p_ue[t]
+        ), f"ue_balance_{t}"
+
+        prob += (
+                p_pv_elh[t] + p_bess_elh[t] + p_grid_elh[t] == p_el_heater[t]
+        ), f"fixed_boiler_balance_{t}"
 
         # Grid mérleg
         prob += (
@@ -136,6 +155,10 @@ def individual_opt_bess(
         prob += (
             p_grid_export[t] == p_pv_grid[t]
         ), f"grid_export_def_{t}"
+
+        prob += (
+                p_grid_import[t] == p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t]
+        ), f"grid_import_def_{t}"
 
         # Ne legyen egyszerre import és export
         if not run_lp:
@@ -160,6 +183,10 @@ def individual_opt_bess(
                 p_bess_out[t] == p_bess_load[t]
             ), f"bess_out_def_{t}"
 
+            prob += (
+                    p_bess_load[t] == p_bess_ue[t] + p_bess_elh[t]
+            ), f"bess_load_split_{t}"
+
             # dinamika
             prob += e_bess[k] == (
                     e_bess[t] * eta_bess_stor
@@ -181,16 +208,24 @@ def individual_opt_bess(
         # 15 perces bruttó import felosztása
         e_imp_t = p_grid_import[t] * dt
 
-        prob += e_grid_low_step[t] + e_grid_high_step[t] == e_imp_t, f"grid_step_split_{t}"
+        e_imp_a_t = dt * (p_grid_ue[t] + p_grid_bess[t])
+        e_imp_b_t = dt * p_grid_elh[t]
+
+        prob += e_grid_a_low_step[t] + e_grid_a_high_step[t] == e_imp_a_t
+        prob += e_grid_b_low_step[t] + e_grid_b_high_step[t] == e_imp_b_t
 
         if t == 0:
-            prob += rem_low[t] == grid_low_cap_kwh - e_grid_low_step[t], "rem_low_init"
-            prob += e_grid_low_step[t] <= grid_low_cap_kwh, f"grid_low_step_cap_{t}"
+            prob += rem_a_low[t] == grid_a_low_cap_kwh - e_grid_a_low_step[t]
+            prob += e_grid_a_low_step[t] <= grid_a_low_cap_kwh
+
+            prob += rem_b_low[t] == grid_b_low_cap_kwh - e_grid_b_low_step[t]
+            prob += e_grid_b_low_step[t] <= grid_b_low_cap_kwh
         else:
-            prob += rem_low[t] == rem_low[t - 1] - e_grid_low_step[t], f"rem_low_balance_{t}"
-            prob += e_grid_low_step[t] <= rem_low[t - 1], f"grid_low_step_cap_{t}"
+            prob += rem_a_low[t] == rem_a_low[t - 1] - e_grid_a_low_step[t]
+            prob += e_grid_a_low_step[t] <= rem_a_low[t - 1]
 
-
+            prob += rem_b_low[t] == rem_b_low[t - 1] - e_grid_b_low_step[t]
+            prob += e_grid_b_low_step[t] <= rem_b_low[t - 1]
 
     # kezdeti SOC
     if bess_active:
@@ -205,15 +240,13 @@ def individual_opt_bess(
 
     # ------------------------------------------------------------------
     # Célfüggvény: nettó villanyszámla [Ft]
-    # ------------------------------------------------------------------
-    # 15 perces bruttó nettó villanyszámla
-    cost_grid = pulp.lpSum(
-        price_grid_low * e_grid_low_step[t] + price_grid_high * e_grid_high_step[t]
-        for t in time_set
-    )
-    revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] * dt for t in time_set)
-
-    prob += cost_grid - revenue_export
+    if objective == "grid":
+        prob += pulp.lpSum(
+            dt * (p_grid_import[t] + p_grid_export[t])
+            for t in time_set
+        )
+    else:
+        raise ValueError("objective must be 'grid'")
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
@@ -279,12 +312,21 @@ def individual_opt_bess(
         "soc_bess_init": float(soc_bess_init),
         "bess_active": int(bess_active),
 
-        "p_pv_load": p_pv_load_v,
+        "p_pv_load": p_pv_ue_v + p_pv_elh_v,
+        "p_pv_ue": p_pv_ue_v,
+        "p_pv_elh": p_pv_elh_v,
         "p_pv_bess": p_pv_bess_v,
         "p_pv_grid": p_pv_grid_v,
 
-        "p_bess_load": p_bess_load_v,
-        "p_grid_load": p_grid_load_v,
+        "p_bess_load": p_bess_ue_v + p_bess_elh_v,
+        "p_bess_ue": p_bess_ue_v,
+        "p_bess_elh": p_bess_elh_v,
+
+        "p_grid_load": p_grid_ue_v + p_grid_elh_v,
+        "p_grid_ue": p_grid_ue_v,
+        "p_grid_elh": p_grid_elh_v,
+        "p_grid_to_base": p_grid_ue_v,
+        "p_grid_to_boiler": p_grid_elh_v,
 
         "p_bess_in": p_bess_in_v,
         "p_bess_out": p_bess_out_v,
@@ -309,6 +351,18 @@ def individual_opt_bess(
         "e_grid_low_step": e_grid_low_step_v,
         "e_grid_high_step": e_grid_high_step_v,
         "remaining_low_block_kwh": rem_low_v,
+
+        "grid_import_a_kwh": float(np.sum(p_grid_ue_v + p_grid_bess_v) * dt),
+        "grid_import_b_kwh": float(np.sum(p_grid_elh_v) * dt),
+        "grid_import_a_low_kwh": e_grid_a_low_v,
+        "grid_import_a_high_kwh": e_grid_a_high_v,
+        "grid_import_b_low_kwh": e_grid_b_low_v,
+        "grid_import_b_high_kwh": e_grid_b_high_v,
+        "import_cost_a_ft": import_cost_a_ft,
+        "import_cost_b_ft": import_cost_b_ft,
+        "import_cost_ft": import_cost_a_ft + import_cost_b_ft,
+        "export_revenue_ft": export_revenue,
+        "brt_bill_ft": net_cost,
     }
 
     return results

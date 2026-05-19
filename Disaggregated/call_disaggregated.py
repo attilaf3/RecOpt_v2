@@ -153,12 +153,13 @@ def build_inputs(
             p_ue_cols.append(np.zeros(8760))
 
         # --- PV (termelés) ---
+        n_pv = 7.0
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
         pv_size = float(pv.get("size")) if pv.get("size") is not None else None
         if pv_prof and pv_prof in df.columns and pv_size is not None:
             base = _aggregate_to_hourly(df[pv_prof].to_numpy())
-            p_pv_cols.append(_norm_to_annual(base, pv_size * float(pv_ratio)))
+            p_pv_cols.append(_norm_to_annual(base, pv_size / n_pv))
         else:
             p_pv_cols.append(np.zeros(8760))
 

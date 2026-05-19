@@ -56,7 +56,6 @@ def build_inputs(
         profiles_csv_path: os.PathLike,
         dhw_profile_path: os.PathLike,
         max_users: int = 10,
-        pv_ratio: float = 1.0,
         search_roots: Iterable[os.PathLike] | None = None,
         dt: float = 0.25,
 ) -> Tuple[
@@ -145,8 +144,9 @@ def build_inputs(
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
 
+        n_pv = 7.0
         if pv_prof and pv_prof in df.columns:
-            e_pv_kwh_step = _energy_profile_kwh_step(df[pv_prof].to_numpy()) * float(pv_ratio)
+            e_pv_kwh_step = _energy_profile_kwh_step(df[pv_prof].to_numpy()) / n_pv
             p_pv_kw = e_pv_kwh_step / dt
             p_pv_cols.append(p_pv_kw)
         else:
@@ -240,7 +240,6 @@ def run(
         out_dir: os.PathLike,
         max_users: int = 10,
         run_lp: bool = True,
-        pv_ratio: float = 1.0,
 ) -> dict:
     dt = 0.25
     (
@@ -253,7 +252,6 @@ def run(
         profiles_csv_path=profiles_csv,
         dhw_profile_path=dhw_profiles_csv,
         max_users=max_users,
-        pv_ratio=pv_ratio,
         dt=dt,
     )
 
@@ -469,7 +467,6 @@ def main(argv: list[str] | None = None):
         out_dir=args.out,
         max_users=args.max_users,
         run_lp=not args.mip,
-        pv_ratio=args.pv_ratio,
         dhw_profiles_csv=args.dhw_profiles,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -483,6 +480,5 @@ if __name__ == "__main__":
         out_dir="results_individual_opt_boiler",
         max_users=105,
         run_lp=False,
-        pv_ratio=1.0,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
