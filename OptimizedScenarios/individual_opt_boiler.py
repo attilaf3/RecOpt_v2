@@ -230,13 +230,17 @@ def individual_opt_boiler(
     else:
         raise ValueError("objective must be 'grid'")
 
-
+    prob.writeLP("debug.lp")
     solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
     status = prob.solve(solver)
 
     status_str = pulp.LpStatus[status]
-    if status_str not in {"Optimal", "Not Solved", "Integer Feasible", "Undefined"}:
-        raise RuntimeError(f"Hiba: {status_str}")
+
+    if status_str not in {"Optimal", "Integer Feasible"}:
+        raise RuntimeError(
+            f"Optimalizálási hiba: {status_str}. "
+            "A modell nem adott érvényes megoldást, ezért nem mentek 0-kat."
+        )
 
     def _val(x):
         v = pulp.value(x)

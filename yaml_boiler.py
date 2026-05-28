@@ -9,7 +9,7 @@ HSS_TEMPERATURE_PARAMS = {
     "T_env": "20.0",
     "T_in": "10.0",
     "T_max": "65.0",
-    "T_min": "38.0",
+    "T_min": "35.0",
     "T_out": "40.0",
     "T_set": "50.0",
 }

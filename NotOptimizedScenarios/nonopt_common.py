@@ -313,6 +313,7 @@ def simulate_one_user_greedy(
     soc_bess_max: float,
     t_bess_min_h: float,
     e_boiler_load: np.ndarray | None = None,
+    boiler_tariff: str = "B",
 ) -> dict:
     T = len(e_load)
 
@@ -323,6 +324,18 @@ def simulate_one_user_greedy(
     else:
         e_boiler_load = np.maximum(np.asarray(e_boiler_load, dtype=float), 0.0)
     e_base_load = np.maximum(e_load - e_boiler_load, 0.0)
+
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
+
+    if boiler_tariff == "A":
+        # A tarifás bojler: sima fogyasztó, kaphat PV-t és BESS-t.
+        e_dispatch_load = e_load
+    else:
+        # B tarifás bojler: külön mérő, külön áramkör.
+        # PV/BESS csak az általános fogyasztást látja el.
+        e_dispatch_load = e_base_load
 
     e_pv_to_load = np.zeros(T, dtype=float)
     e_pv_to_bess = np.zeros(T, dtype=float)
@@ -335,8 +348,8 @@ def simulate_one_user_greedy(
 
 
     if not use_bess or bess_size_kwh <= 1e-12:
-        e_pv_to_load = np.minimum(e_load, e_pv)
-        e_grid_to_load = np.maximum(e_load - e_pv_to_load, 0.0)
+        e_pv_to_load = np.minimum(e_dispatch_load, e_pv)
+        e_grid_to_load = np.maximum(e_dispatch_load - e_pv_to_load, 0.0)
         e_inj = np.maximum(e_pv - e_pv_to_load, 0.0)
         e_bess[:] = 0.0
     else:
@@ -356,7 +369,7 @@ def simulate_one_user_greedy(
         for t in range(T):
             soc *= eta_bess_stor
 
-            load_t = max(e_load[t], 0.0)
+            load_t = max(e_dispatch_load[t], 0.0)
             pv_t = max(e_pv[t], 0.0)
 
             pv_to_load = min(load_t, pv_t)
@@ -394,20 +407,37 @@ def simulate_one_user_greedy(
     pv_to_load_kwh = e_pv_to_load.sum()
     pv_to_bess_kwh = e_pv_to_bess.sum()
     bess_to_load_kwh = e_bess_to_load.sum()
-    grid_import_kwh = e_grid_to_load.sum()
     injection_kwh = e_inj.sum()
 
-    split = split_grid_import_base_boiler(
-        e_base_load=e_base_load,
-        e_boiler_load=e_boiler_load,
-        e_pv_to_load=e_pv_to_load,
-        e_bess_to_load=e_bess_to_load,
-    )
+    if boiler_tariff == "A":
+        # A tarifás bojler: nincs külön B tarifás import.
+        e_grid_to_base = e_grid_to_load.copy()
+        e_grid_to_boiler = np.zeros_like(e_grid_to_load)
+
+        e_local_total = e_pv_to_load + e_bess_to_load
+        e_local_to_base = np.minimum(e_base_load, e_local_total)
+        e_local_to_boiler = np.minimum(
+            np.maximum(e_local_total - e_local_to_base, 0.0),
+            e_boiler_load,
+        )
+
+    else:
+        # B tarifás bojler: teljes bojlerfogyasztás B tarifás hálózati import.
+        e_grid_to_base = e_grid_to_load.copy()
+        e_grid_to_boiler = e_boiler_load.copy()
+
+        e_local_to_base = e_pv_to_load + e_bess_to_load
+        e_local_to_boiler = np.zeros_like(e_boiler_load)
+
+        # Teljes hálózati import = A tarifás alapimport + B tarifás bojlerimport.
+        e_grid_to_load = e_grid_to_base + e_grid_to_boiler
+
+    grid_import_kwh = e_grid_to_load.sum()
 
     bill = calc_bill_15min_brutto(
         e_grid_to_load=e_grid_to_load,
         e_inj=e_inj,
-        e_grid_to_boiler=split["e_grid_to_boiler"],
+        e_grid_to_boiler=e_grid_to_boiler,
     )
 
     # SCI: önfogyasztási index.
@@ -439,10 +469,10 @@ def simulate_one_user_greedy(
             "e_pv_to_bess": e_pv_to_bess,
             "e_bess_to_load": e_bess_to_load,
             "e_grid_to_load": e_grid_to_load,
-            "e_grid_to_base": split["e_grid_to_base"],
-            "e_grid_to_boiler": split["e_grid_to_boiler"],
-            "e_local_to_base": split["e_local_to_base"],
-            "e_local_to_boiler": split["e_local_to_boiler"],
+            "e_grid_to_base": e_grid_to_base,
+            "e_grid_to_boiler": e_grid_to_boiler,
+            "e_local_to_base": e_local_to_base,
+            "e_local_to_boiler": e_local_to_boiler,
             "e_inj": e_inj,
             "e_bess": e_bess,
             "d_bess_ch": d_bess_ch,
@@ -587,9 +617,14 @@ def run_case(
     max_users: int,
     include_bess: bool,
     bess_share_pct: float = 100.0,
+    boiler_tariff: str = "B",
 ):
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
+
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
     (
         e_pv,
@@ -615,6 +650,7 @@ def run_case(
 
     e_boiler = e_el_heater
     e_total_load = e_ue + e_boiler
+    e_base_load = e_ue
 
     rows = []
 
@@ -630,6 +666,8 @@ def run_case(
     ts_e_bess = np.zeros((T, U), dtype=float)
     ts_d_bess_ch = np.zeros((T, U), dtype=float)
     ts_d_bess_dis = np.zeros((T, U), dtype=float)
+    ts_e_base_load = np.zeros((T, U), dtype=float)
+    ts_e_boiler = np.zeros((T, U), dtype=float)
 
     pv_annual_kwh = e_pv.sum(axis=0)
     has_pv_arr = pv_annual_kwh > 1e-9
@@ -664,13 +702,16 @@ def run_case(
             soc_bess_min=float(soc_bess_min_u[u]),
             soc_bess_max=float(soc_bess_max_u[u]),
             t_bess_min_h=float(t_bess_min_u[u]),
+            boiler_tariff=boiler_tariff,
         )
+
 
         annual = sim["annual"]
         times = sim["timeseries"]
 
         base_load_kwh = e_ue[:, u].sum()
         boiler_kwh = e_boiler[:, u].sum()
+        pmax_kw = float(np.max(e_total_load[:, u] / DT))
 
         rows.append({
             "user_name": user_names[u],
@@ -686,6 +727,7 @@ def run_case(
             "boiler_kwh": boiler_kwh,
             "total_load_kwh": annual["load_kwh"],
             "pv_kwh": annual["pv_kwh"],
+            "Pmax_kw": pmax_kw,
             "pv_to_load_kwh": annual["pv_to_load_kwh"],
             "pv_to_bess_kwh": annual["pv_to_bess_kwh"],
             "bess_to_load_kwh": annual["bess_to_load_kwh"],
@@ -724,6 +766,8 @@ def run_case(
         ts_e_bess[:, u] = times["e_bess"]
         ts_d_bess_ch[:, u] = times["d_bess_ch"]
         ts_d_bess_dis[:, u] = times["d_bess_dis"]
+        ts_e_base_load[:, u] = e_ue[:, u]
+        ts_e_boiler[:, u] = e_boiler[:, u]
 
     per_user_df = pd.DataFrame(rows)
     per_user_df.to_csv(out_case / "per_user_summary.csv", index=False)
@@ -733,6 +777,7 @@ def run_case(
 
     total = {
         "case_name": case_name,
+        "boiler_tariff": boiler_tariff,
         "n_users": int(U),
         "base_load_kwh": float(per_user_df["base_load_kwh"].sum()),
         "boiler_kwh": float(per_user_df["boiler_kwh"].sum()),
@@ -801,6 +846,8 @@ def run_case(
     save_ts(ts_e_bess, "e_bess.csv")
     save_ts(ts_d_bess_ch, "d_bess_ch.csv")
     save_ts(ts_d_bess_dis, "d_bess_dis.csv")
+    save_ts(ts_e_base_load, "e_base_load.csv")
+    save_ts(ts_e_boiler, "e_boiler.csv")
 
     community_ts = pd.DataFrame({
         "e_load_total": ts_e_load.sum(axis=1),

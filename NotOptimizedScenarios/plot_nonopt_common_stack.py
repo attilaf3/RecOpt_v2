@@ -49,15 +49,24 @@ def _load_household_series(
     Betölti az adott háztartás szükséges e_* idősorait.
 
     Elvárt fájlok:
-      - e_load.csv
+      - e_load.csv              teljes fogyasztás
+      - e_base_load.csv         általános fogyasztás
+      - e_boiler.csv            bojler fogyasztás
       - e_pv.csv
       - e_bess_to_load.csv
-      - e_grid_to_load.csv
+      - e_grid_to_load.csv      teljes hálózati import
+      - e_grid_to_base.csv      A tarifás hálózati import
+      - e_grid_to_boiler.csv    B tarifás bojlerimport
       - e_inj.csv
       - e_pv_to_bess.csv
+      - e_bess.csv
+      - d_bess_ch.csv
+      - d_bess_dis.csv
     """
     files = {
         "e_load": "e_load.csv",
+        "e_base_load": "e_base_load.csv",
+        "e_boiler": "e_boiler.csv",
         "e_pv": "e_pv.csv",
         "e_bess_to_load": "e_bess_to_load.csv",
         "e_grid_to_load": "e_grid_to_load.csv",
@@ -130,11 +139,19 @@ def _plot_one_season(
     sl = slice(t0, tf)
 
     e_load = series["e_load"][sl]
+    e_base_load = series["e_base_load"][sl]
+    e_boiler = series["e_boiler"][sl]
+
     e_pv = series["e_pv"][sl]
     e_bess_to_load = series["e_bess_to_load"][sl]
+
     e_grid_to_load = series["e_grid_to_load"][sl]
+    e_grid_to_base = series["e_grid_to_base"][sl]
+    e_grid_to_boiler = series["e_grid_to_boiler"][sl]
+
     e_inj = series["e_inj"][sl]
     e_pv_to_bess = series["e_pv_to_bess"][sl]
+
     e_bess = series["e_bess"][sl]
     d_bess_ch = series["d_bess_ch"][sl]
     d_bess_dis = series["d_bess_dis"][sl]
@@ -142,9 +159,16 @@ def _plot_one_season(
 
     # --- teljesítmény [kW] ---
     p_load = _energy_to_power(e_load, dt)
+    p_base_load = _energy_to_power(e_base_load, dt)
+    p_boiler = _energy_to_power(e_boiler, dt)
+
     p_pv = _energy_to_power(e_pv, dt)
     p_bess_to_load = _energy_to_power(e_bess_to_load, dt)
+
     p_grid_to_load = _energy_to_power(e_grid_to_load, dt)
+    p_grid_to_base = _energy_to_power(e_grid_to_base, dt)
+    p_grid_to_boiler = _energy_to_power(e_grid_to_boiler, dt)
+
     p_inj = _energy_to_power(e_inj, dt)
     p_pv_to_bess = _energy_to_power(e_pv_to_bess, dt)
 
@@ -193,27 +217,46 @@ def _plot_one_season(
     )
     pos_bottom += p_bess_to_load
 
-    h_grid = ax.bar(
+    h_grid_base = ax.bar(
         time_h,
-        p_grid_to_load,
+        p_grid_to_base,
         width=bar_width,
         bottom=pos_bottom,
-        label="Hálózati import",
+        label="Hálózati import – A tarifa",
     )
+    pos_bottom += p_grid_to_base
+
+    h_grid_boiler = ax.bar(
+        time_h,
+        p_grid_to_boiler,
+        width=bar_width,
+        bottom=pos_bottom,
+        label="Hálózati import – B tarifa / bojler",
+    )
+    pos_bottom += p_grid_to_boiler
 
     # ======================
     # 0 ALATT: kifolyó teljesítmények
     # ======================
     neg_bottom = np.zeros_like(time_h, dtype=float)
 
-    h_load = ax.bar(
+    h_base_load = ax.bar(
         time_h,
-        -p_load,
+        -p_base_load,
         width=bar_width,
         bottom=neg_bottom,
-        label="Fogyasztás",
+        label="Általános fogyasztás",
     )
-    neg_bottom -= p_load
+    neg_bottom -= p_base_load
+
+    h_boiler = ax.bar(
+        time_h,
+        -p_boiler,
+        width=bar_width,
+        bottom=neg_bottom,
+        label="Bojler fogyasztás",
+    )
+    neg_bottom -= p_boiler
 
     h_export = ax.bar(
         time_h,
@@ -232,15 +275,21 @@ def _plot_one_season(
         label="BESS töltés",
     )
 
+    boiler_is_b_tariff = np.nanmax(e_grid_to_boiler) > 1e-9
+    boiler_tariff_label = "B tarifás bojler" if boiler_is_b_tariff else "A tarifás bojler"
+
     # --- tengelyek ---
     ax.axhline(0.0, color="black", linewidth=1.0)
-    ax.set_title(f"{season_title} – háztartási teljesítménymérleg\n{household_name}")
+    ax.set_title(
+        f"{season_title} – háztartási teljesítménymérleg\n"
+        f"{household_name} – {boiler_tariff_label}"
+    )
     ax.set_xlabel("Idő [h]")
     ax.set_ylabel("Teljesítmény [kW]")
     ax.grid(True, alpha=0.3)
 
-    y_pos = p_pv + p_bess_to_load + p_grid_to_load
-    y_neg = p_load + p_inj + p_pv_to_bess
+    y_pos = p_pv + p_bess_to_load + p_grid_to_base + p_grid_to_boiler
+    y_neg = p_base_load + p_boiler + p_inj + p_pv_to_bess
     ymax = max(float(np.nanmax(y_pos)), float(np.nanmax(y_neg)), 1e-6)
     ax.set_ylim(-1.15 * ymax, 1.15 * ymax)
 
@@ -248,16 +297,21 @@ def _plot_one_season(
     handles = [
         h_pv,
         h_bess_out,
-        h_grid,
-        h_load,
+        h_grid_base,
+        h_grid_boiler,
+        h_base_load,
+        h_boiler,
         h_export,
         h_bess_in,
     ]
+
     labels = [
         "PV termelés",
         "BESS kisütés",
-        "Hálózati import",
-        "Fogyasztás",
+        "Hálózati import – A tarifa",
+        "Hálózati import – B tarifa / bojler",
+        "Általános fogyasztás",
+        "Bojler fogyasztás",
         "PV export",
         "BESS töltés",
     ]
@@ -364,15 +418,29 @@ def plot_household_power_stack_seasons(
 
 if __name__ == "__main__":
     # plot_household_power_stack_seasons(
-    #     results_dir=r"results_base_with_bess",
+    #     results_dir=r"results_base_with_bess_B_tariff",
     #     household_name="0420144888439778",
     #     window_days=3,
     #     dt=DT,
     # )
 
     plot_household_power_stack_seasons(
-        results_dir=r"results_base_no_bess",
-        household_name="0420144888439778",
+        results_dir=r"results_base_with_bess_B_tariff",
+        household_name="0420144653458813",
         window_days=3,
         dt=DT,
     )
+
+    # plot_household_power_stack_seasons(
+    #     results_dir=r"results_base_no_bess_B_tariff",
+    #     household_name="0420144888439778",
+    #     window_days=3,
+    #     dt=DT,
+    # )
+
+    # plot_household_power_stack_seasons(
+    #     results_dir=r"results_base_no_bess_B_tariff",
+    #     household_name="0420144653458813",
+    #     window_days=3,
+    #     dt=DT,
+    # )
