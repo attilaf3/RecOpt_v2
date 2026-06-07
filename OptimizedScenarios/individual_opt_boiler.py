@@ -30,7 +30,8 @@ def individual_opt_boiler(
     cl_min_midday_hours_per_day=4.0,
     gapRel=None,
     timeLimit=None,
-    objective="grid"
+    boiler_tariff="B",
+    objective="bill"
 ):
     """
     Egy háztartás optimalizálása:
@@ -59,6 +60,10 @@ def individual_opt_boiler(
 
     has_pv = np.sum(p_pv) > 1e-9
     hss_active = has_pv and (size_elh > 1e-9) and (vol_hss_water > 1e-9)
+
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
     c_hss = 0.00116667  # kWh / (liter*K)
 
@@ -122,6 +127,11 @@ def individual_opt_boiler(
                 == p_pv[t]
         ), f"pv_split_{t}"
 
+        if boiler_tariff == "B":
+            # B tarifás bojler: külön mérő/kör, nem kaphat PV-ből.
+            prob += p_pv_elh[t] == 0, f"no_pv_to_hss_B_{t}"
+            prob += p_pv_elh_fixed[t] == 0, f"no_pv_to_fixed_boiler_B_{t}"
+
         prob += (
                 p_pv_elh_fixed[t] + p_grid_elh_fixed[t] == p_el_heater_fixed[t]
         ), f"fixed_boiler_balance_{t}"
@@ -130,13 +140,13 @@ def individual_opt_boiler(
         prob += p_pv_load[t] + p_grid_load[t] == p_ue[t], f"ue_balance_{t}"
 
         if not run_lp:
+            if boiler_tariff == "A":
+                p_grid_import_a_t = p_grid_load[t] + p_grid_elh[t] + p_grid_elh_fixed[t]
+            else:
+                p_grid_import_a_t = p_grid_load[t]
+
             prob += p_pv_grid[t] <= M_pv * d_export[t], f"export_gate_{t}"
-            prob += (
-                    p_grid_load[t]
-                    + p_grid_elh[t]
-                    + p_grid_elh_fixed[t]
-                    <= M_grid * (1 - d_export[t])
-            ), f"grid_vs_export_{t}"
+            prob += p_grid_import_a_t <= M_grid * (1 - d_export[t]), f"grid_vs_export_{t}"
 
 
         if hss_active:
@@ -175,8 +185,14 @@ def individual_opt_boiler(
             prob += p_grid_elh[t] == 0, f"no_hss_grid_elh_{t}"
 
         # 15 perces import felosztása kedvezményes és piaci részre
-        e_imp_a_t = dt * p_grid_load[t]
-        e_imp_b_t = dt * (p_grid_elh[t] + p_grid_elh_fixed[t])
+        if boiler_tariff == "A":
+            # A tarifás bojler: UE + bojler hálózati része is A tarifán van.
+            e_imp_a_t = dt * (p_grid_load[t] + p_grid_elh[t] + p_grid_elh_fixed[t])
+            e_imp_b_t = 0.0
+        else:
+            # B tarifás bojler: bojler csak hálózatból, B tarifán.
+            e_imp_a_t = dt * p_grid_load[t]
+            e_imp_b_t = dt * (p_grid_elh[t] + p_grid_elh_fixed[t])
 
         prob += e_grid_a_low_step[t] + e_grid_a_high_step[t] == e_imp_a_t
         prob += e_grid_b_low_step[t] + e_grid_b_high_step[t] == e_imp_b_t
@@ -217,18 +233,17 @@ def individual_opt_boiler(
             prob += pulp.lpSum(d_cl[t] for t in day_idx) <= max_on_steps, f"day_{j}_cl_maxon"
             prob += pulp.lpSum(d_cl[t] * y_middle_day[t - j] for t in day_idx) >= min_mid_steps, f"day_{j}_cl_midmin"
 
-    if objective == "grid":
+    if objective == "bill":
         prob += pulp.lpSum(
-            dt * (
-                    p_grid_load[t]
-                    + p_grid_elh[t]
-                    + p_grid_elh_fixed[t]
-                    + p_pv_grid[t]
-            )
+            price_grid_a_low * e_grid_a_low_step[t]
+            + price_grid_a_high * e_grid_a_high_step[t]
+            + price_grid_b_low * e_grid_b_low_step[t]
+            + price_grid_b_high * e_grid_b_high_step[t]
+            - price_pv_grid * dt * p_pv_grid[t]
             for t in time_set
         )
     else:
-        raise ValueError("objective must be 'grid'")
+        raise ValueError("objective must be 'bill'")
 
     prob.writeLP("debug.lp")
     solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
@@ -310,8 +325,13 @@ def individual_opt_boiler(
     export_revenue = float(price_pv_grid * e_grid_export_v)
     net_cost = import_cost_a_ft + import_cost_b_ft - export_revenue
 
-    p_grid_to_base = p_grid_load_v
-    p_grid_to_boiler = p_grid_elh_v + p_grid_elh_fixed_v
+    if boiler_tariff == "A":
+        p_grid_to_base = p_grid_load_v + p_grid_elh_v + p_grid_elh_fixed_v
+        p_grid_to_boiler = np.zeros(T, dtype=float)
+    else:
+        p_grid_to_base = p_grid_load_v
+        p_grid_to_boiler = p_grid_elh_v + p_grid_elh_fixed_v
+
     p_el_heater_total = p_elh_in_v + p_el_heater_fixed
 
     results = {
@@ -335,12 +355,13 @@ def individual_opt_boiler(
         "hss_active": int(hss_active),
         "d_cl": d_cl_v,
         "d_export": d_export_v,
+        "boiler_tariff": boiler_tariff,
 
         "e_grid_total": e_grid_total_v,
         "e_grid_export": e_grid_export_v,
 
         "grid_import_a_kwh": float(np.sum(p_grid_load_v) * dt),
-        "grid_import_b_kwh": float(np.sum(p_grid_elh_v + p_grid_elh_fixed_v) * dt),
+        "grid_import_b_kwh": float(np.sum(p_grid_to_boiler) * dt),
 
         "grid_import_low_kwh": e_grid_a_low_v + e_grid_b_low_v,
         "grid_import_high_kwh": e_grid_a_high_v + e_grid_b_high_v,

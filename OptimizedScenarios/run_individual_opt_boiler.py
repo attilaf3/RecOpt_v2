@@ -256,8 +256,14 @@ def run(
         max_users: int = 10,
         target_user: str | None = None,
         run_lp: bool = True,
+        boiler_tariff: str = "B",
 ) -> dict:
     dt = 0.25
+
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
+
     (
         p_pv, p_ue, p_dhw, p_el_heater,
         size_elh, vol_hss_water,
@@ -337,7 +343,8 @@ def run(
             cl_min_midday_hours_per_day=4.0,
             gapRel=0.005,
             timeLimit=None,
-            objective="grid",
+            boiler_tariff=boiler_tariff,
+            objective="bill",
         )
 
         # opcionális: külön idősor mentés háztartásonként
@@ -391,6 +398,7 @@ def run(
             "household": name,
             "has_pv": int(np.sum(p_pv[:, u]) > 1e-9),
             "has_boiler": int((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9)),
+            "boiler_tariff": boiler_tariff,
 
             "pv_gen_kwh": float(np.sum(p_pv[:, u]) * dt),
             "load_kwh": float(np.sum(p_ue[:, u]) * dt),
@@ -455,6 +463,7 @@ def run(
         "total_brt_bill_ft": float(finance_df["brt_bill_ft"].sum()),
         "total_import_cost_ft": float(finance_df["import_cost_ft"].sum()),
         "total_export_revenue_ft": float(finance_df["export_revenue_ft"].sum()),
+        "boiler_tariff": boiler_tariff,
     }
 
     (out / "summary.json").write_text(
@@ -490,12 +499,26 @@ def main(argv: list[str] | None = None):
 
 
 if __name__ == "__main__":
+    # A tarifa
     summary = run(
         sim_yaml="../Input/simulation_config_disaggregated_with_userlist.yaml",
         profiles_csv="../Input/measurements_disaggregated.csv",
         dhw_profiles_csv="../Input/dhw_v2.csv",
-        out_dir="results_individual_opt_boiler",
+        out_dir="results_individual_opt_boiler_B_tariff",
         max_users=105,
         run_lp=False,
+        boiler_tariff="A",
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    # B tarifa
+    # summary = run(
+    #     sim_yaml="../Input/simulation_config_disaggregated_with_userlist.yaml",
+    #     profiles_csv="../Input/measurements_disaggregated.csv",
+    #     dhw_profiles_csv="../Input/dhw_v2.csv",
+    #     out_dir="results_individual_opt_boiler_B_tariff",
+    #     max_users=105,
+    #     run_lp=False,
+    #     boiler_tariff="B",
+    # )
+    # print(json.dumps(summary, indent=2, ensure_ascii=False))
