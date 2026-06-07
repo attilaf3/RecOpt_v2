@@ -78,7 +78,7 @@ def plot_household_fourpack_seasons(
         "p_bess_in",
         "p_bess_out",
         "e_bess",
-        "d_bess",
+        "d_bess_ch"
     ]
     missing = [c for c in needed if c not in ts.columns]
     if missing:
@@ -94,7 +94,7 @@ def plot_household_fourpack_seasons(
 
     # SOC és bináris jel (SOC: kWh, d_bess: 0/1)
     soc   = ts["e_bess"].to_numpy(dtype=float)
-    d_bess = ts["d_bess"].to_numpy(dtype=float)
+    d_bess_ch = ts["d_bess_ch"].to_numpy(dtype=float)
 
     T = len(ts)
     steps_per_day = int(round(24 / dt))
@@ -126,7 +126,7 @@ def plot_household_fourpack_seasons(
         pv_exp = p_grid_export[t0:tf]
 
         soc_s = soc[t0:tf]
-        d_s = d_bess[t0:tf]
+        d_ch_s = d_bess_ch[t0:tf]
 
         # ====== 2x2: bal oldalon plotok, jobb oldalon 2 legend axes ======
         fig, axes = plt.subplots(
@@ -185,10 +185,18 @@ def plot_household_fourpack_seasons(
         ax_s.tick_params(labelsize=fontsize)
 
         ax_s2 = ax_s.twinx()
-        ln_db, = ax_s2.step(time, d_s, where="post", color="gray", lw=1.0, alpha=0.9, label=r"$d_{bess}$")
+        ln_db, = ax_s2.step(
+            time,
+            d_ch_s,
+            where="post",
+            color="gray",
+            lw=1.0,
+            alpha=0.9,
+            label=r"$d_{ch}$"
+        )
         ax_s2.set_ylim(-0.05, 1.05)
         ax_s2.set_yticks([0, 1])
-        ax_s2.set_ylabel(r"$d_{bess}$ (-)", fontsize=fontsize, color="gray")
+        ax_s2.set_ylabel(r"$d_{ch}$ (-)", fontsize=fontsize, color="gray")
         ax_s2.tick_params(axis="y", labelsize=fontsize - 2, colors="gray")
 
         h1, l1 = ax_s.get_legend_handles_labels()

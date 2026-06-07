@@ -69,6 +69,10 @@ def plot_household_fourpack_seasons(
         "p_elh_in",
         "t_hss",
         "d_cl",
+        "p_grid_to_base",
+        "p_grid_to_boiler",
+        "p_el_heater_total",
+        "p_pv_to_boiler",
     ]
     missing = [c for c in needed if c not in ts.columns]
     if missing:
@@ -87,6 +91,11 @@ def plot_household_fourpack_seasons(
 
     t_hss = ts["t_hss"].to_numpy(dtype=float)
     d_cl  = ts["d_cl"].to_numpy(dtype=float)
+
+    p_grid_to_base = ts["p_grid_to_base"].to_numpy(dtype=float)
+    p_grid_to_boiler = ts["p_grid_to_boiler"].to_numpy(dtype=float)
+    p_el_heater_total = ts["p_el_heater_total"].to_numpy(dtype=float)
+    p_pv_to_boiler = ts["p_pv_to_boiler"].to_numpy(dtype=float)
 
     # Villamos csomópont komponensek
     if "p_grid_import" in ts.columns:
@@ -123,6 +132,10 @@ def plot_household_fourpack_seasons(
         pv_exp = p_pv_grid[t0:tf]
         temp = t_hss[t0:tf]
         cl = d_cl[t0:tf]
+        grid_base = p_grid_to_base[t0:tf]
+        grid_boiler = p_grid_to_boiler[t0:tf]
+        boiler_el = p_el_heater_total[t0:tf]
+        pv_to_boiler = p_pv_to_boiler[t0:tf]
 
         # ====== 2x2: bal oldalon plotok, jobb oldalon 2 legend axes ======
         fig, axes = plt.subplots(
@@ -143,12 +156,23 @@ def plot_household_fourpack_seasons(
         # 1) Electric hub (pozitív be, negatív ki)
         # ======================
         bottom = np.zeros_like(time, dtype=float)
-        ax_e.bar(time, pv, bottom=bottom, label=r"$PV$", **bar_kw); bottom += pv
-        ax_e.bar(time, grid_imp, bottom=bottom, label=r"$Grid\ import$", **bar_kw)
+        ax_e.bar(time, pv, bottom=bottom, label=r"$PV$", **bar_kw)
+        bottom += pv
+
+        ax_e.bar(time, grid_base, bottom=bottom, label=r"$Grid\ import\ A$", **bar_kw)
+        bottom += grid_base
+
+        ax_e.bar(time, grid_boiler, bottom=bottom, label=r"$Grid\ import\ B / boiler$", **bar_kw)
+
+
 
         bottom = np.zeros_like(time, dtype=float)
-        ax_e.bar(time, -ue, bottom=bottom, label=r"$Load$", **bar_kw); bottom -= ue
-        ax_e.bar(time, -elh, bottom=bottom, label=r"$Boiler\ (opt.)$", **bar_kw); bottom -= elh
+        ax_e.bar(time, -ue, bottom=bottom, label=r"$Load$", **bar_kw)
+        bottom -= ue
+
+        ax_e.bar(time, -boiler_el, bottom=bottom, label=r"$Boiler\ electric$", **bar_kw)
+        bottom -= boiler_el
+
         ax_e.bar(time, -pv_exp, bottom=bottom, label=r"$PV\ export$", **bar_kw)
 
         ax_e.axhline(0.0, color="black", lw=1.0)
@@ -158,8 +182,8 @@ def plot_household_fourpack_seasons(
         ax_e.tick_params(labelsize=fontsize)
 
         # Szép szimmetrikus y-limit
-        y_pos = pv + grid_imp
-        y_neg = ue + elh + pv_exp
+        y_pos = pv + grid_base + grid_boiler
+        y_neg = ue + boiler_el + pv_exp
         ymax = max(float(np.nanmax(y_pos)), float(np.nanmax(y_neg)), 1e-6)
         ax_e.set_ylim(-1.15 * ymax, 1.15 * ymax)
 
