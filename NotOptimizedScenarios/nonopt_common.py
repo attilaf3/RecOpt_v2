@@ -341,6 +341,7 @@ def simulate_one_user_greedy(
     e_pv_to_bess = np.zeros(T, dtype=float)
     e_bess_to_load = np.zeros(T, dtype=float)
     e_grid_to_load = np.zeros(T, dtype=float)
+    e_grid_to_bess = np.zeros(T, dtype=float)
     e_inj = np.zeros(T, dtype=float)
     e_bess = np.zeros(T, dtype=float)
     d_bess_ch = np.zeros(T, dtype=float)
@@ -366,6 +367,10 @@ def simulate_one_user_greedy(
         soc = 0.5 * bess_size_kwh
         soc = min(max(soc, soc_min_kwh), soc_max_kwh)
 
+        min_mode_steps = 4
+        mode = "idle"
+        lock_steps_left = 0
+
         for t in range(T):
             soc *= eta_bess_stor
 
@@ -376,8 +381,11 @@ def simulate_one_user_greedy(
             deficit = load_t - pv_to_load
             surplus = pv_t - pv_to_load
 
+            can_charge = (lock_steps_left <= 0) or (mode == "charge")
+            can_discharge = (lock_steps_left <= 0) or (mode == "discharge")
+
             charge = 0.0
-            if surplus > 1e-12:
+            if surplus > 1e-12 and can_charge:
                 room_kwh = max(soc_max_kwh - soc, 0.0)
                 max_charge_by_soc = room_kwh / max(eta_bess_in, 1e-12)
                 charge = min(surplus, e_bess_max_step, max_charge_by_soc)
@@ -385,21 +393,49 @@ def simulate_one_user_greedy(
                 surplus -= charge
 
             discharge = 0.0
-            if deficit > 1e-12:
+            if deficit > 1e-12 and can_discharge:
                 avail_kwh = max(soc - soc_min_kwh, 0.0)
                 max_discharge_by_soc = avail_kwh * eta_bess_out
                 discharge = min(deficit, e_bess_max_step, max_discharge_by_soc)
                 soc -= discharge / max(eta_bess_out, 1e-12)
                 deficit -= discharge
 
+
+            grid_charge = 0.0
+            if soc < soc_min_kwh - 1e-12 and can_charge and surplus <= 1e-12:
+                need_to_soc = soc_min_kwh - soc
+                grid_charge = min(
+                    e_bess_max_step,
+                    need_to_soc / max(eta_bess_in, 1e-12),
+                )
+                soc += grid_charge * eta_bess_in
+
+            if charge > 1e-12 or grid_charge > 1e-12:
+                if mode != "charge":
+                    mode = "charge"
+                    lock_steps_left = min_mode_steps - 1
+
+            elif discharge > 1e-12:
+                if mode != "discharge":
+                    mode = "discharge"
+                    lock_steps_left = min_mode_steps - 1
+
+            else:
+                if lock_steps_left <= 0:
+                    mode = "idle"
+
+            if lock_steps_left > 0:
+                lock_steps_left -= 1
+
             e_pv_to_load[t] = pv_to_load
             e_pv_to_bess[t] = charge
             e_bess_to_load[t] = discharge
-            e_grid_to_load[t] = max(deficit, 0.0)
+            e_grid_to_load[t] = max(deficit, 0.0) + grid_charge
             e_inj[t] = max(surplus, 0.0)
             e_bess[t] = soc
+            e_grid_to_bess[t] = grid_charge
 
-            d_bess_ch[t] = 1.0 if charge > 1e-12 else 0.0
+            d_bess_ch[t] = 1.0 if (charge > 1e-12 or grid_charge > 1e-12) else 0.0
             d_bess_dis[t] = 1.0 if discharge > 1e-12 else 0.0
 
     load_kwh = e_load.sum()
@@ -469,6 +505,7 @@ def simulate_one_user_greedy(
             "e_pv_to_bess": e_pv_to_bess,
             "e_bess_to_load": e_bess_to_load,
             "e_grid_to_load": e_grid_to_load,
+            "e_grid_to_bess": e_grid_to_bess,
             "e_grid_to_base": e_grid_to_base,
             "e_grid_to_boiler": e_grid_to_boiler,
             "e_local_to_base": e_local_to_base,
@@ -488,6 +525,7 @@ def simulate_one_user_greedy(
             "grid_import_kwh": grid_import_kwh,
             "grid_import_a_kwh": bill["grid_import_a_kwh"],
             "grid_import_b_kwh": bill["grid_import_b_kwh"],
+            "grid_to_bess_kwh": float(e_grid_to_bess.sum()),
             "injection_kwh": injection_kwh,
             "self_consumed_pv_kwh": self_consumed_pv_kwh,
             "locally_supplied_load_kwh": locally_supplied_load_kwh,
@@ -661,6 +699,7 @@ def run_case(
     ts_e_bess_to_load = np.zeros((T, U), dtype=float)
     ts_e_grid_to_load = np.zeros((T, U), dtype=float)
     ts_e_grid_to_base = np.zeros((T, U), dtype=float)
+    ts_e_grid_to_bess = np.zeros((T, U), dtype=float)
     ts_e_grid_to_boiler = np.zeros((T, U), dtype=float)
     ts_e_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
@@ -731,6 +770,7 @@ def run_case(
             "pv_to_load_kwh": annual["pv_to_load_kwh"],
             "pv_to_bess_kwh": annual["pv_to_bess_kwh"],
             "bess_to_load_kwh": annual["bess_to_load_kwh"],
+            "grid_to_bess_kwh": annual["grid_to_bess_kwh"],
             "grid_import_kwh": annual["grid_import_kwh"],
             "grid_import_a_kwh": annual["grid_import_a_kwh"],
             "grid_import_b_kwh": annual["grid_import_b_kwh"],
@@ -761,6 +801,7 @@ def run_case(
         ts_e_bess_to_load[:, u] = times["e_bess_to_load"]
         ts_e_grid_to_load[:, u] = times["e_grid_to_load"]
         ts_e_grid_to_base[:, u] = times["e_grid_to_base"]
+        ts_e_grid_to_bess[:, u] = times["e_grid_to_bess"]
         ts_e_grid_to_boiler[:, u] = times["e_grid_to_boiler"]
         ts_e_inj[:, u] = times["e_inj"]
         ts_e_bess[:, u] = times["e_bess"]
@@ -796,6 +837,7 @@ def run_case(
         "grid_import_a_high_kwh": float(per_user_df["grid_import_a_high_kwh"].sum()),
         "grid_import_b_low_kwh": float(per_user_df["grid_import_b_low_kwh"].sum()),
         "grid_import_b_high_kwh": float(per_user_df["grid_import_b_high_kwh"].sum()),
+        "grid_to_bess_kwh": float(per_user_df["grid_to_bess_kwh"].sum()),
         "injection_kwh": float(per_user_df["injection_kwh"].sum()),
         "import_cost_a_ft": float(per_user_df["import_cost_a_ft"].sum()),
         "import_cost_b_ft": float(per_user_df["import_cost_b_ft"].sum()),
@@ -841,6 +883,7 @@ def run_case(
     save_ts(ts_e_bess_to_load, "e_bess_to_load.csv")
     save_ts(ts_e_grid_to_load, "e_grid_to_load.csv")
     save_ts(ts_e_grid_to_base, "e_grid_to_base.csv")
+    save_ts(ts_e_grid_to_bess, "e_grid_to_bess.csv")
     save_ts(ts_e_grid_to_boiler, "e_grid_to_boiler.csv")
     save_ts(ts_e_inj, "e_inj.csv")
     save_ts(ts_e_bess, "e_bess.csv")
@@ -860,6 +903,7 @@ def run_case(
         "e_grid_to_boiler_total": ts_e_grid_to_boiler.sum(axis=1),
         "e_inj_total": ts_e_inj.sum(axis=1),
         "e_bess_total": ts_e_bess.sum(axis=1),
+        "e_grid_to_bess_total": ts_e_grid_to_bess.sum(axis=1),
     })
     community_ts.to_csv(out_case / "community_timeseries.csv", index=False)
 

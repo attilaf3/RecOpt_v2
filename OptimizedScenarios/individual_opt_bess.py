@@ -13,7 +13,7 @@ def individual_opt_bess(
     eta_bess_stor=0.995,
     soc_bess_min=0.10,
     soc_bess_max=0.90,
-    soc_bess_init=None,
+    soc_bess_init=0.5,
     t_bess_min=2.0,         # h -> max teljesítmény = size_bess / t_bess_min
     price_grid_a_low=36.0,
     price_grid_a_high=71.0,
@@ -22,7 +22,8 @@ def individual_opt_bess(
     price_pv_grid=5.0,
     grid_a_low_cap_kwh=2523.0,
     grid_b_low_cap_kwh=2523.0,
-    objective="grid",
+    boiler_tariff="B",
+    objective="bill",
     run_lp=False,
     msg=False,
     gapRel=None,
@@ -57,6 +58,9 @@ def individual_opt_bess(
     time_set = range(T)
 
     total_load = p_ue + p_el_heater
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
     bess_active = float(size_bess) > 1e-9
     if soc_bess_init is None:
@@ -100,13 +104,19 @@ def individual_opt_bess(
             )
             for t in time_set
         ]
-        d_bess = [
-            pulp.LpVariable(f"d_bess_{t}", cat=pulp.LpBinary) if not run_lp else 0
+        d_bess_ch = [
+            pulp.LpVariable(f"d_bess_ch_{t}", cat=pulp.LpBinary) if not run_lp else 0
+            for t in time_set
+        ]
+
+        d_bess_dis = [
+            pulp.LpVariable(f"d_bess_dis_{t}", cat=pulp.LpBinary) if not run_lp else 0
             for t in time_set
         ]
     else:
         e_bess = [0.0] * T
-        d_bess = [0.0] * T
+        d_bess_ch = [0.0] * T
+        d_bess_dis = [0.0] * T
 
     # Grid import/export
     p_grid_import = [pulp.LpVariable(f"p_grid_import_{t}", lowBound=0) for t in time_set]
@@ -127,7 +137,7 @@ def individual_opt_bess(
     # Korlátok
     # ------------------------------------------------------------------
     for t in time_set:
-        k = (t + 1) % T
+        # k = (t + 1) % T
 
         # PV split
         prob += (
@@ -151,8 +161,11 @@ def individual_opt_bess(
                 p_grid_import[t] == p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t]
         ), f"grid_import_def_{t}"
 
-        # Ne legyen egyszerre import és export
-        if not run_lp:
+        # Ne legyen egyszerre import és export ugyanazon a normál A tarifás körön.
+        # B tarifás bojlernél a bojler külön mérőn van, ezért lehet egyszerre:
+        # - B körön hálózati import a bojlerre
+        # - A körön PV export
+        if not run_lp and boiler_tariff == "A":
             prob += p_grid_import[t] <= M_grid * d_grid[t], f"grid_import_gate_{t}"
             prob += p_grid_export[t] <= M_pv * (1 - d_grid[t]), f"grid_export_gate_{t}"
 
@@ -165,9 +178,10 @@ def individual_opt_bess(
             prob += p_bess_out[t] == 0, f"no_bess_out_{t}"
             prob += p_grid_bess[t] == 0, f"no_bess_grid_bess_{t}"
         else:
-            # töltés két forrásból
+            # BESS tölthet PV-ből és hálózatból is.
+            # A hálózati BESS töltés A tarifás import.
             prob += (
-                p_bess_in[t] == p_pv_bess[t] + p_grid_bess[t]
+                    p_bess_in[t] == p_pv_bess[t] + p_grid_bess[t]
             ), f"bess_in_def_{t}"
 
             # kisütés csak a loadra
@@ -178,26 +192,54 @@ def individual_opt_bess(
 
 
             # dinamika
-            prob += e_bess[k] == (
-                    e_bess[t] * eta_bess_stor
-                    + dt * (p_bess_in[t] * eta_bess_in - p_bess_out[t] / max(eta_bess_out, 1e-9))
-            )
+            # prob += e_bess[k] == (
+            #         e_bess[t] * eta_bess_stor
+            #         + dt * (p_bess_in[t] * eta_bess_in - p_bess_out[t] / max(eta_bess_out, 1e-9))
+            # )
+
+            if t < T - 1:
+                prob += e_bess[t + 1] == (
+                        e_bess[t] * eta_bess_stor
+                        + dt * (
+                                p_bess_in[t] * eta_bess_in
+                                - p_bess_out[t] / max(eta_bess_out, 1e-9)
+                        )
+                ), f"bess_dyn_{t}"
 
             # teljesítménykorlát
             if run_lp:
                 prob += p_bess_in[t] <= battery_power, f"bess_in_cap_{t}"
                 prob += p_bess_out[t] <= battery_power, f"bess_out_cap_{t}"
             else:
-                prob += p_bess_in[t] <= d_bess[t] * battery_power, f"bess_in_gate_{t}"
-                prob += p_bess_out[t] <= (1 - d_bess[t]) * battery_power, f"bess_out_gate_{t}"
+                prob += d_bess_ch[t] + d_bess_dis[t] <= 1, f"bess_no_simultaneous_{t}"
+
+                prob += p_bess_in[t] <= d_bess_ch[t] * battery_power, f"bess_in_gate_{t}"
+                prob += p_bess_out[t] <= d_bess_dis[t] * battery_power, f"bess_out_gate_{t}"
 
             # SOC korlát külön is
             prob += e_bess[t] >= float(size_bess) * float(soc_bess_min), f"soc_min_{t}"
             prob += e_bess[t] <= float(size_bess) * float(soc_bess_max), f"soc_max_{t}"
 
-        # 15 perces bruttó import felosztása
-        e_imp_a_t = dt * (p_grid_ue[t] + p_grid_bess[t])
-        e_imp_b_t = dt * p_grid_elh[t]
+        # Bojler tarifalogika
+        if boiler_tariff == "A":
+            # A tarifás bojler:
+            # - kaphat PV-ből
+            # - kaphat BESS-ből
+            # - hálózatból A tarifán vételez
+            e_imp_a_t = dt * (p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t])
+            e_imp_b_t = 0.0
+
+        else:
+            # B tarifás bojler:
+            # - külön mérő / külön áramkör
+            # - nem kaphat PV-ből
+            # - nem kaphat BESS-ből
+            # - teljes bojlerigény B tarifás hálózati import
+            prob += p_pv_elh[t] == 0, f"no_pv_to_boiler_B_{t}"
+            prob += p_bess_elh[t] == 0, f"no_bess_to_boiler_B_{t}"
+
+            e_imp_a_t = dt * (p_grid_ue[t] + p_grid_bess[t])
+            e_imp_b_t = dt * p_grid_elh[t]
 
         prob += e_grid_a_low_step[t] + e_grid_a_high_step[t] == e_imp_a_t
         prob += e_grid_b_low_step[t] + e_grid_b_high_step[t] == e_imp_b_t
@@ -220,21 +262,41 @@ def individual_opt_bess(
         prob += e_bess[0] == float(size_bess) * float(soc_bess_init), "bess_init"
 
     if bess_active and not run_lp:
-        min_on_steps = 4  # 4 * 15 perc = 1 óra
-        for t in range(1, T - min_on_steps + 1):
-            start_up = d_bess[t] - d_bess[t - 1]
-            prob += pulp.lpSum(d_bess[tau] for tau in range(t, t + min_on_steps)) >= min_on_steps * start_up, \
-                f"bess_min_on_{t}"
+        min_mode_steps = 4  # 4 * 15 perc = 1 óra
+
+        for t in range(1, T - min_mode_steps + 1):
+            start_ch = d_bess_ch[t] - d_bess_ch[t - 1]
+            start_dis = d_bess_dis[t] - d_bess_dis[t - 1]
+
+            prob += (
+                    pulp.lpSum(d_bess_ch[tau] for tau in range(t, t + min_mode_steps))
+                    >= min_mode_steps * start_ch
+            ), f"bess_min_charge_{t}"
+
+            prob += (
+                    pulp.lpSum(d_bess_dis[tau] for tau in range(t, t + min_mode_steps))
+                    >= min_mode_steps * start_dis
+            ), f"bess_min_discharge_{t}"
 
     # ------------------------------------------------------------------
-    # Célfüggvény: nettó villanyszámla [Ft]
+    # Célfüggvény: hálózati interakció [Ft]
     if objective == "grid":
         prob += pulp.lpSum(
             dt * (p_grid_import[t] + p_grid_export[t])
             for t in time_set
         )
-    else:
-        raise ValueError("objective must be 'grid'")
+    # Célfüggvény: éves bruttó villanyszámla [Ft]
+    elif objective == "bill":
+        prob += pulp.lpSum(
+            price_grid_a_low * e_grid_a_low_step[t]
+            + price_grid_a_high * e_grid_a_high_step[t]
+            + price_grid_b_low * e_grid_b_low_step[t]
+            + price_grid_b_high * e_grid_b_high_step[t]
+            - price_pv_grid * dt * p_grid_export[t]
+            for t in time_set
+        )
+
+
     # ------------------------------------------------------------------
     # Solve
     # ------------------------------------------------------------------
@@ -242,7 +304,7 @@ def individual_opt_bess(
     status = prob.solve(solver)
 
     status_str = pulp.LpStatus.get(status, str(status))
-    if status_str not in {"Optimal", "Not Solved", "Integer Feasible", "Undefined"}:
+    if status_str not in {"Optimal", "Integer Feasible"}:
         raise RuntimeError(f"Hiba: {status_str}")
 
     def _val(x):
@@ -268,10 +330,14 @@ def individual_opt_bess(
 
     if bess_active:
         e_bess_v = np.array([_val(v) for v in e_bess], dtype=float)
-        d_bess_v = np.array([_val(v) if not run_lp else 0.0 for v in d_bess], dtype=float)
+        d_bess_ch_v = np.array([_val(v) if not run_lp else 0.0 for v in d_bess_ch], dtype=float)
+        d_bess_dis_v = np.array([_val(v) if not run_lp else 0.0 for v in d_bess_dis], dtype=float)
+
     else:
         e_bess_v = np.zeros(T, dtype=float)
-        d_bess_v = np.zeros(T, dtype=float)
+        d_bess_ch_v = np.zeros(T, dtype=float)
+        d_bess_dis_v = np.zeros(T, dtype=float)
+
 
     d_grid_v = np.array([_val(v) if not run_lp else 0.0 for v in d_grid], dtype=float)
 
@@ -301,7 +367,7 @@ def individual_opt_bess(
 
     import_cost_ft = import_cost_a_ft + import_cost_b_ft
 
-    net_cost = import_cost_ft - export_revenue
+    brt_bill_ft = import_cost_ft - export_revenue
 
     results = {
         "p_pv": p_pv,
@@ -331,13 +397,15 @@ def individual_opt_bess(
         "p_grid_ue": p_grid_ue_v,
         "p_grid_elh": p_grid_elh_v,
         "p_grid_to_base": p_grid_ue_v,
-        "p_grid_to_boiler": p_grid_elh_v,
+        "p_grid_to_boiler": p_grid_elh_v if boiler_tariff == "B" else np.zeros(T, dtype=float),
+        "boiler_tariff": boiler_tariff,
 
         "p_bess_in": p_bess_in_v,
         "p_bess_out": p_bess_out_v,
         "p_grid_bess": p_grid_bess_v,
         "e_bess": e_bess_v,
-        "d_bess": d_bess_v,
+        "d_bess_ch": d_bess_ch_v,
+        "d_bess_dis": d_bess_dis_v,
 
         "p_grid_import": p_grid_import_v,
         "p_grid_export": p_grid_export_v,
@@ -349,7 +417,7 @@ def individual_opt_bess(
             + e_grid_b_low_v
             + e_grid_b_high_v,
 
-        "objective_Ft": float(pulp.value(prob.objective)),
+
         "status": status_str,
 
         "grid_import_low_kwh":
@@ -368,7 +436,8 @@ def individual_opt_bess(
         "import_cost_b_ft": import_cost_b_ft,
         "import_cost_ft": import_cost_a_ft + import_cost_b_ft,
         "export_revenue_ft": export_revenue,
-        "brt_bill_ft": net_cost,
+        "objective_Ft": float(brt_bill_ft),
+        "brt_bill_ft": brt_bill_ft,
     }
 
     return results

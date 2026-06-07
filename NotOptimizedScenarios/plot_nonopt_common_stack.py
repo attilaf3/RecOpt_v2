@@ -74,6 +74,7 @@ def _load_household_series(
         "e_grid_to_boiler": "e_grid_to_boiler.csv",
         "e_inj": "e_inj.csv",
         "e_pv_to_bess": "e_pv_to_bess.csv",
+        "e_grid_to_bess": "e_grid_to_bess.csv",
         "e_bess": "e_bess.csv",
         "d_bess_ch": "d_bess_ch.csv",
         "d_bess_dis": "d_bess_dis.csv",
@@ -148,6 +149,7 @@ def _plot_one_season(
     e_grid_to_load = series["e_grid_to_load"][sl]
     e_grid_to_base = series["e_grid_to_base"][sl]
     e_grid_to_boiler = series["e_grid_to_boiler"][sl]
+    e_grid_to_bess = series["e_grid_to_bess"][sl]
 
     e_inj = series["e_inj"][sl]
     e_pv_to_bess = series["e_pv_to_bess"][sl]
@@ -168,6 +170,7 @@ def _plot_one_season(
     p_grid_to_load = _energy_to_power(e_grid_to_load, dt)
     p_grid_to_base = _energy_to_power(e_grid_to_base, dt)
     p_grid_to_boiler = _energy_to_power(e_grid_to_boiler, dt)
+    p_grid_to_bess = _energy_to_power(e_grid_to_bess, dt)
 
     p_inj = _energy_to_power(e_inj, dt)
     p_pv_to_bess = _energy_to_power(e_pv_to_bess, dt)
@@ -267,12 +270,21 @@ def _plot_one_season(
     )
     neg_bottom -= p_inj
 
-    h_bess_in = ax.bar(
+    h_bess_in_pv = ax.bar(
         time_h,
         -p_pv_to_bess,
         width=bar_width,
         bottom=neg_bottom,
-        label="BESS töltés",
+        label="BESS töltés PV-ből",
+    )
+    neg_bottom -= p_pv_to_bess
+
+    h_bess_in_grid = ax.bar(
+        time_h,
+        -p_grid_to_bess,
+        width=bar_width,
+        bottom=neg_bottom,
+        label="BESS töltés hálózatból",
     )
 
     boiler_is_b_tariff = np.nanmax(e_grid_to_boiler) > 1e-9
@@ -289,7 +301,7 @@ def _plot_one_season(
     ax.grid(True, alpha=0.3)
 
     y_pos = p_pv + p_bess_to_load + p_grid_to_base + p_grid_to_boiler
-    y_neg = p_base_load + p_boiler + p_inj + p_pv_to_bess
+    y_neg = p_base_load + p_boiler + p_inj + p_pv_to_bess + p_grid_to_bess
     ymax = max(float(np.nanmax(y_pos)), float(np.nanmax(y_neg)), 1e-6)
     ax.set_ylim(-1.15 * ymax, 1.15 * ymax)
 
@@ -302,7 +314,8 @@ def _plot_one_season(
         h_base_load,
         h_boiler,
         h_export,
-        h_bess_in,
+        h_bess_in_pv,
+        h_bess_in_grid,
     ]
 
     labels = [
@@ -313,7 +326,8 @@ def _plot_one_season(
         "Általános fogyasztás",
         "Bojler fogyasztás",
         "PV export",
-        "BESS töltés",
+        "BESS töltés PV-ből",
+        "BESS töltés hálózatból",
     ]
 
     ax_leg.legend(handles, labels, loc="center", frameon=False)
@@ -418,7 +432,7 @@ def plot_household_power_stack_seasons(
 
 if __name__ == "__main__":
     # plot_household_power_stack_seasons(
-    #     results_dir=r"results_base_with_bess_B_tariff",
+    #     results_dir=r"results_base_with_bess_A_tariff",
     #     household_name="0420144888439778",
     #     window_days=3,
     #     dt=DT,
