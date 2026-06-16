@@ -24,8 +24,10 @@ import matplotlib.patheffects as pe
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
-RESULTS_DIR = r"results_individual_opt_bess"
-HOUSEHOLD_NAME = "420144653458813"   # timeseries_<...>.csv-ben a <...> rész (ha nem pontos, keres fallbackkal)
+BOILER_TARIFF = 'B'
+RESULTS_DIR = f"results_individual_opt_bess_{BOILER_TARIFF}_tariff"
+HOUSEHOLD_NAME = "0420144653458813"
+# HOUSEHOLD_NAME = "0420144888439778"
 WINDOW_DAYS = 3                       # 2 vagy 3
 DT = 0.25                             # 15 perc (óra) – az ablakok skálázásához kell
 P_ARE_KWH_PER_STEP = True             # True: p_* oszlopok kWh/lépés; False: kW
@@ -207,7 +209,7 @@ def plot_household_fourpack_seasons(
         fig.suptitle(f"Háztartás: {household_name}", fontsize=fontsize + 2)
         fig.tight_layout()
 
-        out_png = out_dir / f"household_{household_name}_{season}_{window_days}days.png"
+        out_png = out_dir / f"household_{household_name}_{season}_{BOILER_TARIFF}.png"
         plt.savefig(out_png, dpi=dpi)
         plt.close(fig)
         print(f"Mentve: {out_png}")

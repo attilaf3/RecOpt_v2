@@ -59,6 +59,41 @@ def individual_opt_bess(
 
     total_load = p_ue + p_el_heater
     boiler_tariff = str(boiler_tariff).upper().strip()
+
+    # ------------------------------------------------------------------
+    # Nonopt-tal ekvivalens fix PV -> load sorrend
+    # ------------------------------------------------------------------
+    if boiler_tariff == "A":
+        # A tarifás bojler: a bojler a normál fogyasztási kör része.
+        p_dispatch_load = total_load.copy()
+    else:
+        # B tarifás bojler: a PV/BESS csak az alapfogyasztást látja.
+        p_dispatch_load = p_ue.copy()
+
+    # A nonopt logika szerint:
+    # PV először a dispatch loadra megy.
+    p_pv_to_load_fixed = np.minimum(p_pv, p_dispatch_load)
+
+    # PV többlet, amit vagy BESS-be töltünk, vagy exportálunk.
+    p_surplus = np.maximum(p_pv - p_pv_to_load_fixed, 0.0)
+
+    # Fogyasztási hiány, amit vagy BESS-ből, vagy hálózatból látunk el.
+    p_deficit = np.maximum(p_dispatch_load - p_pv_to_load_fixed, 0.0)
+
+    # A lokális ellátás riportolásához ugyanazt az elvet használjuk:
+    # először alapfogyasztás, utána bojler.
+    p_pv_ue_fixed = np.minimum(p_ue, p_pv_to_load_fixed)
+
+    if boiler_tariff == "A":
+        p_pv_elh_fixed = np.maximum(p_pv_to_load_fixed - p_pv_ue_fixed, 0.0)
+        p_deficit_ue = np.maximum(p_ue - p_pv_ue_fixed, 0.0)
+        p_deficit_elh = np.maximum(p_el_heater - p_pv_elh_fixed, 0.0)
+    else:
+        # B tarifás bojler nem kaphat PV-t.
+        p_pv_elh_fixed = np.zeros(T, dtype=float)
+        p_deficit_ue = p_deficit.copy()
+        p_deficit_elh = p_el_heater.copy()
+
     if boiler_tariff not in {"A", "B"}:
         raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
@@ -104,6 +139,22 @@ def individual_opt_bess(
             )
             for t in time_set
         ]
+
+        e_bess_pre = [
+            pulp.LpVariable(
+                f"e_bess_pre_{t}",
+                lowBound=0,
+                upBound=float(size_bess) * float(soc_bess_max),
+            )
+            for t in time_set
+        ]
+
+        d_grid_bess_guard = [
+            pulp.LpVariable(f"d_grid_bess_guard_{t}", cat=pulp.LpBinary) if not run_lp else 0
+            for t in time_set
+        ]
+
+
         d_bess_ch = [
             pulp.LpVariable(f"d_bess_ch_{t}", cat=pulp.LpBinary) if not run_lp else 0
             for t in time_set
@@ -117,6 +168,8 @@ def individual_opt_bess(
         e_bess = [0.0] * T
         d_bess_ch = [0.0] * T
         d_bess_dis = [0.0] * T
+        e_bess_pre = [0.0] * T
+        d_grid_bess_guard = [0.0] * T
 
     # Grid import/export
     p_grid_import = [pulp.LpVariable(f"p_grid_import_{t}", lowBound=0) for t in time_set]
@@ -139,19 +192,34 @@ def individual_opt_bess(
     for t in time_set:
         # k = (t + 1) % T
 
-        # PV split
-        prob += (
-                p_pv_ue[t] + p_pv_elh[t] + p_pv_bess[t] + p_pv_grid[t] == p_pv[t]
-        ), f"pv_split_{t}"
+        # ------------------------------------------------------------------
+        # Nonopt-tal ekvivalens villamos sorrend
+        # ------------------------------------------------------------------
 
-        # Fogyasztás kiszolgálása
-        prob += (
-                p_pv_ue[t] + p_bess_ue[t] + p_grid_ue[t] == p_ue[t]
-        ), f"ue_balance_{t}"
+        # PV -> load fixen, nem döntési változóként.
+        prob += p_pv_ue[t] == float(p_pv_ue_fixed[t]), f"pv_ue_fixed_{t}"
+        prob += p_pv_elh[t] == float(p_pv_elh_fixed[t]), f"pv_elh_fixed_{t}"
 
+        # A maradék PV vagy BESS-be megy, vagy export.
         prob += (
-                p_pv_elh[t] + p_bess_elh[t] + p_grid_elh[t] == p_el_heater[t]
-        ), f"fixed_boiler_balance_{t}"
+                p_pv_bess[t] + p_pv_grid[t] == float(p_surplus[t])
+        ), f"surplus_split_{t}"
+
+        # A PV után fennmaradó alapfogyasztási hiány:
+        # vagy BESS-ből, vagy hálózatból.
+        prob += (
+                p_bess_ue[t] + p_grid_ue[t] == float(p_deficit_ue[t])
+        ), f"ue_deficit_split_{t}"
+
+        # A PV után fennmaradó bojlerhiány:
+        # A tarifán: BESS vagy grid is mehet rá.
+        # B tarifán: BESS nem mehet rá, csak grid.
+        prob += (
+                p_bess_elh[t] + p_grid_elh[t] == float(p_deficit_elh[t])
+        ), f"boiler_deficit_split_{t}"
+
+        if boiler_tariff == "B":
+            prob += p_bess_elh[t] == 0, f"no_bess_to_boiler_B_{t}"
 
         prob += (
             p_grid_export[t] == p_pv_grid[t]
@@ -161,12 +229,16 @@ def individual_opt_bess(
                 p_grid_import[t] == p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t]
         ), f"grid_import_def_{t}"
 
-        # Ne legyen egyszerre import és export ugyanazon a normál A tarifás körön.
-        # B tarifás bojlernél a bojler külön mérőn van, ezért lehet egyszerre:
-        # - B körön hálózati import a bojlerre
-        # - A körön PV export
-        if not run_lp and boiler_tariff == "A":
-            prob += p_grid_import[t] <= M_grid * d_grid[t], f"grid_import_gate_{t}"
+        # Ne legyen egyszerre A-körös import és PV export.
+        # B tarifán a bojler külön körön importálhat, de az A kör
+        # akkor sem importálhat és exportálhat egyszerre.
+        if not run_lp:
+            if boiler_tariff == "A":
+                p_grid_import_a_t = p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t]
+            else:
+                p_grid_import_a_t = p_grid_ue[t] + p_grid_bess[t]
+
+            prob += p_grid_import_a_t <= M_grid * d_grid[t], f"grid_import_a_gate_{t}"
             prob += p_grid_export[t] <= M_pv * (1 - d_grid[t]), f"grid_export_gate_{t}"
 
         # Akku logika
@@ -198,13 +270,48 @@ def individual_opt_bess(
             # )
 
             if t < T - 1:
-                prob += e_bess[t + 1] == (
+                soc_min_abs = float(size_bess) * float(soc_bess_min)
+                M_soc = float(size_bess)
+
+                # SOC grid->BESS pótlás nélkül.
+                # Ez ugyanaz, mint a nonopt-ban: először önkisülés,
+                # PV-töltés és kisütés hatása, de még hálózati pótlás nélkül.
+                prob += e_bess_pre[t + 1] == (
                         e_bess[t] * eta_bess_stor
                         + dt * (
-                                p_bess_in[t] * eta_bess_in
+                                p_pv_bess[t] * eta_bess_in
                                 - p_bess_out[t] / max(eta_bess_out, 1e-9)
                         )
-                ), f"bess_dyn_{t}"
+                ), f"bess_pre_dyn_{t}"
+
+                # A tényleges SOC már tartalmazhat grid->BESS minimumszint-pótlást.
+                prob += e_bess[t + 1] == (
+                        e_bess_pre[t + 1]
+                        + dt * eta_bess_in * p_grid_bess[t]
+                ), f"bess_dyn_with_grid_guard_{t}"
+
+                if not run_lp:
+                    grid_added = dt * eta_bess_in * p_grid_bess[t]
+                    deficit_to_min = soc_min_abs - e_bess_pre[t + 1]
+
+                    # Ha e_bess_pre < SOC_min, akkor grid_added pontosan a hiány.
+                    # Ha e_bess_pre >= SOC_min, akkor grid_added = 0.
+                    prob += grid_added >= deficit_to_min, f"grid_bess_guard_lb_{t}"
+                    prob += (
+                            grid_added <= deficit_to_min + M_soc * (1 - d_grid_bess_guard[t])
+                    ), f"grid_bess_guard_exact_{t}"
+                    prob += grid_added <= M_soc * d_grid_bess_guard[t], f"grid_bess_guard_ub_{t}"
+
+                else:
+                    # LP-relaxáció esetén kevésbé szigorú, de MIP futásnál a fenti pontos.
+                    prob += (
+                            dt * eta_bess_in * p_grid_bess[t]
+                            >= soc_min_abs - e_bess_pre[t + 1]
+                    ), f"grid_bess_guard_lp_{t}"
+
+            else:
+                # Utolsó időlépésben nincs következő SOC, ezért itt ne töltsön hálózatból.
+                prob += p_grid_bess[t] == 0, f"no_grid_bess_last_step_{t}"
 
             # teljesítménykorlát
             if run_lp:
@@ -229,14 +336,13 @@ def individual_opt_bess(
             e_imp_a_t = dt * (p_grid_ue[t] + p_grid_elh[t] + p_grid_bess[t])
             e_imp_b_t = 0.0
 
+
         else:
             # B tarifás bojler:
             # - külön mérő / külön áramkör
             # - nem kaphat PV-ből
             # - nem kaphat BESS-ből
             # - teljes bojlerigény B tarifás hálózati import
-            prob += p_pv_elh[t] == 0, f"no_pv_to_boiler_B_{t}"
-            prob += p_bess_elh[t] == 0, f"no_bess_to_boiler_B_{t}"
 
             e_imp_a_t = dt * (p_grid_ue[t] + p_grid_bess[t])
             e_imp_b_t = dt * p_grid_elh[t]
@@ -369,6 +475,13 @@ def individual_opt_bess(
 
     brt_bill_ft = import_cost_ft - export_revenue
 
+    if boiler_tariff == "A":
+        p_grid_to_base_v = p_grid_ue_v + p_grid_elh_v + p_grid_bess_v
+        p_grid_to_boiler_v = np.zeros(T, dtype=float)
+    else:
+        p_grid_to_base_v = p_grid_ue_v + p_grid_bess_v
+        p_grid_to_boiler_v = p_grid_elh_v
+
     results = {
         "p_pv": p_pv,
         "p_ue": p_ue,
@@ -396,8 +509,8 @@ def individual_opt_bess(
 
         "p_grid_ue": p_grid_ue_v,
         "p_grid_elh": p_grid_elh_v,
-        "p_grid_to_base": p_grid_ue_v,
-        "p_grid_to_boiler": p_grid_elh_v if boiler_tariff == "B" else np.zeros(T, dtype=float),
+        "p_grid_to_base": p_grid_to_base_v,
+        "p_grid_to_boiler": p_grid_to_boiler_v,
         "boiler_tariff": boiler_tariff,
 
         "p_bess_in": p_bess_in_v,

@@ -431,19 +431,19 @@ def plot_household_power_stack_seasons(
 
 
 if __name__ == "__main__":
-    # plot_household_power_stack_seasons(
-    #     results_dir=r"results_base_with_bess_A_tariff",
-    #     household_name="0420144888439778",
-    #     window_days=3,
-    #     dt=DT,
-    # )
-
     plot_household_power_stack_seasons(
-        results_dir=r"results_base_with_bess_B_tariff",
-        household_name="0420144653458813",
+        results_dir=r"results_base_with_bess_A_tariff",
+        household_name="0420144888439778",
         window_days=3,
         dt=DT,
     )
+
+    # plot_household_power_stack_seasons(
+    #     results_dir=r"results_base_with_bess_A_tariff",
+    #     household_name="0420144653458813",
+    #     window_days=3,
+    #     dt=DT,
+    # )
 
     # plot_household_power_stack_seasons(
     #     results_dir=r"results_base_no_bess_B_tariff",

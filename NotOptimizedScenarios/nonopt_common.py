@@ -221,6 +221,7 @@ def calc_bill_15min_brutto(
     Ha van, akkor `e_grid_to_load` a teljes import, ebből levonjuk a bojler
     importját, és csak a maradék kerül A-tarifára.
     """
+
     e_grid_to_load = np.maximum(np.asarray(e_grid_to_load, dtype=float), 0.0)
     e_inj = np.maximum(np.asarray(e_inj, dtype=float), 0.0)
 
@@ -244,6 +245,16 @@ def calc_bill_15min_brutto(
         low_price_ft_per_kwh=B_LOW_TARIFF_FT_PER_KWH,
         high_price_ft_per_kwh=B_HIGH_TARIFF_FT_PER_KWH,
     )
+
+    # Bruttó elszámolás:
+    #   importköltség = A tarifás import költsége + B tarifás import költsége
+    #   exportbevétel = PV exportált energia * átvételi ár
+    #   bruttó villanyszámla = importköltség - exportbevétel
+    #
+    # A tarifa:
+    #   normál háztartási fogyasztás
+    # B tarifa:
+    #   külön bojler import
 
     export_revenue_ft = e_inj.sum() * EXPORT_FT_PER_KWH
     import_cost_ft = a_import_cost_ft + b_import_cost_ft
@@ -370,6 +381,23 @@ def simulate_one_user_greedy(
         min_mode_steps = 4
         mode = "idle"
         lock_steps_left = 0
+
+        # Greedy logika:
+        # 1) PV először közvetlenül a fogyasztást látja el.
+        # 2) Ha PV többlet van, az BESS-be tölt.
+        # 3) Ha a BESS már nem tud több energiát felvenni, a maradék PV export.
+        # 4) Ha fogyasztási hiány van, a BESS kisüt.
+        # 5) Ha még mindig hiány van, hálózati import történik.
+        # 6) A BESS SOC minden időlépésben önkisüléssel csökken.
+
+        # A tarifás bojler esetén:
+        #   a bojler a teljes háztartási fogyasztás része,
+        #   ezért PV és BESS is kiszolgálhatja.
+        #
+        # B tarifás bojler esetén:
+        #   a bojler külön mérőn van,
+        #   ezért nem kap PV-t és nem kap BESS energiát,
+        #   a teljes bojlerigény B tarifás hálózati import.
 
         for t in range(T):
             soc *= eta_bess_stor

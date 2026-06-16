@@ -206,8 +206,8 @@ def build_inputs(
         # HSS paraméterek
         T_env_u.append(float(hss.get("T_env", 20)))
         T_max_u.append(float(hss.get("T_max", 65)))
-        T_min_u.append(float(hss.get("T_min", 10)))
-        T_in_u.append(float(hss.get("T_in", 10)))
+        T_min_u.append(float(hss.get("T_min", 35)))
+        T_in_u.append(float(hss.get("T_in", 12)))
         T_out_u.append(float(hss.get("T_out", 55)))
         a_hss_u.append(float(hss.get("a_hss", 0.01275)))
         eta_elh_u.append(float(hss.get("eta_elh", 0.95)))
