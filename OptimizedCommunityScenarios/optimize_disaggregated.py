@@ -138,6 +138,20 @@ def optimize_multi_users_economic(
     M_rec = max_total_pv + float(np.sum(battery_power_u))
     M_grid = max_total_load + max_total_dhw_el + float(np.sum(battery_power_u)) + 1.0
 
+    eligible_load = p_ue.copy()
+
+    if not hss_flag:
+        eligible_load = eligible_load + p_el_heater
+    else:
+        eligible_load = eligible_load + p_dhw / np.maximum(eta_elh_u, 1e-9)
+
+    total_eligible_load = np.sum(eligible_load, axis=1)
+
+    share_alpha = np.zeros_like(eligible_load)
+    for t in range(T):
+        if total_eligible_load[t] > 1e-9:
+            share_alpha[t, :] = eligible_load[t, :] / total_eligible_load[t]
+
     # -------------------------------------------------------------------------
     # Variables
     # -------------------------------------------------------------------------
@@ -348,6 +362,11 @@ def optimize_multi_users_economic(
         # ---------------------------
         prob += p_inj_comm[t] == pulp.lpSum(p_inj_user[t][u] for u in users), f"{t}_inj_comm_def"
         prob += p_with_comm[t] == pulp.lpSum(p_with_user[t][u] for u in users), f"{t}_with_comm_def"
+
+        for u in users:
+            prob += (
+                    p_with_user[t][u] == share_alpha[t, u] * p_with_comm[t]
+            ), f"{t}_{u}_proportional_rec_share"
 
         # REC direct sharing: surplus goes to grid export, shortage comes from grid import
         prob += p_inj_comm[t] + p_grid_import[t] == p_with_comm[t] + p_grid_export[t], f"{t}_community_grid_balance"

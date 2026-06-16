@@ -1,24 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List
+from typing import Iterable, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import yaml
 from matplotlib.patches import Patch
 
+from HeatPump.simulate_ata import (HOUSES_RAW, build_setpoint_profile as hp_build_setpoint_profile,
+                                   load_or_make_inputs as load_hp_weather, simulate_5r2c, solar_gain_sepsi,
+                                   tabula_to_5r2c_iso_sepsi, )
 from OptimizedCommunityScenarios.call_disaggregated import build_inputs
-from HeatPump.simulate_ata import (
-    HOUSES_RAW,
-    build_setpoint_profile as hp_build_setpoint_profile,
-    load_or_make_inputs as load_hp_weather,
-    simulate_5r2c,
-    solar_gain_sepsi,
-    tabula_to_5r2c_iso_sepsi,
-)
-import matplotlib.pyplot as plt
-
 
 DT = 0.25  # 15 perc
 HP_DT = 0.25  # 5R2C időlépés
@@ -30,6 +27,141 @@ BOILER_LOW_TARIFF_FT_PER_KWH = 23.0
 BOILER_HIGH_TARIFF_FT_PER_KWH = 60.9
 HP_LOW_TARIFF_FT_PER_KWH = 29.34
 HP_HIGH_TARIFF_FT_PER_KWH = 60.1
+
+
+def _as_15min_energy(profile: np.ndarray) -> np.ndarray:
+    p = np.asarray(profile, dtype=float).ravel()
+    if p.size != 35040:
+        raise ValueError(f"A profil hossza {p.size}, de 35040 kell.")
+    return np.maximum(p, 0.0)
+
+
+def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
+    for r in roots:
+        for cand in (name, f"{name}.yaml"):
+            p = Path(r) / cand
+            if p.exists():
+                return p
+    return None
+
+
+def build_inputs(sim_yaml_path: os.PathLike, profiles_csv_path: os.PathLike, dhw_profile_path: os.PathLike,
+        max_users: int = 10, search_roots: Iterable[os.PathLike] | None = None, ) -> Tuple[
+    np.ndarray,  # e_pv (35040, U) [kWh / 15 perc]
+    np.ndarray,  # e_ue (35040, U) [kWh / 15 perc]
+    np.ndarray,  # e_el_heater (35040, U) [kWh / 15 perc]
+    np.ndarray,  # size_bess (U,)
+    np.ndarray,  # eta_bess_in (U,)
+    np.ndarray,  # eta_bess_out (U,)
+    np.ndarray,  # eta_bess_stor (U,)
+    np.ndarray,  # soc_bess_min (U,)
+    np.ndarray,  # soc_bess_max (U,)
+    np.ndarray,  # t_bess_min (U,)
+    list[float], list[float], list[float], list[float], list[float], list[float], list[float], list[str],]:
+    sim_yaml_path = Path(sim_yaml_path)
+    profiles_csv_path = Path(profiles_csv_path)
+
+    if search_roots is None:
+        search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
+
+    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
+    users_list = list(sim.get("users_list", []))[: int(max_users)]
+
+    EXCLUDE = {"battery", "bess", "community"}
+    users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
+    if not users_list:
+        raise RuntimeError("A simulation YAML nem tartalmaz users_list-et vagy max_users=0.")
+
+    df = pd.read_csv(profiles_csv_path, index_col=0)
+    df.columns = [str(c) for c in df.columns]
+    df = df[[c for c in df.columns if c.lower() not in EXCLUDE]]
+
+    e_pv_cols: list[np.ndarray] = []
+    e_ue_cols: list[np.ndarray] = []
+    e_el_heater_cols: list[np.ndarray] = []
+
+    user_names = []
+
+    size_bess = []
+    eta_bess_in_u = []
+    eta_bess_out_u = []
+    eta_bess_stor_u = []
+    soc_bess_min_u = []
+    soc_bess_max_u = []
+    t_bess_min_u = []
+
+    for user_key in users_list:
+        ypath = _find_user_yaml(search_roots, user_key)
+        if not ypath:
+            print(f"[WARN] YAML nem található: {user_key} — kihagyom.")
+            continue
+
+        u = yaml.safe_load(ypath.read_text(encoding="utf-8")) or {}
+        units = u.get("units") or {}
+        name = (units.get("name") or {}).get("name", str(user_key))
+        user_names.append(name)
+
+        # --- UE (villamos fogyasztás), 15 perc [kWh / lépés] ---
+        ue = units.get("ue") or {}
+        ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
+        if ue_prof and ue_prof in df.columns:
+            e_ue_cols.append(_as_15min_energy(df[ue_prof].to_numpy()))
+        else:
+            e_ue_cols.append(np.zeros(35040, dtype=float))
+
+        # --- PV (termelés), 15 perc [kWh / lépés] ---
+        n_pv = 1.0
+        pv = units.get("pv") or {}
+        pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
+        if pv_prof and pv_prof in df.columns:
+            e_pv_cols.append(_as_15min_energy(df[pv_prof].to_numpy()) / n_pv)
+        else:
+            e_pv_cols.append(np.zeros(35040, dtype=float))
+
+        # --- BESS paraméterek ---
+        bess = units.get("bess") or {}
+        size_bess.append(float(bess.get("bess_size", 0.0)))
+        eta_bess_in_u.append(float(bess.get("eta_bess_in", 0.98)))
+        eta_bess_out_u.append(float(bess.get("eta_bess_out", 0.96)))
+        eta_bess_stor_u.append(float(bess.get("eta_bess_stor", 0.995)))
+        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.1)))
+        soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.9)))
+        t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
+
+        # nincs HSS, az UT profil is 15 perces energia [kWh / lépés]
+        heater = units.get("ut") or {}
+
+        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
+        if p_el_heater_prof and p_el_heater_prof in df.columns:
+            e_el_heater_cols.append(_as_15min_energy(df[p_el_heater_prof].to_numpy()))
+        else:
+            e_el_heater_cols.append(np.zeros(35040, dtype=float))
+
+    if not user_names:
+        raise RuntimeError("Nincs érvényes felhasználó.")
+
+    U = len(user_names)
+
+    e_pv = np.column_stack(e_pv_cols).astype(float)
+    e_ue = np.column_stack(e_ue_cols).astype(float)
+
+    e_el_heater = (
+        np.column_stack(e_el_heater_cols).astype(float) if e_el_heater_cols else np.zeros((35040, U), dtype=float))
+
+    return (e_pv, e_ue, e_el_heater, np.asarray(size_bess, dtype=float), np.asarray(eta_bess_in_u, dtype=float),
+            np.asarray(eta_bess_out_u, dtype=float), np.asarray(eta_bess_stor_u, dtype=float),
+            np.asarray(soc_bess_min_u, dtype=float), np.asarray(soc_bess_max_u, dtype=float),
+            np.asarray(t_bess_min_u, dtype=float), user_names,)
+
+
+LOW_TARIFF_LIMIT_KWH = 2523.0
+LOW_TARIFF_FT_PER_KWH = 36.0
+HIGH_TARIFF_FT_PER_KWH = 71.0
+
+B_LOW_TARIFF_LIMIT_KWH = 2523.0
+B_LOW_TARIFF_FT_PER_KWH = 23.0
+B_HIGH_TARIFF_FT_PER_KWH = 61.0
+
 EXPORT_FT_PER_KWH = 5.0
 # Default HP forbidden windows: allow season-specific configuration.
 # By default use earlier-morning forbidden window in winter (5-8) and
@@ -37,61 +169,92 @@ EXPORT_FT_PER_KWH = 5.0
 # The simulate_5r2c function accepts either a sequence of (start,end) tuples
 # (applies all year) or a dict with keys 'winter' and 'summer' (and optional
 # 'default') mapping to sequences of tuples.
-HP_DEFAULT_BLOCK_WINDOWS = {
-    "winter": ((5, 8), (16, 18)),
-    "summer": ((6, 9), (16, 18)),
-    # fallback for other seasons
-    "default": ((5, 8), (16, 18)),
-}
+HP_DEFAULT_BLOCK_WINDOWS = {"winter": ((5, 8), (16, 18)), "summer": ((6, 9), (16, 18)), # fallback for other seasons
+    "default": ((5, 8), (16, 18)), }
+
 
 # TODO: az a vagy a b szcenáriót futtatjuk, ezt lehessen egy kapcsolóval megadni, és a b esetben számolja a virtuális
 #  energiaármokat (surplus, amit szétosztunk a közösség tagjai között)
 
 
-# TODO: mehet az economicsba
-def calc_bill_15min_brutto(e_grid_to_load: np.ndarray, e_inj: np.ndarray) -> dict:
-    """
-    15 perces bruttó elszámolás.
-    A bemenetek már kWh / időlépés egységűek.
-    """
+def _calc_import_cost(e_import_steps: np.ndarray, low_limit_kwh: float, low_price_ft_per_kwh: float,
+        high_price_ft_per_kwh: float, ) -> tuple[float, float, float]:
+    remaining_low = float(low_limit_kwh)
+    low_kwh = 0.0
+    high_kwh = 0.0
+    cost_ft = 0.0
 
-    e_grid_to_load = np.asarray(e_grid_to_load, dtype=float)
-    e_inj = np.asarray(e_inj, dtype=float)
+    for e_imp in np.maximum(np.asarray(e_import_steps, dtype=float), 0.0):
+        low_part = min(float(e_imp), max(remaining_low, 0.0))
+        high_part = max(float(e_imp) - low_part, 0.0)
 
-    e_import_steps = np.maximum(e_grid_to_load, 0.0)
-    e_export_steps = np.maximum(e_inj, 0.0)
+        cost_ft += low_part * low_price_ft_per_kwh
+        cost_ft += high_part * high_price_ft_per_kwh
 
-    remaining_low = LOW_TARIFF_LIMIT_KWH
-    import_cost_ft = 0.0
-
-    e_grid_low = 0.0
-    e_grid_high = 0.0
-
-    for e_imp in e_import_steps:
-        low_part = min(e_imp, max(remaining_low, 0.0))
-        high_part = max(e_imp - low_part, 0.0)
-
-        import_cost_ft += low_part * LOW_TARIFF_FT_PER_KWH
-        import_cost_ft += high_part * HIGH_TARIFF_FT_PER_KWH
-
-        e_grid_low += low_part
-        e_grid_high += high_part
+        low_kwh += low_part
+        high_kwh += high_part
         remaining_low -= low_part
 
-    export_revenue_ft = e_export_steps.sum() * EXPORT_FT_PER_KWH
-    net_bill_ft = import_cost_ft - export_revenue_ft
+    return low_kwh, high_kwh, cost_ft
 
-    return {
-        "grid_import_low_kwh": e_grid_low,
-        "grid_import_high_kwh": e_grid_high,
-        "import_cost_ft": import_cost_ft,
-        "export_revenue_ft": export_revenue_ft,
-        "net_bill_ft": net_bill_ft,
-    }
+
+def calc_bill_15min_brutto(e_grid_to_load: np.ndarray, e_inj: np.ndarray,
+        e_grid_to_boiler: np.ndarray | None = None, ) -> dict:
+    """
+    15 perces bruttó elszámolás.
+
+    A bemenetek kWh / időlépés egységűek.
+    - Normál háztartási fogyasztás: A tarifa, 36 / 71 Ft/kWh.
+    - Bojler: B tarifa, 23 / 61 Ft/kWh.
+
+    Ha nincs külön `e_grid_to_boiler`, akkor minden import A-tarifára kerül.
+    Ha van, akkor `e_grid_to_load` a teljes import, ebből levonjuk a bojler
+    importját, és csak a maradék kerül A-tarifára.
+    """
+
+    e_grid_to_load = np.maximum(np.asarray(e_grid_to_load, dtype=float), 0.0)
+    e_inj = np.maximum(np.asarray(e_inj, dtype=float), 0.0)
+
+    if e_grid_to_boiler is None:
+        e_grid_to_boiler = np.zeros_like(e_grid_to_load)
+    else:
+        e_grid_to_boiler = np.maximum(np.asarray(e_grid_to_boiler, dtype=float), 0.0)
+
+    e_grid_to_boiler = np.minimum(e_grid_to_boiler, e_grid_to_load)
+    e_grid_to_base = np.maximum(e_grid_to_load - e_grid_to_boiler, 0.0)
+
+    a_low_kwh, a_high_kwh, a_import_cost_ft = _calc_import_cost(e_import_steps=e_grid_to_base,
+        low_limit_kwh=LOW_TARIFF_LIMIT_KWH, low_price_ft_per_kwh=LOW_TARIFF_FT_PER_KWH,
+        high_price_ft_per_kwh=HIGH_TARIFF_FT_PER_KWH, )
+    b_low_kwh, b_high_kwh, b_import_cost_ft = _calc_import_cost(e_import_steps=e_grid_to_boiler,
+        low_limit_kwh=B_LOW_TARIFF_LIMIT_KWH, low_price_ft_per_kwh=B_LOW_TARIFF_FT_PER_KWH,
+        high_price_ft_per_kwh=B_HIGH_TARIFF_FT_PER_KWH, )
+
+    # Bruttó elszámolás:
+    #   importköltség = A tarifás import költsége + B tarifás import költsége
+    #   exportbevétel = PV exportált energia * átvételi ár
+    #   bruttó villanyszámla = importköltség - exportbevétel
+    #
+    # A tarifa:
+    #   normál háztartási fogyasztás
+    # B tarifa:
+    #   külön bojler import
+
+    export_revenue_ft = e_inj.sum() * EXPORT_FT_PER_KWH
+    import_cost_ft = a_import_cost_ft + b_import_cost_ft
+    brt_bill_ft = import_cost_ft - export_revenue_ft
+
+    return {"grid_import_low_kwh": a_low_kwh + b_low_kwh, "grid_import_high_kwh": a_high_kwh + b_high_kwh,
+        "grid_import_a_low_kwh": a_low_kwh, "grid_import_a_high_kwh": a_high_kwh, "grid_import_b_low_kwh": b_low_kwh,
+        "grid_import_b_high_kwh": b_high_kwh, "grid_import_a_kwh": float(e_grid_to_base.sum()),
+        "grid_import_b_kwh": float(e_grid_to_boiler.sum()), "import_cost_a_ft": a_import_cost_ft,
+        "import_cost_b_ft": b_import_cost_ft, "import_cost_ft": import_cost_ft, "export_revenue_ft": export_revenue_ft,
+        "brt_bill_ft": brt_bill_ft, }
 
 
 # TODO: economicsba
-def _two_tier_cost_for_steps(e_steps: np.ndarray, low_limit_kwh: float, low_rate: float, high_rate: float) -> tuple[float, float, float]:
+def _two_tier_cost_for_steps(e_steps: np.ndarray, low_limit_kwh: float, low_rate: float, high_rate: float) -> tuple[
+    float, float, float]:
     """Compute the two-tier cost (low/high) for a sequence of energy import steps (kWh per step).
 
     Returns (low_kwh, high_kwh, cost_ft).
@@ -117,12 +280,8 @@ def _two_tier_cost_for_steps(e_steps: np.ndarray, low_limit_kwh: float, low_rate
 
 
 # TODO: economics
-def calc_bill_15min_brutto_breakdown(
-    e_grid_base: np.ndarray,
-    e_grid_boiler: np.ndarray,
-    e_grid_hp: np.ndarray,
-    e_inj: np.ndarray,
-) -> dict:
+def calc_bill_15min_brutto_breakdown(e_grid_base: np.ndarray, e_grid_boiler: np.ndarray, e_grid_hp: np.ndarray,
+        e_inj: np.ndarray, ) -> dict:
     """
     Compute bill when grid imports are provided broken down by component.
 
@@ -135,15 +294,12 @@ def calc_bill_15min_brutto_breakdown(
     e_grid_boiler = np.asarray(e_grid_boiler, dtype=float)
     e_grid_hp = np.asarray(e_grid_hp, dtype=float)
 
-    base_low_kwh, base_high_kwh, base_cost = _two_tier_cost_for_steps(
-        e_grid_base, LOW_TARIFF_LIMIT_KWH, LOW_TARIFF_FT_PER_KWH, HIGH_TARIFF_FT_PER_KWH
-    )
-    boiler_low_kwh, boiler_high_kwh, boiler_cost = _two_tier_cost_for_steps(
-        e_grid_boiler, LOW_TARIFF_LIMIT_KWH, BOILER_LOW_TARIFF_FT_PER_KWH, BOILER_HIGH_TARIFF_FT_PER_KWH
-    )
-    hp_low_kwh, hp_high_kwh, hp_cost = _two_tier_cost_for_steps(
-        e_grid_hp, LOW_TARIFF_LIMIT_KWH, HP_LOW_TARIFF_FT_PER_KWH, HP_HIGH_TARIFF_FT_PER_KWH
-    )
+    base_low_kwh, base_high_kwh, base_cost = _two_tier_cost_for_steps(e_grid_base, LOW_TARIFF_LIMIT_KWH,
+        LOW_TARIFF_FT_PER_KWH, HIGH_TARIFF_FT_PER_KWH)
+    boiler_low_kwh, boiler_high_kwh, boiler_cost = _two_tier_cost_for_steps(e_grid_boiler, LOW_TARIFF_LIMIT_KWH,
+        BOILER_LOW_TARIFF_FT_PER_KWH, BOILER_HIGH_TARIFF_FT_PER_KWH)
+    hp_low_kwh, hp_high_kwh, hp_cost = _two_tier_cost_for_steps(e_grid_hp, LOW_TARIFF_LIMIT_KWH,
+        HP_LOW_TARIFF_FT_PER_KWH, HP_HIGH_TARIFF_FT_PER_KWH)
 
     export_revenue_ft = np.maximum(e_inj, 0.0).sum() * EXPORT_FT_PER_KWH
 
@@ -152,23 +308,12 @@ def calc_bill_15min_brutto_breakdown(
     import_cost_ft = base_cost + boiler_cost + hp_cost
     net_bill_ft = import_cost_ft - export_revenue_ft
 
-    return {
-        "grid_import_low_kwh": total_low,
-        "grid_import_high_kwh": total_high,
-        "import_cost_ft": import_cost_ft,
-        "export_revenue_ft": export_revenue_ft,
-        "net_bill_ft": net_bill_ft,
-        # component level details for diagnostics
-        "grid_import_base_low_kwh": base_low_kwh,
-        "grid_import_base_high_kwh": base_high_kwh,
-        "grid_import_boiler_low_kwh": boiler_low_kwh,
-        "grid_import_boiler_high_kwh": boiler_high_kwh,
-        "grid_import_hp_low_kwh": hp_low_kwh,
-        "grid_import_hp_high_kwh": hp_high_kwh,
-        "import_cost_base_ft": base_cost,
-        "import_cost_boiler_ft": boiler_cost,
-        "import_cost_hp_ft": hp_cost,
-    }
+    return {"grid_import_low_kwh": total_low, "grid_import_high_kwh": total_high, "import_cost_ft": import_cost_ft,
+        "export_revenue_ft": export_revenue_ft, "net_bill_ft": net_bill_ft, # component level details for diagnostics
+        "grid_import_base_low_kwh": base_low_kwh, "grid_import_base_high_kwh": base_high_kwh,
+        "grid_import_boiler_low_kwh": boiler_low_kwh, "grid_import_boiler_high_kwh": boiler_high_kwh,
+        "grid_import_hp_low_kwh": hp_low_kwh, "grid_import_hp_high_kwh": hp_high_kwh, "import_cost_base_ft": base_cost,
+        "import_cost_boiler_ft": boiler_cost, "import_cost_hp_ft": hp_cost, }
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -214,82 +359,45 @@ def _build_hp_setpoint_profile(idx: pd.DatetimeIndex, rng: np.random.Generator) 
     profile = profile + offset_c
     profile[is_night] += night_delta_c
 
-    return profile, {
-        "setpoint_offset_c": float(offset_c),
-        "night_delta_c": float(night_delta_c),
-    }
+    return profile, {"setpoint_offset_c": float(offset_c), "night_delta_c": float(night_delta_c), }
 
 
 def _sample_hp_control_params(rng: np.random.Generator) -> dict:
-    return {
-        "deadband": _sample_clamped(rng, mean=2.0, sigma=0.30, low=1.0, high=3.0),
+    return {"deadband": _sample_clamped(rng, mean=2.0, sigma=0.30, low=1.0, high=3.0),
         "min_on_min": _sample_clamped(rng, mean=20.0, sigma=4.0, low=5.0, high=35.0),
         "min_off_min": _sample_clamped(rng, mean=20.0, sigma=4.0, low=5.0, high=35.0),
         "p_ramp_kW_per_step": _sample_clamped(rng, mean=1.5, sigma=0.25, low=0.25, high=3.0),
-        "p_th_min_kW": _sample_clamped(rng, mean=2.0, sigma=0.40, low=0.5, high=4.0),
-    }
+        "p_th_min_kW": _sample_clamped(rng, mean=2.0, sigma=0.40, low=0.5, high=4.0), }
 
 
-def _simulate_heat_pump_hourly_load(
-    idx_hp: pd.DatetimeIndex,
-    T_env_hp: np.ndarray,
-    I_by_dir_hp: dict[str, pd.Series],
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, dict]:
+def _simulate_heat_pump_hourly_load(idx_hp: pd.DatetimeIndex, T_env_hp: np.ndarray, I_by_dir_hp: dict[str, pd.Series],
+        rng: np.random.Generator, ) -> tuple[np.ndarray, dict]:
     """Egy háztartás HP villamos profiljának előállítása a 5R2C modellből."""
 
     base_key = str(rng.choice(list(HOUSES_RAW.keys())))
     house = _perturb_hp_house(HOUSES_RAW[base_key], rng)
 
-    pars = tabula_to_5r2c_iso_sepsi(
-        Aref_m2=house["Aref"],
-        h_m=house["h"],
-        Htr_W_per_K=house["Htr"],
-        Hve_W_per_K=house["Hve"],
-        U_window_W_m2K=house["U_window"],
-        window_total_m2=house["window_total"],
-        Awin_raw=house["Awin_raw"],
-    )
+    pars = tabula_to_5r2c_iso_sepsi(Aref_m2=house["Aref"], h_m=house["h"], Htr_W_per_K=house["Htr"],
+        Hve_W_per_K=house["Hve"], U_window_W_m2K=house["U_window"], window_total_m2=house["window_total"],
+        Awin_raw=house["Awin_raw"], )
 
     q_sol = solar_gain_sepsi(I_by_dir_hp, pars.Awin_by_dir_m2, idx_hp)
     t_set_profile, setpoint_meta = _build_hp_setpoint_profile(idx_hp, rng)
     ctrl = _sample_hp_control_params(rng)
 
-    res = simulate_5r2c(
-        idx_hp,
-        T_env_hp,
-        q_sol.values,
-        pars,
-        dt_h=HP_DT,
-        deadband=ctrl["deadband"],
-        min_on_min=ctrl["min_on_min"],
-        min_off_min=ctrl["min_off_min"],
-        p_ramp_kW_per_step=ctrl["p_ramp_kW_per_step"],
-        hp_block_windows=HP_DEFAULT_BLOCK_WINDOWS,
-        t_set_profile=t_set_profile,
-        enforce_hysteresis=True,
-        enforce_min_on_off=True,
-        enforce_ramp_limit=True,
-        enforce_participation_factor=True,
-        power_mode="min_cap",
-        p_th_min_kW=ctrl["p_th_min_kW"],
-    )
+    res = simulate_5r2c(idx_hp, T_env_hp, q_sol.values, pars, dt_h=HP_DT, deadband=ctrl["deadband"],
+        min_on_min=ctrl["min_on_min"], min_off_min=ctrl["min_off_min"], p_ramp_kW_per_step=ctrl["p_ramp_kW_per_step"],
+        hp_block_windows=HP_DEFAULT_BLOCK_WINDOWS, t_set_profile=t_set_profile, enforce_hysteresis=True,
+        enforce_min_on_off=True, enforce_ramp_limit=True, enforce_participation_factor=True, power_mode="min_cap",
+        p_th_min_kW=ctrl["p_th_min_kW"], )
 
     e_hp_hourly = pd.Series(res["P_hp_el"] * HP_DT, index=idx_hp).resample("h").sum()
-    meta = {
-        "hp_house_key": base_key,
-        "hp_Aref_m2": float(house["Aref"]),
-        "hp_h_m": float(house["h"]),
-        "hp_deadband_c": float(ctrl["deadband"]),
-        "hp_min_on_min": float(ctrl["min_on_min"]),
-        "hp_min_off_min": float(ctrl["min_off_min"]),
-        "hp_ramp_kW_per_step": float(ctrl["p_ramp_kW_per_step"]),
-        "hp_p_th_min_kW": float(ctrl["p_th_min_kW"]),
-        "hp_setpoint_offset_c": float(setpoint_meta["setpoint_offset_c"]),
-        "hp_night_delta_c": float(setpoint_meta["night_delta_c"]),
-        "hp_energy_kwh": float(e_hp_hourly.sum()),
-        "hp_peak_kw": float(np.max(res["P_hp_el"])) if len(res["P_hp_el"]) else 0.0,
-    }
+    meta = {"hp_house_key": base_key, "hp_Aref_m2": float(house["Aref"]), "hp_h_m": float(house["h"]),
+        "hp_deadband_c": float(ctrl["deadband"]), "hp_min_on_min": float(ctrl["min_on_min"]),
+        "hp_min_off_min": float(ctrl["min_off_min"]), "hp_ramp_kW_per_step": float(ctrl["p_ramp_kW_per_step"]),
+        "hp_p_th_min_kW": float(ctrl["p_th_min_kW"]), "hp_setpoint_offset_c": float(setpoint_meta["setpoint_offset_c"]),
+        "hp_night_delta_c": float(setpoint_meta["night_delta_c"]), "hp_energy_kwh": float(e_hp_hourly.sum()),
+        "hp_peak_kw": float(np.max(res["P_hp_el"])) if len(res["P_hp_el"]) else 0.0, }
     return e_hp_hourly.to_numpy(dtype=float), meta
 
 
@@ -311,11 +419,8 @@ def _group_label(has_pv: bool, has_bess: bool, has_heat_pump: bool, has_boiler: 
 
 
 def _ordered_group_labels(df: pd.DataFrame) -> list[str]:
-    preferred = [
-        "Nincs PV", "PV", "HP", "PV+HP", "PV+BESS", "PV+BESS+HP",
-        "BESS+HP", "BESS+HP+Boiler", "BESS+Boiler", "HP+Boiler",
-        "PV+BESS+HP+Boiler", "PV+BESS+Boiler", "PV+HP+Boiler",
-    ]
+    preferred = ["Nincs PV", "PV", "HP", "PV+HP", "PV+BESS", "PV+BESS+HP", "BESS+HP", "BESS+HP+Boiler", "BESS+Boiler",
+        "HP+Boiler", "PV+BESS+HP+Boiler", "PV+BESS+Boiler", "PV+HP+Boiler", ]
     groups = list(dict.fromkeys(df["group_label"].tolist()))
     ordered = [g for g in preferred if g in groups]
     ordered.extend([g for g in groups if g not in ordered])
@@ -340,6 +445,7 @@ def plot_community_load_breakdown(community_ts: pd.DataFrame, out_case: Path):
     plt.savefig(out_case / "community_load_breakdown_with_heat_pumps.png", dpi=200)
     plt.close()
 
+
 def _as_datetime_index(index: pd.Index, length: int) -> pd.DatetimeIndex:
     if isinstance(index, pd.DatetimeIndex) and len(index) == length:
         return pd.DatetimeIndex(index)
@@ -354,12 +460,9 @@ def _season_windows(index: pd.DatetimeIndex, window_len: int) -> list[tuple[str,
     if len(index) < 4:
         return [("Általános", slice(0, len(index)))]
 
-    season_centers = [
-        ("Tél", pd.Timestamp(index[0].year, 1, 15, 12)),
-        ("Tavasz", pd.Timestamp(index[0].year, 4, 15, 12)),
-        ("Nyár", pd.Timestamp(index[0].year, 7, 15, 12)),
-        ("Ősz", pd.Timestamp(index[0].year, 10, 15, 12)),
-    ]
+    season_centers = [("Tél", pd.Timestamp(index[0].year, 1, 15, 12)),
+        ("Tavasz", pd.Timestamp(index[0].year, 4, 15, 12)), ("Nyár", pd.Timestamp(index[0].year, 7, 15, 12)),
+        ("Ősz", pd.Timestamp(index[0].year, 10, 15, 12)), ]
 
     windows: list[tuple[str, slice]] = []
     for label, center in season_centers:
@@ -388,21 +491,8 @@ def _select_households(per_user_df: Optional[pd.DataFrame], limit: int = 3) -> L
     if per_user_df is None or len(per_user_df) == 0:
         return []
 
-    preferred_groups = [
-        "PV+BESS+HP+Boiler",
-        "PV+BESS+HP",
-        "BESS+HP+Boiler",
-        "BESS+HP",
-        "PV+HP+Boiler",
-        "PV+HP",
-        "HP+Boiler",
-        "HP",
-        "PV+BESS+Boiler",
-        "PV+BESS",
-        "PV+Boiler",
-        "PV",
-        "Nincs PV",
-    ]
+    preferred_groups = ["PV+BESS+HP+Boiler", "PV+BESS+HP", "BESS+HP+Boiler", "BESS+HP", "PV+HP+Boiler", "PV+HP",
+        "HP+Boiler", "HP", "PV+BESS+Boiler", "PV+BESS", "PV+Boiler", "PV", "Nincs PV", ]
 
     selected: list[int] = []
     used: set[int] = set()
@@ -427,14 +517,8 @@ def _select_households(per_user_df: Optional[pd.DataFrame], limit: int = 3) -> L
     return selected
 
 
-def _stack_signed_bars(
-    ax: plt.Axes,
-    x: np.ndarray,
-    components: List[Tuple[str, np.ndarray, str]],
-    *,
-    width: float = 0.8,
-    alpha: float = 0.88,
-) -> Dict[str, object]:
+def _stack_signed_bars(ax: plt.Axes, x: np.ndarray, components: List[Tuple[str, np.ndarray, str]], *,
+        width: float = 0.8, alpha: float = 0.88, ) -> Dict[str, object]:
     pos_bottom = np.zeros_like(x, dtype=float)
     neg_bottom = np.zeros_like(x, dtype=float)
     handles: dict[str, object] = {}
@@ -447,7 +531,8 @@ def _stack_signed_bars(
         neg = np.clip(arr, None, 0.0)
 
         if np.any(pos > 0.0):
-            container = ax.bar(x, pos, width=width, bottom=pos_bottom, color=color, alpha=alpha, edgecolor="none", label=label)
+            container = ax.bar(x, pos, width=width, bottom=pos_bottom, color=color, alpha=alpha, edgecolor="none",
+                               label=label)
             pos_bottom = pos_bottom + pos
             handles[label] = container[0]
         elif np.any(neg < 0.0):
@@ -463,13 +548,9 @@ def _stack_signed_bars(
 
 
 # TODO: visualization packagebe
-def plot_community_energy_balance(
-    community_ts: pd.DataFrame,
-    out_case: Path,
-    per_user_df: Optional[pd.DataFrame] = None,
-    household_ts: Optional[Dict[str, np.ndarray]] = None,
-    user_names: Optional[List[str]] = None,
-):
+def plot_community_energy_balance(community_ts: pd.DataFrame, out_case: Path,
+        per_user_df: Optional[pd.DataFrame] = None, household_ts: Optional[Dict[str, np.ndarray]] = None,
+        user_names: Optional[List[str]] = None, ):
     """Seasonal bar-balance plot for the community and a few sample households."""
 
     if len(community_ts) == 0:
@@ -484,15 +565,13 @@ def plot_community_energy_balance(
     if not windows:
         return
 
-    available = {
-        "pv": float(_col_or_zero(community_ts, "e_pv_total").sum()) > 1e-9,
+    available = {"pv": float(_col_or_zero(community_ts, "e_pv_total").sum()) > 1e-9,
         "grid": float(_col_or_zero(community_ts, "e_grid_to_load_total").sum()) > 1e-9,
-        "bess": float(_col_or_zero(community_ts, "e_bess_to_load_total").sum()) > 1e-9
-        or float(_col_or_zero(community_ts, "e_bess_total").sum()) > 1e-9,
+        "bess": float(_col_or_zero(community_ts, "e_bess_to_load_total").sum()) > 1e-9 or float(
+            _col_or_zero(community_ts, "e_bess_total").sum()) > 1e-9,
         "hp": float(_col_or_zero(community_ts, "e_hp_total").sum()) > 1e-9,
         "boiler": float(_col_or_zero(community_ts, "e_boiler_total").sum()) > 1e-9,
-        "base": float(_col_or_zero(community_ts, "e_ue_total", "e_load_base_total").sum()) > 1e-9,
-    }
+        "base": float(_col_or_zero(community_ts, "e_ue_total", "e_load_base_total").sum()) > 1e-9, }
 
     has_bess_col = available["bess"]
     nrows = len(windows)
@@ -545,7 +624,8 @@ def plot_community_energy_balance(
         handles = _stack_signed_bars(balance_ax, x, balance_components)
         for k, v in handles.items():
             legend_handles.setdefault(k, v)
-        balance_ax.set_title(f"{season_label} – fogyasztás (felül) / termelés (alul)\n{season_start:%m-%d} → {season_stop:%m-%d}")
+        balance_ax.set_title(
+            f"{season_label} – fogyasztás (felül) / termelés (alul)\n{season_start:%m-%d} → {season_stop:%m-%d}")
         balance_ax.set_ylabel("kWh / óra (+ fogyasztás/import, − termelés/export)")
 
         hh_col = 1
@@ -586,7 +666,8 @@ def plot_community_energy_balance(
                 if hh_grid.ndim != 2 or u >= hh_grid.shape[1]:
                     continue
                 net_balance = hh_grid[slc, u] - hh_inj[slc, u]
-                household_components.append((local_names[pos], net_balance, household_colors[pos % len(household_colors)]))
+                household_components.append(
+                    (local_names[pos], net_balance, household_colors[pos % len(household_colors)]))
 
             if household_components:
                 handles = _stack_signed_bars(hh_ax, hh_x, household_components)
@@ -618,34 +699,43 @@ def plot_community_energy_balance(
     labels_list = list(legend_handles.keys())
     if handles_list:
         ncol_bottom = min(6, max(1, len(handles_list)))
-        fig.legend(
-            handles_list,
-            labels_list,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.015),
-            ncol=ncol_bottom,
-            frameon=True,
-        )
+        fig.legend(handles_list, labels_list, loc="lower center", bbox_to_anchor=(0.5, 0.015), ncol=ncol_bottom,
+            frameon=True, )
 
     # leave a small bottom margin so the bottom legend is visible
     fig.tight_layout(rect=(0.0, 0.06, 0.86, 0.985))
     fig.savefig(out_case / "community_energy_balance.png", dpi=200)
     plt.close(fig)
 
-def simulate_one_user_greedy(
-    e_load_base: np.ndarray,
-    e_boiler: np.ndarray,
-    e_hp: np.ndarray,
-    e_pv: np.ndarray,
-    use_bess: bool,
-    bess_size_kwh: float,
-    eta_bess_in: float,
-    eta_bess_out: float,
-    eta_bess_stor: float,
-    soc_bess_min: float,
-    soc_bess_max: float,
-    t_bess_min_h: float,
-) -> dict:
+
+def split_grid_import_base_boiler(e_base_load: np.ndarray, e_boiler_load: np.ndarray, e_pv_to_load: np.ndarray,
+        e_bess_to_load: np.ndarray, ) -> dict:
+    """
+    A teljes lokális ellátást először az alapfogyasztásra, majd a bojlerre osztja.
+
+    Így a bojler csak akkor kap PV/BESS energiát, ha az adott 15 perces lépésben
+    az alapfogyasztás már ki van szolgálva. A maradék bojlerigény B-tarifás
+    hálózati import lesz.
+    """
+    e_base_load = np.maximum(np.asarray(e_base_load, dtype=float), 0.0)
+    e_boiler_load = np.maximum(np.asarray(e_boiler_load, dtype=float), 0.0)
+    local_supply = np.maximum(np.asarray(e_pv_to_load, dtype=float) + np.asarray(e_bess_to_load, dtype=float), 0.0, )
+
+    e_local_to_base = np.minimum(e_base_load, local_supply)
+    remaining_local = np.maximum(local_supply - e_local_to_base, 0.0)
+    e_local_to_boiler = np.minimum(e_boiler_load, remaining_local)
+
+    e_grid_to_base = np.maximum(e_base_load - e_local_to_base, 0.0)
+    e_grid_to_boiler = np.maximum(e_boiler_load - e_local_to_boiler, 0.0)
+
+    return {"e_local_to_base": e_local_to_base, "e_local_to_boiler": e_local_to_boiler,
+        "e_grid_to_base": e_grid_to_base, "e_grid_to_boiler": e_grid_to_boiler, }
+
+
+def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp: np.ndarray, e_pv: np.ndarray,
+        use_bess: bool, bess_size_kwh: float, eta_bess_in: float, eta_bess_out: float, eta_bess_stor: float,
+        soc_bess_min: float, soc_bess_max: float, t_bess_min_h: float, e_boiler_load: np.ndarray | None = None,
+        boiler_tariff: str = "B", ) -> dict:
     """Greedy simulator that tracks PV/bess/grid interactions and attributes grid imports
     to base, boiler and heat-pump loads separately so separate tariffs can be applied.
     """
@@ -655,6 +745,23 @@ def simulate_one_user_greedy(
     e_boiler = np.asarray(e_boiler, dtype=float)
     e_hp = np.asarray(e_hp, dtype=float)
     e_pv = np.asarray(e_pv, dtype=float)
+    if e_boiler_load is None:
+        e_boiler_load = np.zeros_like(e_load_base)
+    else:
+        e_boiler_load = np.maximum(np.asarray(e_boiler_load, dtype=float), 0.0)
+    e_base_load = np.maximum(e_load_base - e_boiler_load, 0.0)
+
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
+
+    if boiler_tariff == "A":
+        # A tarifás bojler: sima fogyasztó, kaphat PV-t és BESS-t.
+        e_dispatch_load = e_load_base
+    else:
+        # B tarifás bojler: külön mérő, külön áramkör.
+        # PV/BESS csak az általános fogyasztást látja el.
+        e_dispatch_load = e_base_load
 
     # per-component time series
     e_pv_to_load = np.zeros(T, dtype=float)
@@ -663,8 +770,12 @@ def simulate_one_user_greedy(
     e_grid_to_load_base = np.zeros(T, dtype=float)
     e_grid_to_load_boiler = np.zeros(T, dtype=float)
     e_grid_to_load_hp = np.zeros(T, dtype=float)
+    e_grid_to_load = np.zeros(T, dtype=float)
+    e_grid_to_bess = np.zeros(T, dtype=float)
     e_inj = np.zeros(T, dtype=float)
     e_bess = np.zeros(T, dtype=float)
+    d_bess_ch = np.zeros(T, dtype=float)
+    d_bess_dis = np.zeros(T, dtype=float)
 
     e_load = e_load_base + e_boiler + e_hp
 
@@ -717,6 +828,10 @@ def simulate_one_user_greedy(
             e_inj[t] = max(pv_t - assigned_to_load, 0.0)
             e_bess[t] = 0.0
 
+        e_pv_to_load = np.minimum(e_dispatch_load, e_pv)
+        e_grid_to_load = np.maximum(e_dispatch_load - e_pv_to_load, 0.0)
+        e_inj = np.maximum(e_pv - e_pv_to_load, 0.0)
+        e_bess[:] = 0.0
     else:
         soc_min_kwh = max(0.0, soc_bess_min) * bess_size_kwh
         soc_max_kwh = max(soc_min_kwh, soc_bess_max * bess_size_kwh)
@@ -728,7 +843,29 @@ def simulate_one_user_greedy(
 
         e_bess_max_step = p_bess_max_kw * DT
 
-        soc = soc_min_kwh
+        soc = 0.5 * bess_size_kwh
+        soc = min(max(soc, soc_min_kwh), soc_max_kwh)
+
+        min_mode_steps = 4
+        mode = "idle"
+        lock_steps_left = 0
+
+        # Greedy logika:
+        # 1) PV először közvetlenül a fogyasztást látja el.
+        # 2) Ha PV többlet van, az BESS-be tölt.
+        # 3) Ha a BESS már nem tud több energiát felvenni, a maradék PV export.
+        # 4) Ha fogyasztási hiány van, a BESS kisüt.
+        # 5) Ha még mindig hiány van, hálózati import történik.
+        # 6) A BESS SOC minden időlépésben önkisüléssel csökken.
+
+        # A tarifás bojler esetén:
+        #   a bojler a teljes háztartási fogyasztás része,
+        #   ezért PV és BESS is kiszolgálhatja.
+        #
+        # B tarifás bojler esetén:
+        #   a bojler külön mérőn van,
+        #   ezért nem kap PV-t és nem kap BESS energiát,
+        #   a teljes bojlerigény B tarifás hálózati import.
 
         for t in range(T):
             soc *= eta_bess_stor
@@ -737,6 +874,7 @@ def simulate_one_user_greedy(
             lo = max(e_boiler[t], 0.0)
             lh = max(e_hp[t], 0.0)
             total_load = lb + lo + lh
+            load_t = max(e_dispatch_load[t], 0.0)
             pv_t = max(e_pv[t], 0.0)
 
             # allocate PV to loads proportionally
@@ -765,8 +903,11 @@ def simulate_one_user_greedy(
 
             # charge battery with remaining PV
             surplus = max(pv_t - assigned_to_load, 0.0)
+            can_charge = (lock_steps_left <= 0) or (mode == "charge")
+            can_discharge = (lock_steps_left <= 0) or (mode == "discharge")
+
             charge = 0.0
-            if surplus > 1e-12:
+            if surplus > 1e-12 and can_charge:
                 room_kwh = max(soc_max_kwh - soc, 0.0)
                 max_charge_by_soc = room_kwh / max(eta_bess_in, 1e-12)
                 charge = min(surplus, e_bess_max_step, max_charge_by_soc)
@@ -781,7 +922,7 @@ def simulate_one_user_greedy(
 
             # discharge to cover deficit
             discharge = 0.0
-            if deficit > 1e-12:
+            if deficit > 1e-12 and can_discharge:
                 avail_kwh = max(soc - soc_min_kwh, 0.0)
                 max_discharge_by_soc = avail_kwh * eta_bess_out
                 discharge = min(deficit, e_bess_max_step, max_discharge_by_soc)
@@ -821,8 +962,39 @@ def simulate_one_user_greedy(
             e_grid_to_load_base[t] = def_base
             e_grid_to_load_boiler[t] = def_boiler
             e_grid_to_load_hp[t] = def_hp
+
+            grid_charge = 0.0
+            if soc < soc_min_kwh - 1e-12 and can_charge and surplus <= 1e-12:
+                need_to_soc = soc_min_kwh - soc
+                grid_charge = min(e_bess_max_step, need_to_soc / max(eta_bess_in, 1e-12), )
+                soc += grid_charge * eta_bess_in
+
+            if charge > 1e-12 or grid_charge > 1e-12:
+                if mode != "charge":
+                    mode = "charge"
+                    lock_steps_left = min_mode_steps - 1
+
+            elif discharge > 1e-12:
+                if mode != "discharge":
+                    mode = "discharge"
+                    lock_steps_left = min_mode_steps - 1
+
+            else:
+                if lock_steps_left <= 0:
+                    mode = "idle"
+
+            if lock_steps_left > 0:
+                lock_steps_left -= 1
+
+            e_pv_to_bess[t] = charge
+            e_bess_to_load[t] = discharge
+            e_grid_to_load[t] = max(deficit, 0.0) + grid_charge
             e_inj[t] = max(surplus, 0.0)
             e_bess[t] = soc
+            e_grid_to_bess[t] = grid_charge
+
+            d_bess_ch[t] = 1.0 if (charge > 1e-12 or grid_charge > 1e-12) else 0.0
+            d_bess_dis[t] = 1.0 if discharge > 1e-12 else 0.0
 
     load_kwh = e_load.sum()
     pv_kwh = e_pv.sum()
@@ -832,49 +1004,71 @@ def simulate_one_user_greedy(
     grid_import_kwh = (e_grid_to_load_base + e_grid_to_load_boiler + e_grid_to_load_hp).sum()
     injection_kwh = e_inj.sum()
 
-    # calculate bill using per-component imports
-    bill = calc_bill_15min_brutto_breakdown(
-        e_grid_base=e_grid_to_load_base,
-        e_grid_boiler=e_grid_to_load_boiler,
-        e_grid_hp=e_grid_to_load_hp,
-        e_inj=e_inj,
-    )
+    if boiler_tariff == "A":
+        # A tarifás bojler: nincs külön B tarifás import.
+        e_grid_to_base = e_grid_to_load.copy()
+        e_grid_to_boiler = np.zeros_like(e_grid_to_load)
 
+        e_local_total = e_pv_to_load + e_bess_to_load
+        e_local_to_base = np.minimum(e_base_load, e_local_total)
+        e_local_to_boiler = np.minimum(np.maximum(e_local_total - e_local_to_base, 0.0), e_boiler_load, )
+
+    else:
+        # B tarifás bojler: teljes bojlerfogyasztás B tarifás hálózati import.
+        e_grid_to_base = e_grid_to_load.copy()
+        e_grid_to_boiler = e_boiler_load.copy()
+
+        e_local_to_base = e_pv_to_load + e_bess_to_load
+        e_local_to_boiler = np.zeros_like(e_boiler_load)
+
+        # Teljes hálózati import = A tarifás alapimport + B tarifás bojlerimport.
+        e_grid_to_load = e_grid_to_base + e_grid_to_boiler
+
+    grid_import_kwh = e_grid_to_load.sum()
+
+    bill = calc_bill_15min_brutto(e_grid_to_load=e_grid_to_load, e_inj=e_inj, e_grid_to_boiler=e_grid_to_boiler, )
+
+    # SCI: önfogyasztási index.
+    # A megtermelt PV mekkora része marad helyben:
+    # - közvetlen PV -> fogyasztás
+    # - PV -> BESS töltés
+    #
+    # Fontos: SCI-ben a PV->BESS töltést számoljuk,
+    # nem a későbbi BESS->load kisütést, mert az már veszteségekkel csökkentett energia.
     self_consumed_pv_kwh = pv_to_load_kwh + pv_to_bess_kwh
     self_consumption_ratio = self_consumed_pv_kwh / pv_kwh if pv_kwh > 1e-12 else 0.0
-    self_sufficiency_ratio = (load_kwh - grid_import_kwh) / load_kwh if load_kwh > 1e-12 else 0.0
+    self_consumption_ratio = min(max(self_consumption_ratio, 0.0), 1.0)
 
-    return {
-        "timeseries": {
-            "e_load": e_load,
-            "e_pv": e_pv,
-            "e_pv_to_load": e_pv_to_load,
-            "e_pv_to_bess": e_pv_to_bess,
-            "e_bess_to_load": e_bess_to_load,
-            "e_grid_to_load": e_grid_to_load_base + e_grid_to_load_boiler + e_grid_to_load_hp,
-            "e_inj": e_inj,
-            "e_bess": e_bess,
-        },
+    # SSI: önellátási index.
+    # A fogyasztás mekkora részét fedezi helyi energia:
+    # - közvetlen PV -> fogyasztás
+    # - BESS -> fogyasztás
+    #
+    # Itt a BESS kisütés számít, mert ez ténylegesen fogyasztást lát el.
+    locally_supplied_load_kwh = pv_to_load_kwh + bess_to_load_kwh
+    self_sufficiency_ratio = locally_supplied_load_kwh / load_kwh if load_kwh > 1e-12 else 0.0
+    self_sufficiency_ratio = min(max(self_sufficiency_ratio, 0.0), 1.0)
 
-        "annual": {
-            "load_kwh": load_kwh,
-            "pv_kwh": pv_kwh,
-            "pv_to_load_kwh": pv_to_load_kwh,
-            "pv_to_bess_kwh": pv_to_bess_kwh,
-            "bess_to_load_kwh": bess_to_load_kwh,
-            "grid_import_kwh": grid_import_kwh,
-            "injection_kwh": injection_kwh,
-            "self_consumed_pv_kwh": self_consumed_pv_kwh,
-            "self_consumption_ratio": self_consumption_ratio,
-            "self_sufficiency_ratio": self_sufficiency_ratio,
-            **bill,
-        },
-    }
+    return {"timeseries": {"e_load": e_load, "e_pv": e_pv, "e_pv_to_load": e_pv_to_load, "e_pv_to_bess": e_pv_to_bess,
+        "e_bess_to_load": e_bess_to_load,
+        "e_grid_to_load": e_grid_to_load_base + e_grid_to_load_boiler + e_grid_to_load_hp,
+        "e_grid_to_load": e_grid_to_load, "e_grid_to_bess": e_grid_to_bess, "e_grid_to_base": e_grid_to_base,
+        "e_grid_to_boiler": e_grid_to_boiler, "e_local_to_base": e_local_to_base,
+        "e_local_to_boiler": e_local_to_boiler, "e_inj": e_inj, "e_bess": e_bess, "d_bess_ch": d_bess_ch,
+        "d_bess_dis": d_bess_dis, },
+
+        "annual": {"load_kwh": load_kwh, "pv_kwh": pv_kwh, "pv_to_load_kwh": pv_to_load_kwh,
+            "pv_to_bess_kwh": pv_to_bess_kwh, "bess_to_load_kwh": bess_to_load_kwh, "grid_import_kwh": grid_import_kwh,
+            "grid_import_a_kwh": bill["grid_import_a_kwh"], "grid_import_b_kwh": bill["grid_import_b_kwh"],
+            "grid_to_bess_kwh": float(e_grid_to_bess.sum()), "injection_kwh": injection_kwh,
+            "self_consumed_pv_kwh": self_consumed_pv_kwh, "locally_supplied_load_kwh": locally_supplied_load_kwh,
+            "self_consumption_ratio": self_consumption_ratio, "self_sufficiency_ratio": self_sufficiency_ratio,
+            **bill, }, }
 
 
 # TODO: visualize package-be
 def plot_household_percentiles_by_group(per_user_df: pd.DataFrame, out_case: Path):
-    df = per_user_df.copy().sort_values("net_bill_ft").reset_index(drop=True)
+    df = per_user_df.copy().sort_values("brt_bill_ft").reset_index(drop=True)
     n = len(df)
 
     if n == 0:
@@ -882,22 +1076,10 @@ def plot_household_percentiles_by_group(per_user_df: pd.DataFrame, out_case: Pat
 
     df["percentile"] = 100.0 * (np.arange(n) + 0.5) / n
 
-    marker_map = {
-        "Nincs PV": "o",
-        "PV": "s",
-        "HP": "D",
-        "PV+HP": "P",
-        "PV+BESS": "^",
-        "PV+BESS+HP": "X",
+    marker_map = {"Nincs PV": "o", "PV": "s", "HP": "D", "PV+HP": "P", "PV+BESS": "^", "PV+BESS+HP": "X",
         # Boiler-aware groups
-        "BESS+HP": "H",
-        "BESS+HP+Boiler": "*",
-        "BESS+Boiler": "v",
-        "HP+Boiler": "d",
-        "PV+BESS+HP+Boiler": "*",
-        "PV+BESS+Boiler": "v",
-        "PV+HP+Boiler": "d",
-    }
+        "BESS+HP": "H", "BESS+HP+Boiler": "*", "BESS+Boiler": "v", "HP+Boiler": "d", "PV+BESS+HP+Boiler": "*",
+        "PV+BESS+Boiler": "v", "PV+HP+Boiler": "d", }
 
     plt.figure(figsize=(9, 5.5))
 
@@ -906,18 +1088,12 @@ def plot_household_percentiles_by_group(per_user_df: pd.DataFrame, out_case: Pat
         if len(sub) == 0:
             continue
 
-        plt.scatter(
-            sub["net_bill_ft"],
-            sub["percentile"],
-            s=28,
-            marker=marker_map.get(group, "o"),
-            alpha=0.8,
-            label=group,
-        )
-    x_lo = np.percentile(df["net_bill_ft"], 1)
-    x_hi = np.percentile(df["net_bill_ft"], 99)
+        plt.scatter(sub["brt_bill_ft"], sub["percentile"], s=28, marker=marker_map.get(group, "o"), alpha=0.8,
+            label=group, )
+    x_lo = np.percentile(df["brt_bill_ft"], 1)
+    x_hi = np.percentile(df["brt_bill_ft"], 99)
     plt.xlim(x_lo, x_hi)
-    plt.xlabel("Éves nettó villanyszámla [Ft/év]")
+    plt.xlabel("Éves bruttó villanyszámla [Ft/év]")
     plt.ylabel("Háztartások aránya [%]")
     plt.title("Háztartások villanyszámla szerinti eloszlása")
     plt.ylim(0, 100)
@@ -927,10 +1103,11 @@ def plot_household_percentiles_by_group(per_user_df: pd.DataFrame, out_case: Pat
     plt.savefig(out_case / "household_bill_percentiles_by_group.png", dpi=200)
     plt.close()
 
+
 def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataFrame, out_case: Path):
     from scipy.optimize import curve_fit
 
-    df = per_user_df.copy().sort_values("net_bill_ft").reset_index(drop=True)
+    df = per_user_df.copy().sort_values("brt_bill_ft").reset_index(drop=True)
     n = len(df)
 
     if n == 0:
@@ -938,22 +1115,10 @@ def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataF
 
     df["percentile"] = 100.0 * (np.arange(n) + 0.5) / n
 
-    marker_map = {
-        "Nincs PV": "o",
-        "PV": "s",
-        "HP": "D",
-        "PV+HP": "P",
-        "PV+BESS": "^",
-        "PV+BESS+HP": "X",
+    marker_map = {"Nincs PV": "o", "PV": "s", "HP": "D", "PV+HP": "P", "PV+BESS": "^", "PV+BESS+HP": "X",
         # Boiler-aware groups
-        "BESS+HP": "H",
-        "BESS+HP+Boiler": "*",
-        "BESS+Boiler": "v",
-        "HP+Boiler": "d",
-        "PV+BESS+HP+Boiler": "*",
-        "PV+BESS+Boiler": "v",
-        "PV+HP+Boiler": "d",
-    }
+        "BESS+HP": "H", "BESS+HP+Boiler": "*", "BESS+Boiler": "v", "HP+Boiler": "d", "PV+BESS+HP+Boiler": "*",
+        "PV+BESS+Boiler": "v", "PV+HP+Boiler": "d", }
 
     plt.figure(figsize=(9, 5.5))
 
@@ -963,17 +1128,11 @@ def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataF
         if len(sub) == 0:
             continue
 
-        plt.scatter(
-            sub["net_bill_ft"],
-            sub["percentile"],
-            s=28,
-            marker=marker_map.get(group, "o"),
-            alpha=0.8,
-            label=group,
-        )
+        plt.scatter(sub["brt_bill_ft"], sub["percentile"], s=28, marker=marker_map.get(group, "o"), alpha=0.8,
+            label=group, )
 
     # egyetlen globális S-görbe az összes háztartásra
-    x = df["net_bill_ft"].to_numpy(dtype=float)
+    x = df["brt_bill_ft"].to_numpy(dtype=float)
     y = df["percentile"].to_numpy(dtype=float)
 
     def logistic(x_, x0, k):
@@ -988,15 +1147,15 @@ def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataF
             popt = curve_fit(logistic, x, y, p0=[x0_init, k_init], maxfev=20000)[0]
             x_grid = np.linspace(x.min(), x.max(), 400)
             y_fit = logistic(x_grid, *popt)
-            plt.plot(x_grid, y_fit, color="darkred",linewidth=2, label="Illesztett S-görbe (összes háztartás)")
+            plt.plot(x_grid, y_fit, color="darkred", linewidth=2, label="Illesztett S-görbe (összes háztartás)")
         except Exception:
             pass
 
-    x_lo = np.percentile(df["net_bill_ft"], 1)
-    x_hi = np.percentile(df["net_bill_ft"], 100)
+    x_lo = np.percentile(df["brt_bill_ft"], 1)
+    x_hi = np.percentile(df["brt_bill_ft"], 100)
     plt.xlim(x_lo, x_hi)
 
-    plt.xlabel("Éves nettó villanyszámla [Ft/év]")
+    plt.xlabel("Éves bruttó villanyszámla [Ft/év]")
     plt.ylabel("Háztartások aránya [%]")
     plt.title("Háztartások villanyszámla szerinti eloszlása")
     plt.ylim(0, 100)
@@ -1006,63 +1165,23 @@ def plot_household_percentiles_by_group_with_global_scurve(per_user_df: pd.DataF
     plt.savefig(out_case / "household_bill_percentiles_by_group_global_scurve.png", dpi=200)
     plt.close()
 
-def run_case(
-    case_name: str,
-    sim_yaml: str,
-    profiles_csv: str,
-    dhw_profiles_csv: str,
-    out_dir: str,
-    max_users: int,
-    pv_ratio: float,
-    include_bess: bool,
-    include_boiler: bool,
-    include_heat_pump: bool = False,
-    heat_pump_share_pct: float = 0.0,
-    bess_share_pct: float = 100.0,
-):
+
+def run_case(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_csv: str, out_dir: str, max_users: int,
+        include_bess: bool, include_boiler: bool, include_heat_pump: bool = False, heat_pump_share_pct: float = 0.0,
+        bess_share_pct: float = 100.0, boiler_tariff: str = "B", ):
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
 
-    build_inputs_result: Any = build_inputs(
-        sim_yaml_path=Path(sim_yaml),
-        profiles_csv_path=Path(profiles_csv),
-        dhw_profile_path=Path(dhw_profiles_csv),
-        max_users=max_users,
-        pv_ratio=pv_ratio,
-        use_hss=False,
-    )
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
-    (
-        e_pv,
-        e_ue,
-        e_dhw,
-        e_el_heater,
-        size_elh,
-        vol_hss_water,
-        size_bess,
-        eta_bess_in_u,
-        eta_bess_out_u,
-        eta_bess_stor_u,
-        soc_bess_min_u,
-        soc_bess_max_u,
-        t_bess_min_u,
-        T_env_u,
-        T_max_u,
-        T_min_u,
-        T_in_u,
-        a_hss_u,
-        eta_elh_u,
-        t_hss_min_in_u,
-        user_names,
-    ) = build_inputs_result
-
-    p_pv = e_pv / DT
-    p_ue = e_ue / DT
-    p_dhw = e_dhw / DT
-    p_el_heater = e_el_heater / DT
+    (e_pv, e_ue, e_el_heater, size_bess, eta_bess_in_u, eta_bess_out_u, eta_bess_stor_u, soc_bess_min_u, soc_bess_max_u,
+     t_bess_min_u, user_names,) = build_inputs(sim_yaml_path=sim_yaml, profiles_csv_path=profiles_csv,
+        dhw_profile_path=dhw_profiles_csv, max_users=max_users, )
 
     U = len(user_names)
-    T = p_ue.shape[0]
+    T = e_ue.shape[0]
 
     e_boiler = e_el_heater if include_boiler else np.zeros_like(e_el_heater)
     rng = np.random.default_rng()
@@ -1094,18 +1213,17 @@ def run_case(
                 print(f"[INFO] HP szimuláció indul: {user_names[u]} ({u + 1}/{U})")
                 e_hp_hourly, meta = _simulate_heat_pump_hourly_load(idx_hp, T_env_hp, I_by_dir_hp, rng)
                 if len(e_hp_hourly) != T:
-                    raise RuntimeError(
-                        f"A HP profil hossza {len(e_hp_hourly)}, de a fogyasztási profil hossza {T}."
-                    )
+                    raise RuntimeError(f"A HP profil hossza {len(e_hp_hourly)}, de a fogyasztási profil hossza {T}.")
                 ts_e_hp[:, u] = e_hp_hourly
                 hp_user_meta[u] = meta
-                print(
-                    f"[INFO] HP kész: {user_names[u]} | "
-                    f"ház={meta['hp_house_key']} | E_hp={meta['hp_energy_kwh']:.1f} kWh | "
-                    f"P_csúcs={meta['hp_peak_kw']:.2f} kW"
-                )
+                print(f"[INFO] HP kész: {user_names[u]} | "
+                      f"ház={meta['hp_house_key']} | E_hp={meta['hp_energy_kwh']:.1f} kWh | "
+                      f"P_csúcs={meta['hp_peak_kw']:.2f} kW")
 
     e_total_load = e_ue + e_boiler + ts_e_hp
+    e_boiler = e_el_heater
+    e_total_load = e_ue + e_boiler
+    e_base_load = e_ue
 
     rows = []
 
@@ -1115,10 +1233,17 @@ def run_case(
     ts_e_pv_to_bess = np.zeros((T, U), dtype=float)
     ts_e_bess_to_load = np.zeros((T, U), dtype=float)
     ts_e_grid_to_load = np.zeros((T, U), dtype=float)
+    ts_e_grid_to_base = np.zeros((T, U), dtype=float)
+    ts_e_grid_to_bess = np.zeros((T, U), dtype=float)
+    ts_e_grid_to_boiler = np.zeros((T, U), dtype=float)
     ts_e_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
+    ts_d_bess_ch = np.zeros((T, U), dtype=float)
+    ts_d_bess_dis = np.zeros((T, U), dtype=float)
+    ts_e_base_load = np.zeros((T, U), dtype=float)
+    ts_e_boiler = np.zeros((T, U), dtype=float)
 
-    pv_annual_kwh = p_pv.sum(axis=0)
+    pv_annual_kwh = e_pv.sum(axis=0)
     has_pv_arr = pv_annual_kwh > 1e-9
 
     bess_enabled_arr = np.zeros(len(user_names), dtype=bool)
@@ -1139,46 +1264,29 @@ def run_case(
         print(f"[INFO] BESS-t kapó PV-s háztartások száma: {n_bess_users}")
 
     for u in range(U):
-        sim = simulate_one_user_greedy(
-            e_load_base=e_ue[:, u],
-            e_boiler=e_boiler[:, u],
-            e_hp=ts_e_hp[:, u],
-            e_pv=e_pv[:, u],
-            use_bess=bool(bess_enabled_arr[u]),
-            bess_size_kwh=float(size_bess[u]),
-            eta_bess_in=float(eta_bess_in_u[u]),
-            eta_bess_out=float(eta_bess_out_u[u]),
-            eta_bess_stor=float(eta_bess_stor_u[u]),
-            soc_bess_min=float(soc_bess_min_u[u]),
-            soc_bess_max=float(soc_bess_max_u[u]),
-            t_bess_min_h=float(t_bess_min_u[u]),
-        )
+        sim = simulate_one_user_greedy(e_load_base=e_ue[:, u], e_boiler=e_boiler[:, u], e_hp=ts_e_hp[:, u],
+            e_pv=e_pv[:, u], e_boiler_load=e_boiler[:, u], use_bess=bool(bess_enabled_arr[u]),
+            bess_size_kwh=float(size_bess[u]), eta_bess_in=float(eta_bess_in_u[u]),
+            eta_bess_out=float(eta_bess_out_u[u]), eta_bess_stor=float(eta_bess_stor_u[u]),
+            soc_bess_min=float(soc_bess_min_u[u]), soc_bess_max=float(soc_bess_max_u[u]),
+            t_bess_min_h=float(t_bess_min_u[u]), boiler_tariff=boiler_tariff, )
 
         annual = sim["annual"]
         times = sim["timeseries"]
 
-        pv_annual_kwh = e_pv.sum(axis=0)
-        has_pv_arr = pv_annual_kwh > 1e-9
-
         base_load_kwh = e_ue[:, u].sum()
         boiler_kwh = e_boiler[:, u].sum()
         hp_kwh = ts_e_hp[:, u].sum()
+        pmax_kw = float(np.max(e_total_load[:, u] / DT))
 
-        rows.append({
-            "user_name": user_names[u],
-            "has_pv": bool((p_pv[:, u].sum()) > 1e-9),
-            "has_bess": bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
-            "has_heat_pump": bool(hp_enabled_arr[u]),
+        rows.append({"user_name": user_names[u], "has_pv": bool(e_pv[:, u].sum() > 1e-9),
+            "has_bess": bool(bess_enabled_arr[u] and size_bess[u] > 1e-9), "has_heat_pump": bool(hp_enabled_arr[u]),
             "has_boiler": bool(include_boiler and e_boiler[:, u].sum() > 1e-9),
-            "group_label": _group_label(
-                has_pv=bool(has_pv_arr[u]),
-                has_bess=bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
-                has_heat_pump=bool(hp_enabled_arr[u]),
-                has_boiler=bool(include_boiler and e_boiler[:, u].sum() > 1e-9),
-            ),
-            "base_load_kwh": base_load_kwh,
-            "boiler_kwh": boiler_kwh,
-            "heat_pump_kwh": hp_kwh,
+            "group_label": _group_label(has_pv=bool(has_pv_arr[u]),
+                                        has_bess=bool(bess_enabled_arr[u] and size_bess[u] > 1e-9),
+                                        has_heat_pump=bool(hp_enabled_arr[u]),
+                                        has_boiler=bool(include_boiler and e_boiler[:, u].sum() > 1e-9)),
+            "base_load_kwh": base_load_kwh, "boiler_kwh": boiler_kwh, "heat_pump_kwh": hp_kwh,
             "heat_pump_peak_kw": float(hp_user_meta[u].get("hp_peak_kw", 0.0)),
             "heat_pump_house_key": hp_user_meta[u].get("hp_house_key", ""),
             "heat_pump_setpoint_offset_c": float(hp_user_meta[u].get("hp_setpoint_offset_c", 0.0)),
@@ -1188,22 +1296,23 @@ def run_case(
             "heat_pump_min_off_min": float(hp_user_meta[u].get("hp_min_off_min", 0.0)),
             "heat_pump_ramp_kW_per_step": float(hp_user_meta[u].get("hp_ramp_kW_per_step", 0.0)),
             "heat_pump_p_th_min_kW": float(hp_user_meta[u].get("hp_p_th_min_kW", 0.0)),
-            "total_load_kwh": annual["load_kwh"],
-            "pv_kwh": annual["pv_kwh"],
-            "pv_to_load_kwh": annual["pv_to_load_kwh"],
-            "pv_to_bess_kwh": annual["pv_to_bess_kwh"],
-            "bess_to_load_kwh": annual["bess_to_load_kwh"],
-            "grid_import_kwh": annual["grid_import_kwh"],
-            "grid_import_low_kwh": annual["grid_import_low_kwh"],
+            "total_load_kwh": annual["load_kwh"], "pv_kwh": annual["pv_kwh"], "Pmax_kw": pmax_kw,
+            "pv_to_load_kwh": annual["pv_to_load_kwh"], "pv_to_bess_kwh": annual["pv_to_bess_kwh"],
+            "bess_to_load_kwh": annual["bess_to_load_kwh"], "grid_to_bess_kwh": annual["grid_to_bess_kwh"],
+            "grid_import_kwh": annual["grid_import_kwh"], "grid_import_a_kwh": annual["grid_import_a_kwh"],
+            "grid_import_b_kwh": annual["grid_import_b_kwh"], "grid_import_low_kwh": annual["grid_import_low_kwh"],
             "grid_import_high_kwh": annual["grid_import_high_kwh"],
-            "injection_kwh": annual["injection_kwh"],
+            "grid_import_a_low_kwh": annual["grid_import_a_low_kwh"],
+            "grid_import_a_high_kwh": annual["grid_import_a_high_kwh"],
+            "grid_import_b_low_kwh": annual["grid_import_b_low_kwh"],
+            "grid_import_b_high_kwh": annual["grid_import_b_high_kwh"], "injection_kwh": annual["injection_kwh"],
             "self_consumed_pv_kwh": annual["self_consumed_pv_kwh"],
+            "locally_supplied_load_kwh": annual["locally_supplied_load_kwh"],
             "self_consumption_ratio": annual["self_consumption_ratio"],
-            "self_sufficiency_ratio": annual["self_sufficiency_ratio"],
-            "import_cost_ft": annual["import_cost_ft"],
-            "export_revenue_ft": annual["export_revenue_ft"],
-            "net_bill_ft": annual["net_bill_ft"],
-        })
+            "self_sufficiency_ratio": annual["self_sufficiency_ratio"], "SCI": annual["self_consumption_ratio"],
+            "SSI": annual["self_sufficiency_ratio"], "import_cost_a_ft": annual["import_cost_a_ft"],
+            "import_cost_b_ft": annual["import_cost_b_ft"], "import_cost_ft": annual["import_cost_ft"],
+            "export_revenue_ft": annual["export_revenue_ft"], "brt_bill_ft": annual["brt_bill_ft"], })
 
         ts_e_load[:, u] = times["e_load"]
         ts_e_pv[:, u] = times["e_pv"]
@@ -1211,8 +1320,15 @@ def run_case(
         ts_e_pv_to_bess[:, u] = times["e_pv_to_bess"]
         ts_e_bess_to_load[:, u] = times["e_bess_to_load"]
         ts_e_grid_to_load[:, u] = times["e_grid_to_load"]
+        ts_e_grid_to_base[:, u] = times["e_grid_to_base"]
+        ts_e_grid_to_bess[:, u] = times["e_grid_to_bess"]
+        ts_e_grid_to_boiler[:, u] = times["e_grid_to_boiler"]
         ts_e_inj[:, u] = times["e_inj"]
         ts_e_bess[:, u] = times["e_bess"]
+        ts_d_bess_ch[:, u] = times["d_bess_ch"]
+        ts_d_bess_dis[:, u] = times["d_bess_dis"]
+        ts_e_base_load[:, u] = e_ue[:, u]
+        ts_e_boiler[:, u] = e_boiler[:, u]
 
     per_user_df = pd.DataFrame(rows)
     per_user_df.to_csv(out_case / "per_user_summary.csv", index=False)
@@ -1220,48 +1336,52 @@ def run_case(
     plot_household_percentiles_by_group(per_user_df, out_case)
     plot_household_percentiles_by_group_with_global_scurve(per_user_df, out_case)
 
-    total = {
-        "case_name": case_name,
-        "n_users": int(U),
+    total = {"case_name": case_name, "boiler_tariff": boiler_tariff, "n_users": int(U),
         "base_load_kwh": float(per_user_df["base_load_kwh"].sum()),
         "boiler_kwh": float(per_user_df["boiler_kwh"].sum()),
         "heat_pump_kwh": float(per_user_df["heat_pump_kwh"].sum()),
-        "total_load_kwh": float(per_user_df["total_load_kwh"].sum()),
-        "pv_kwh": float(per_user_df["pv_kwh"].sum()),
+        "total_load_kwh": float(per_user_df["total_load_kwh"].sum()), "pv_kwh": float(per_user_df["pv_kwh"].sum()),
         "pv_to_load_kwh": float(per_user_df["pv_to_load_kwh"].sum()),
         "pv_to_bess_kwh": float(per_user_df["pv_to_bess_kwh"].sum()),
         "bess_to_load_kwh": float(per_user_df["bess_to_load_kwh"].sum()),
+        "locally_supplied_load_kwh": float(per_user_df["locally_supplied_load_kwh"].sum()),
         "grid_import_kwh": float(per_user_df["grid_import_kwh"].sum()),
+        "grid_import_a_kwh": float(per_user_df["grid_import_a_kwh"].sum()),
+        "grid_import_b_kwh": float(per_user_df["grid_import_b_kwh"].sum()),
         "grid_import_low_kwh": float(per_user_df["grid_import_low_kwh"].sum()),
         "grid_import_high_kwh": float(per_user_df["grid_import_high_kwh"].sum()),
+        "grid_import_a_low_kwh": float(per_user_df["grid_import_a_low_kwh"].sum()),
+        "grid_import_a_high_kwh": float(per_user_df["grid_import_a_high_kwh"].sum()),
+        "grid_import_b_low_kwh": float(per_user_df["grid_import_b_low_kwh"].sum()),
+        "grid_import_b_high_kwh": float(per_user_df["grid_import_b_high_kwh"].sum()),
+        "grid_to_bess_kwh": float(per_user_df["grid_to_bess_kwh"].sum()),
         "injection_kwh": float(per_user_df["injection_kwh"].sum()),
+        "import_cost_a_ft": float(per_user_df["import_cost_a_ft"].sum()),
+        "import_cost_b_ft": float(per_user_df["import_cost_b_ft"].sum()),
         "import_cost_ft": float(per_user_df["import_cost_ft"].sum()),
         "export_revenue_ft": float(per_user_df["export_revenue_ft"].sum()),
-        "net_bill_ft": float(per_user_df["net_bill_ft"].sum()),
-        "bess_share_pct": float(bess_share_pct),
-        "heat_pump_share_pct": float(heat_pump_share_pct),
-        "pv_user_count": int(has_pv_arr.sum()),
+        "brt_bill_ft": float(per_user_df["brt_bill_ft"].sum()), "bess_share_pct": float(bess_share_pct),
+        "heat_pump_share_pct": float(heat_pump_share_pct), "pv_user_count": int(has_pv_arr.sum()),
         "bess_enabled_user_count": int(bess_enabled_arr.sum()),
-        "heat_pump_enabled_user_count": int(hp_enabled_arr.sum()),
-    }
+        "heat_pump_enabled_user_count": int(hp_enabled_arr.sum()), }
+
+    total["self_consumed_pv_kwh"] = (total["pv_to_load_kwh"] + total["pv_to_bess_kwh"])
 
     total["self_consumption_ratio"] = (
-        (total["pv_to_load_kwh"] + total["pv_to_bess_kwh"]) / total["pv_kwh"]
-        if total["pv_kwh"] > 1e-12 else 0.0
-    )
+        total["self_consumed_pv_kwh"] / total["pv_kwh"] if total["pv_kwh"] > 1e-12 else 0.0)
+
+    total["self_consumption_ratio"] = min(max(total["self_consumption_ratio"], 0.0), 1.0)
     total["self_sufficiency_ratio"] = (
-        (total["total_load_kwh"] - total["grid_import_kwh"]) / total["total_load_kwh"]
-        if total["total_load_kwh"] > 1e-12 else 0.0
-    )
+        total["locally_supplied_load_kwh"] / total["total_load_kwh"] if total["total_load_kwh"] > 1e-12 else 0.0)
 
     total["heat_pump_share_realized_pct"] = (
-        100.0 * total["heat_pump_enabled_user_count"] / total["n_users"] if total["n_users"] > 0 else 0.0
-    )
+        100.0 * total["heat_pump_enabled_user_count"] / total["n_users"] if total["n_users"] > 0 else 0.0)
 
-    (out_case / "summary.json").write_text(
-        json.dumps(total, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
+    total["self_sufficiency_ratio"] = min(max(total["self_sufficiency_ratio"], 0.0), 1.0)
+    total["SCI"] = total["self_consumption_ratio"]
+    total["SSI"] = total["self_sufficiency_ratio"]
+
+    (out_case / "summary.json").write_text(json.dumps(total, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def save_ts(arr: np.ndarray, filename: str):
         pd.DataFrame(arr, columns=user_names).to_csv(out_case / filename, index=False)
@@ -1273,37 +1393,31 @@ def run_case(
     save_ts(ts_e_pv_to_bess, "e_pv_to_bess.csv")
     save_ts(ts_e_bess_to_load, "e_bess_to_load.csv")
     save_ts(ts_e_grid_to_load, "e_grid_to_load.csv")
+    save_ts(ts_e_grid_to_base, "e_grid_to_base.csv")
+    save_ts(ts_e_grid_to_bess, "e_grid_to_bess.csv")
+    save_ts(ts_e_grid_to_boiler, "e_grid_to_boiler.csv")
     save_ts(ts_e_inj, "e_inj.csv")
     save_ts(ts_e_bess, "e_bess.csv")
+    save_ts(ts_d_bess_ch, "d_bess_ch.csv")
+    save_ts(ts_d_bess_dis, "d_bess_dis.csv")
+    save_ts(ts_e_base_load, "e_base_load.csv")
+    save_ts(ts_e_boiler, "e_boiler.csv")
 
-    community_ts = pd.DataFrame({
-        "e_load_total": ts_e_load.sum(axis=1),
-        "e_load_base_total": (e_ue + e_boiler).sum(axis=1),
-        "e_ue_total": e_ue.sum(axis=1),
-        "e_boiler_total": e_boiler.sum(axis=1),
-        "e_hp_total": ts_e_hp.sum(axis=1),
-        "e_pv_total": ts_e_pv.sum(axis=1),
-        "e_pv_to_load_total": ts_e_pv_to_load.sum(axis=1),
-        "e_pv_to_bess_total": ts_e_pv_to_bess.sum(axis=1),
-        "e_bess_to_load_total": ts_e_bess_to_load.sum(axis=1),
-        "e_grid_to_load_total": ts_e_grid_to_load.sum(axis=1),
-        "e_inj_total": ts_e_inj.sum(axis=1),
-        "e_bess_total": ts_e_bess.sum(axis=1),
-    })
+    community_ts = pd.DataFrame(
+        {"e_load_total": ts_e_load.sum(axis=1), "e_load_base_total": (e_ue + e_boiler).sum(axis=1),
+            "e_ue_total": e_ue.sum(axis=1), "e_boiler_total": e_boiler.sum(axis=1), "e_hp_total": ts_e_hp.sum(axis=1),
+            "e_pv_total": ts_e_pv.sum(axis=1), "e_pv_to_load_total": ts_e_pv_to_load.sum(axis=1),
+            "e_pv_to_bess_total": ts_e_pv_to_bess.sum(axis=1), "e_bess_to_load_total": ts_e_bess_to_load.sum(axis=1),
+            "e_grid_to_load_total": ts_e_grid_to_load.sum(axis=1),
+            "e_grid_to_base_total": ts_e_grid_to_base.sum(axis=1),
+            "e_grid_to_boiler_total": ts_e_grid_to_boiler.sum(axis=1), "e_inj_total": ts_e_inj.sum(axis=1),
+            "e_bess_total": ts_e_bess.sum(axis=1), "e_grid_to_bess_total": ts_e_grid_to_bess.sum(axis=1), })
     community_ts.to_csv(out_case / "community_timeseries.csv", index=False)
 
     plot_community_load_breakdown(community_ts, out_case)
 
-    plot_community_energy_balance(
-        community_ts,
-        out_case,
-        per_user_df=per_user_df,
-        household_ts={
-            "e_grid_to_load": ts_e_grid_to_load,
-            "e_inj": ts_e_inj,
-        },
-        user_names=user_names,
-    )
+    plot_community_energy_balance(community_ts, out_case, per_user_df=per_user_df,
+        household_ts={"e_grid_to_load": ts_e_grid_to_load, "e_inj": ts_e_inj, }, user_names=user_names, )
 
     print(f"[INFO] Kész: {case_name}")
     print(f"[INFO] Output: {out_case}")
@@ -1311,4 +1425,3 @@ def run_case(
         print(f"[INFO] HP háztartások: {int(hp_enabled_arr.sum())}/{U}")
         print(f"[INFO] HP összes energia: {float(per_user_df['heat_pump_kwh'].sum()):.1f} kWh")
     print(json.dumps(total, indent=2, ensure_ascii=False))
-

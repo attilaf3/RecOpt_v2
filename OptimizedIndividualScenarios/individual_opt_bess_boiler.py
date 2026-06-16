@@ -29,10 +29,16 @@ def individual_opt_bess_boiler(
     soc_bess_init=None,
     t_bess_min=2.0,         # h  -> max P = size_bess / t_bess_min
     # --- Tariffs (bruttó, 15 perces elszámolás, de low/high éves blokk) ---
-    price_grid_low=36.0,    # Ft/kWh
-    price_grid_high=71.0,   # Ft/kWh
-    price_pv_grid=5.0,      # Ft/kWh
-    grid_low_cap_kwh=2523.0,
+    p_el_heater_fixed=None,
+
+    price_grid_a_low=36.0,
+    price_grid_a_high=71.0,
+    price_grid_b_low=23.0,
+    price_grid_b_high=61.0,
+    price_pv_grid=5.0,
+    grid_a_low_cap_kwh=2523.0,
+    grid_b_low_cap_kwh=2523.0,
+    objective="grid",
     # --- Solve ---
     run_lp=False,           # ha True: LP relax (binárisok kikapcsolva)
     msg=False,
@@ -50,12 +56,20 @@ def individual_opt_bess_boiler(
     p_pv = np.asarray(p_pv, float).ravel()
     p_ue = np.asarray(p_ue, float).ravel()
     p_dhw = np.asarray(p_dhw, float).ravel()
+    if p_el_heater_fixed is None:
+        p_el_heater_fixed = np.zeros_like(p_ue)
+    else:
+        p_el_heater_fixed = np.asarray(p_el_heater_fixed, dtype=float).ravel()
+
+    assert p_el_heater_fixed.shape == p_ue.shape, "p_el_heater_fixed hossza nem egyezik."
     assert p_pv.shape == p_ue.shape == p_dhw.shape, "p_pv, p_ue, p_dhw hossza nem egyezik"
 
     T = len(p_pv)
     time_set = range(T)
 
-    hss_active = (float(size_elh) > 1e-9) and (float(vol_hss_water) > 1e-9)
+    has_pv = np.sum(p_pv) > 1e-9
+    hss_active = has_pv and (float(size_elh) > 1e-9) and (float(vol_hss_water) > 1e-9)
+    fixed_boiler_active = (not hss_active) and (np.sum(p_el_heater_fixed) > 1e-9)
     bess_active = float(size_bess) > 1e-9
     if soc_bess_init is None:
         soc_bess_init = soc_bess_min
@@ -86,6 +100,7 @@ def individual_opt_bess_boiler(
     p_grid_load = [pulp.LpVariable(f"p_grid_load_{t}", lowBound=0) for t in time_set]
     p_grid_elh  = [pulp.LpVariable(f"p_grid_elh_{t}", lowBound=0) for t in time_set]
     p_grid_bess = [pulp.LpVariable(f"p_grid_bess_{t}", lowBound=0) for t in time_set]
+    p_grid_elh_fixed = [pulp.LpVariable(f"p_grid_elh_fixed_{t}", lowBound=0) for t in time_set]
 
     # BESS to load
     p_bess_load = [pulp.LpVariable(f"p_bess_load_{t}", lowBound=0) for t in time_set]
@@ -128,9 +143,13 @@ def individual_opt_bess_boiler(
     d_grid = [pulp.LpVariable(f"d_grid_{t}", cat=pulp.LpBinary) if not run_lp else 0 for t in time_set]  # 1=import, 0=export
 
     # Tariff blocks per step (kWh/step)
-    e_grid_low_step  = [pulp.LpVariable(f"e_grid_low_step_{t}", lowBound=0) for t in time_set]
-    e_grid_high_step = [pulp.LpVariable(f"e_grid_high_step_{t}", lowBound=0) for t in time_set]
-    rem_low = [pulp.LpVariable(f"rem_low_{t}", lowBound=0, upBound=float(grid_low_cap_kwh)) for t in time_set]
+    e_grid_a_low_step = [pulp.LpVariable(f"e_grid_a_low_step_{t}", lowBound=0) for t in time_set]
+    e_grid_a_high_step = [pulp.LpVariable(f"e_grid_a_high_step_{t}", lowBound=0) for t in time_set]
+    rem_a_low = [pulp.LpVariable(f"rem_a_low_{t}", lowBound=0, upBound=float(grid_a_low_cap_kwh)) for t in time_set]
+
+    e_grid_b_low_step = [pulp.LpVariable(f"e_grid_b_low_step_{t}", lowBound=0) for t in time_set]
+    e_grid_b_high_step = [pulp.LpVariable(f"e_grid_b_high_step_{t}", lowBound=0) for t in time_set]
+    rem_b_low = [pulp.LpVariable(f"rem_b_low_{t}", lowBound=0, upBound=float(grid_b_low_cap_kwh)) for t in time_set]
 
     # -----------------------------
     # Constraints
@@ -143,6 +162,11 @@ def individual_opt_bess_boiler(
 
         # UE load balance
         prob += (p_pv_load[t] + p_bess_load[t] + p_grid_load[t] == p_ue[t]), f"ue_balance_{t}"
+
+        if fixed_boiler_active:
+            prob += p_grid_elh_fixed[t] == p_el_heater_fixed[t], f"fixed_boiler_grid_{t}"
+        else:
+            prob += p_grid_elh_fixed[t] == 0, f"no_fixed_boiler_grid_{t}"
 
         # Boiler electrical supply
         if hss_active:
@@ -176,7 +200,7 @@ def individual_opt_bess_boiler(
             # no HSS -> no boiler power
             prob += p_pv_elh[t] == 0, f"no_hss_pv_elh_{t}"
             prob += p_grid_elh[t] == 0, f"no_hss_grid_elh_{t}"
-            prob += p_dhw[t] == 0, f"no_hss_dhw_{t}"
+
 
         # Battery relations
         if not bess_active:
@@ -206,7 +230,10 @@ def individual_opt_bess_boiler(
                 prob += p_bess_out[t] <= (1 - d_bess[t]) * battery_power, f"bess_out_gate_{t}"
 
         # Grid import/export definitions
-        prob += (p_grid_import[t] == p_grid_load[t] + p_grid_elh[t] + p_grid_bess[t]), f"grid_import_def_{t}"
+        prob += (
+                p_grid_import[t]
+                == p_grid_load[t] + p_grid_elh[t] + p_grid_elh_fixed[t] + p_grid_bess[t]
+        ), f"grid_import_def_{t}"
         prob += (p_grid_export[t] == p_pv_grid[t]), f"grid_export_def_{t}"
 
         # No simultaneous import and export
@@ -215,15 +242,24 @@ def individual_opt_bess_boiler(
             prob += p_grid_export[t] <= M_pv * (1 - d_grid[t]), f"grid_export_gate_{t}"
 
         # 15-min (step) import energy split into low/high blocks
-        e_imp_t = p_grid_import[t] * float(dt)  # kWh/step
-        prob += e_grid_low_step[t] + e_grid_high_step[t] == e_imp_t, f"grid_step_split_{t}"
+        e_imp_a_t = float(dt) * (p_grid_load[t] + p_grid_bess[t])
+        e_imp_b_t = float(dt) * (p_grid_elh[t] + p_grid_elh_fixed[t])
+
+        prob += e_grid_a_low_step[t] + e_grid_a_high_step[t] == e_imp_a_t, f"grid_a_step_split_{t}"
+        prob += e_grid_b_low_step[t] + e_grid_b_high_step[t] == e_imp_b_t, f"grid_b_step_split_{t}"
 
         if t == 0:
-            prob += rem_low[t] == float(grid_low_cap_kwh) - e_grid_low_step[t], "rem_low_init"
-            prob += e_grid_low_step[t] <= float(grid_low_cap_kwh), f"grid_low_step_cap_{t}"
+            prob += rem_a_low[t] == float(grid_a_low_cap_kwh) - e_grid_a_low_step[t], "rem_a_low_init"
+            prob += e_grid_a_low_step[t] <= float(grid_a_low_cap_kwh), f"grid_a_low_step_cap_{t}"
+
+            prob += rem_b_low[t] == float(grid_b_low_cap_kwh) - e_grid_b_low_step[t], "rem_b_low_init"
+            prob += e_grid_b_low_step[t] <= float(grid_b_low_cap_kwh), f"grid_b_low_step_cap_{t}"
         else:
-            prob += rem_low[t] == rem_low[t - 1] - e_grid_low_step[t], f"rem_low_balance_{t}"
-            prob += e_grid_low_step[t] <= rem_low[t - 1], f"grid_low_step_cap_{t}"
+            prob += rem_a_low[t] == rem_a_low[t - 1] - e_grid_a_low_step[t], f"rem_a_low_balance_{t}"
+            prob += e_grid_a_low_step[t] <= rem_a_low[t - 1], f"grid_a_low_step_cap_{t}"
+
+            prob += rem_b_low[t] == rem_b_low[t - 1] - e_grid_b_low_step[t], f"rem_b_low_balance_{t}"
+            prob += e_grid_b_low_step[t] <= rem_b_low[t - 1], f"grid_b_low_step_cap_{t}"
 
     # initial SOC
     if bess_active:
@@ -262,14 +298,13 @@ def individual_opt_bess_boiler(
     # -----------------------------
     # Objective: economic (Ft)
     # -----------------------------
-    cost_grid = pulp.lpSum(
-        float(price_grid_low) * e_grid_low_step[t] + float(price_grid_high) * e_grid_high_step[t]
-        for t in time_set
-    )
-    # export energy per step = p_pv_grid[t]*dt
-    revenue_export = pulp.lpSum(float(price_pv_grid) * p_pv_grid[t] * float(dt) for t in time_set)
-
-    prob += cost_grid - revenue_export
+    if objective == "grid":
+        prob += pulp.lpSum(
+            float(dt) * (p_grid_import[t] + p_grid_export[t])
+            for t in time_set
+        )
+    else:
+        raise ValueError("objective must be 'grid'")
 
     # -----------------------------
     # Solve
@@ -283,6 +318,32 @@ def individual_opt_bess_boiler(
     def _val(x):
         v = pulp.value(x)
         return 0.0 if v is None else float(v)
+
+    p_grid_elh_fixed_v = np.array([_val(v) for v in p_grid_elh_fixed], dtype=float)
+
+    e_grid_a_low_step_v = np.array([_val(v) for v in e_grid_a_low_step], dtype=float)
+    e_grid_a_high_step_v = np.array([_val(v) for v in e_grid_a_high_step], dtype=float)
+    e_grid_b_low_step_v = np.array([_val(v) for v in e_grid_b_low_step], dtype=float)
+    e_grid_b_high_step_v = np.array([_val(v) for v in e_grid_b_high_step], dtype=float)
+
+    e_grid_a_low_v = float(np.sum(e_grid_a_low_step_v))
+    e_grid_a_high_v = float(np.sum(e_grid_a_high_step_v))
+    e_grid_b_low_v = float(np.sum(e_grid_b_low_step_v))
+    e_grid_b_high_v = float(np.sum(e_grid_b_high_step_v))
+
+    import_cost_a_ft = (
+            float(price_grid_a_low) * e_grid_a_low_v
+            + float(price_grid_a_high) * e_grid_a_high_v
+    )
+
+    import_cost_b_ft = (
+            float(price_grid_b_low) * e_grid_b_low_v
+            + float(price_grid_b_high) * e_grid_b_high_v
+    )
+
+    e_export = float(np.sum([_val(v) for v in p_pv_grid]) * float(dt))
+    export_rev = float(price_pv_grid) * e_export
+    brt_bill = import_cost_a_ft + import_cost_b_ft - export_rev
 
     # outputs
     res = {
@@ -302,8 +363,9 @@ def individual_opt_bess_boiler(
         "p_pv_grid": np.array([_val(v) for v in p_pv_grid]),
 
         # grid
-        "p_grid_load": np.array([_val(v) for v in p_grid_load]),
-        "p_grid_elh":  np.array([_val(v) for v in p_grid_elh]),
+        "p_grid_elh_fixed": p_grid_elh_fixed_v,
+        "p_grid_to_base": np.array([_val(v) for v in p_grid_load]),
+        "p_grid_to_boiler": np.array([_val(v) for v in p_grid_elh]) + p_grid_elh_fixed_v,
         "p_grid_bess": np.array([_val(v) for v in p_grid_bess]),
         "p_grid_import": np.array([_val(v) for v in p_grid_import]),
         "p_grid_export": np.array([_val(v) for v in p_grid_export]),
@@ -328,31 +390,27 @@ def individual_opt_bess_boiler(
         "d_cl": np.array([_val(v) for v in d_cl]) if (hss_active and not run_lp) else np.zeros(T),
 
         # tariff bookkeeping
-        "e_grid_low_step": np.array([_val(v) for v in e_grid_low_step]),
-        "e_grid_high_step": np.array([_val(v) for v in e_grid_high_step]),
-        "remaining_low_block_kwh": np.array([_val(v) for v in rem_low]),
+        "grid_import_a_kwh": float(np.sum(res["p_grid_load"] + res["p_grid_bess"]) * float(dt)),
+        "grid_import_b_kwh": float(np.sum(res["p_grid_elh"] + p_grid_elh_fixed_v) * float(dt)),
+
+        "grid_import_low_kwh": e_grid_a_low_v + e_grid_b_low_v,
+        "grid_import_high_kwh": e_grid_a_high_v + e_grid_b_high_v,
+
+        "grid_import_a_low_kwh": e_grid_a_low_v,
+        "grid_import_a_high_kwh": e_grid_a_high_v,
+        "grid_import_b_low_kwh": e_grid_b_low_v,
+        "grid_import_b_high_kwh": e_grid_b_high_v,
+
+        "grid_import_total_kwh": e_grid_a_low_v + e_grid_a_high_v + e_grid_b_low_v + e_grid_b_high_v,
+        "grid_export_kwh": e_export,
+
+        "import_cost_a_ft": import_cost_a_ft,
+        "import_cost_b_ft": import_cost_b_ft,
+        "import_cost_ft": import_cost_a_ft + import_cost_b_ft,
+        "export_revenue_ft": export_rev,
+        "brt_bill_ft": brt_bill,
     }
 
-    # KPIs (kWh/year)
-    e_grid_low = float(np.sum(res["e_grid_low_step"]))
-    e_grid_high = float(np.sum(res["e_grid_high_step"]))
-    e_grid_total = e_grid_low + e_grid_high
-    e_export = float(np.sum(res["p_pv_grid"]) * float(dt))
-
-    grid_cost = float(np.sum(float(price_grid_low) * res["e_grid_low_step"] + float(price_grid_high) * res["e_grid_high_step"]))
-    export_rev = float(float(price_pv_grid) * e_export)
-    net_cost = grid_cost - export_rev
-
-    res.update({
-        "e_grid_low_kwh": e_grid_low,
-        "e_grid_high_kwh": e_grid_high,
-        "e_grid_total_kwh": e_grid_total,
-        "e_grid_export_kwh": e_export,
-        "grid_cost_Ft": grid_cost,
-        "export_revenue_Ft": export_rev,
-        "net_cost_Ft": net_cost,
-        "objective_check_Ft": net_cost,
-    })
 
     # stored thermal energy proxy at end (kWh)
     if hss_active:
