@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from read.user_input_reading import read_users
 
 DT = 1.0
 
@@ -29,6 +30,7 @@ def _keep_15min(v: np.ndarray) -> np.ndarray:
         raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
     return v
 
+
 def _aggregate_to_hourly(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=float).ravel()
     if v.size == 8760:
@@ -36,6 +38,7 @@ def _aggregate_to_hourly(v: np.ndarray) -> np.ndarray:
     if v.size != 35040:
         raise ValueError(f"A profil hossza {v.size}, de itt 35040 vagy 8760 kell.")
     return v.reshape(8760, 4).sum(axis=1)
+
 
 def _norm_to_annual(profile: np.ndarray, annual_kwh: float | None) -> np.ndarray:
     p = np.maximum(np.asarray(profile, float), 0.0)
@@ -55,28 +58,21 @@ def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
 
 
 # --- input builder -------------------------------------------------------------
-def build_inputs(
-        sim_yaml_path: os.PathLike,
-        profiles_csv_path: os.PathLike,
-        dhw_profile_path: os.PathLike,
-        max_users: int = 10,
-        pv_ratio: float = 1.0,
-        use_hss: bool = True,
-        search_roots: Iterable[os.PathLike] | None = None,
-) -> Tuple[
-    np.ndarray,  # p_pv (8760, U)
-    np.ndarray,  # p_ue (8760, U)
-    np.ndarray,  # p_dhw (8760, U)
-    np.ndarray,  # p_el_heater (8760, U)
-    np.ndarray,  # size_elh (U,)
-    np.ndarray,  # vol_hss_water (U,)
-    list[float], # T_env_u
-    list[float], # T_max_u
-    list[float], # T_min_u
-    list[float], # T_in_u
-    list[float], # a_hss_u
-    list[float], # eta_elh_u
-    list[str],   # user_names
+def build_inputs(sim_yaml_path: os.PathLike, profiles_csv_path: os.PathLike, dhw_profile_path: os.PathLike,
+        max_users: int = 10, pv_ratio: float = 1.0, use_hss: bool = True,
+        search_roots: Iterable[os.PathLike] | None = None, ) -> Tuple[np.ndarray,  # p_pv (8760, U)
+np.ndarray,  # p_ue (8760, U)
+np.ndarray,  # p_dhw (8760, U)
+np.ndarray,  # p_el_heater (8760, U)
+np.ndarray,  # size_elh (U,)
+np.ndarray,  # vol_hss_water (U,)
+list[float],  # T_env_u
+list[float],  # T_max_u
+list[float],  # T_min_u
+list[float],  # T_in_u
+list[float],  # a_hss_u
+list[float],  # eta_elh_u
+list[str],  # user_names
 ]:
     """
     Return:
@@ -90,14 +86,7 @@ def build_inputs(
     if search_roots is None:
         search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
 
-    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
-    users_list = list(sim.get("users_list", []))[: int(max_users)]
-
-    # exclude some pseudo users by name (optional)
-    EXCLUDE = {"battery", "bess", "community"}
-    users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
-    if not users_list:
-        raise RuntimeError("A simulation YAML nem tartalmaz users_list-et vagy max_users=0.")
+    users_list = read_users(sim_yaml_path, max_users)
 
     df = pd.read_csv(profiles_csv_path, index_col=0)
     df.columns = [str(c) for c in df.columns]  # oszlopnevek legyenek stringek
@@ -240,58 +229,21 @@ def build_inputs(
         p_el_heater = np.column_stack(p_el_heater_cols).astype(float) if p_el_heater_cols else np.zeros((8760, U),
                                                                                                         float)
 
-    return (
-        p_pv,
-        p_ue,
-        p_dhw,
-        p_el_heater,
-        np.asarray(size_elh, float),
-        np.asarray(vol_hss_water, float),
-        np.asarray(size_bess, float),
-        np.asarray(eta_bess_in_u, float),
-        np.asarray(eta_bess_out_u, float),
-        np.asarray(eta_bess_stor_u, float),
-        np.asarray(soc_bess_min_u, float),
-        np.asarray(soc_bess_max_u, float),
-        np.asarray(t_bess_min_u, float),
-        T_env_u,
-        T_max_u,
-        T_min_u,
-        T_in_u,
-        a_hss_u,
-        eta_elh_u,
-        t_hss_min_in_u,
-        user_names,
-    )
+    return (p_pv, p_ue, p_dhw, p_el_heater, np.asarray(size_elh, float), np.asarray(vol_hss_water, float),
+            np.asarray(size_bess, float), np.asarray(eta_bess_in_u, float), np.asarray(eta_bess_out_u, float),
+            np.asarray(eta_bess_stor_u, float), np.asarray(soc_bess_min_u, float), np.asarray(soc_bess_max_u, float),
+            np.asarray(t_bess_min_u, float), T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
+            user_names,)
 
 
 # --- runner --------------------------------------------------------------------
 
-def run(
-        sim_yaml: os.PathLike,
-        profiles_csv: os.PathLike,
-        dhw_profiles_csv: os.PathLike,
-        out_dir: os.PathLike,
-        max_users: int = 10,
-        run_lp: bool = True,
-        pv_ratio: float = 1.0,
-        use_hss: bool = True,
-) -> dict:
-    (
-        p_pv, p_ue, p_dhw, p_el_heater,
-        size_elh, vol_hss_water,
-        size_bess, eta_bess_in_u, eta_bess_out_u, eta_bess_stor_u,
-        soc_bess_min_u, soc_bess_max_u, t_bess_min_u,
-        T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
-        user_names
-    ) = build_inputs(
-        sim_yaml_path=sim_yaml,
-        profiles_csv_path=profiles_csv,
-        dhw_profile_path=dhw_profiles_csv,
-        max_users=max_users,
-        pv_ratio=pv_ratio,
-        use_hss=use_hss,
-    )
+def run(sim_yaml: os.PathLike, profiles_csv: os.PathLike, dhw_profiles_csv: os.PathLike, out_dir: os.PathLike,
+        max_users: int = 10, run_lp: bool = True, pv_ratio: float = 1.0, use_hss: bool = True, ) -> dict:
+    (p_pv, p_ue, p_dhw, p_el_heater, size_elh, vol_hss_water, size_bess, eta_bess_in_u, eta_bess_out_u, eta_bess_stor_u,
+     soc_bess_min_u, soc_bess_max_u, t_bess_min_u, T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u,
+     t_hss_min_in_u, user_names) = build_inputs(sim_yaml_path=sim_yaml, profiles_csv_path=profiles_csv,
+        dhw_profile_path=dhw_profiles_csv, max_users=max_users, pv_ratio=pv_ratio, use_hss=use_hss, )
 
     print(f"[INFO] Betöltött felhasználók száma: {len(user_names)} → "
           f"{', '.join(user_names[:10])}{'...' if len(user_names) > 10 else ''}")
@@ -301,56 +253,29 @@ def run(
     pv_active = int(((p_pv > 1e-9).sum(axis=0) > 0).sum())
     hss_active = int(((p_dhw > 1e-9).sum(axis=0) > 0).sum())
     elh_active = int(((p_el_heater > 1e-9).sum(axis=0) > 0).sum())
-    print(f"[INFO] Aktív oszlopok — UE:{ue_active}, PV:{pv_active}, HSS:{hss_active}, ELH:{elh_active}, Use HSS:{use_hss} / {p_ue.shape[1]}")
+    print(
+        f"[INFO] Aktív oszlopok — UE:{ue_active}, PV:{pv_active}, HSS:{hss_active}, ELH:{elh_active}, Use HSS:{use_hss} / {p_ue.shape[1]}")
 
     # --- hívjuk az optimalizálót ------------------------------------------------
     # optimize_multi_users pontos interface-e: p_pv/p_ue/p_ut alak (T,U), dt, size_elh, size_bess, vol_hss_water stb. :contentReference[oaicite:2]{index=2}
-    results, status, objective, n_vars, n_cons, infeas_gap = optimize_multi_users_economic(
-        p_pv=p_pv,
-        p_ue=p_ue,
-        p_dhw=p_dhw,
-        p_el_heater=p_el_heater,
-        dt=1.0,
-        hss_flag=use_hss,
-        size_elh=size_elh,
-        vol_hss_water=vol_hss_water,
-        size_bess=size_bess,
-        eta_bess_in=eta_bess_in_u,
-        eta_bess_out=eta_bess_out_u,
-        eta_bess_stor=eta_bess_stor_u,
-        soc_bess_min=soc_bess_min_u,
-        soc_bess_max=soc_bess_max_u,
-        t_bess_min=t_bess_min_u,
-        T_env=T_env_u,
-        T_max=T_max_u,
-        T_min=T_min_u,
-        T_in=T_in_u,
-        a_hss=a_hss_u,
-        eta_elh=eta_elh_u,
-        run_lp=run_lp,
-        msg=True,
-        gapRel=0.01,
-        timeLimit=None,
-        t_hss_min_in=t_hss_min_in_u,
-    )
+    results, status, objective, n_vars, n_cons, infeas_gap = optimize_multi_users_economic(p_pv=p_pv, p_ue=p_ue,
+        p_dhw=p_dhw, p_el_heater=p_el_heater, dt=1.0, hss_flag=use_hss, size_elh=size_elh, vol_hss_water=vol_hss_water,
+        size_bess=size_bess, eta_bess_in=eta_bess_in_u, eta_bess_out=eta_bess_out_u, eta_bess_stor=eta_bess_stor_u,
+        soc_bess_min=soc_bess_min_u, soc_bess_max=soc_bess_max_u, t_bess_min=t_bess_min_u, T_env=T_env_u, T_max=T_max_u,
+        T_min=T_min_u, T_in=T_in_u, a_hss=a_hss_u, eta_elh=eta_elh_u, run_lp=run_lp, msg=True, gapRel=0.01,
+        timeLimit=None, t_hss_min_in=t_hss_min_in_u, )
 
     # --- kimenetek mentése ------------------------------------------------------
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     # Community (1D sorozatok)
-    comm = pd.DataFrame({
-        "p_inj_comm": results["p_inj_comm"],
-        "p_with_comm": results["p_with_comm"],
-        "p_grid_in": results["p_grid_in"],
-        "p_grid_out": results["p_grid_out"],
-        "p_grid_bess_total": results["p_grid_bess_total"],
-        "p_bess_in_total": results["p_bess_in_total"],
-        "p_bess_out_total": results["p_bess_out_total"],
-        "e_bess_total": results["e_bess_total"],
-        "d_bess_any": results["d_bess_any"],
-        "d_grid": results["d_grid"],
-    })
+    comm = pd.DataFrame(
+        {"p_inj_comm": results["p_inj_comm"], "p_with_comm": results["p_with_comm"], "p_grid_in": results["p_grid_in"],
+            "p_grid_out": results["p_grid_out"], "p_grid_bess_total": results["p_grid_bess_total"],
+            "p_bess_in_total": results["p_bess_in_total"], "p_bess_out_total": results["p_bess_out_total"],
+            "e_bess_total": results["e_bess_total"], "d_bess_any": results["d_bess_any"],
+            "d_grid": results["d_grid"], })
     comm.to_csv(out / "community_timeseries.csv", index=False)
 
     # Per-user mátrixok (T×U) → CSV (oszlopok: user_names)
@@ -378,26 +303,15 @@ def run(
     pd.DataFrame([results["e_grid_low"]], columns=user_names).to_csv(out / "e_grid_low.csv", index=False)
     pd.DataFrame([results["e_grid_high"]], columns=user_names).to_csv(out / "e_grid_high.csv", index=False)
 
-    pd.DataFrame({
-        "user_name": user_names,
-        "grid_cost_Ft": results["grid_cost_user"],
-        "rec_buy_cost_Ft": results["rec_buy_cost_user"],
-        "rec_sell_revenue_Ft": results["rec_sell_revenue_user"],
+    # Itt vannak gazdasági számítások is
+    pd.DataFrame({"user_name": user_names, "grid_cost_Ft": results["grid_cost_user"],
+        "rec_buy_cost_Ft": results["rec_buy_cost_user"], "rec_sell_revenue_Ft": results["rec_sell_revenue_user"],
         "grid_export_revenue_Ft": results["grid_export_revenue_user"],
-        "net_cost_Ft": results["net_cost_user"],
-    }).to_csv(out / "user_bills.csv", index=False)
+        "net_cost_Ft": results["net_cost_user"], }).to_csv(out / "user_bills.csv", index=False)
 
-    summary = {
-        "status": int(status),
-        "objective": float(objective),
-        "n_vars": int(n_vars),
-        "n_cons": int(n_cons),
+    summary = {"status": int(status), "objective": float(objective), "n_vars": int(n_vars), "n_cons": int(n_cons),
         "infeas_gap": float(infeas_gap) if isinstance(infeas_gap, (int, float, np.floating)) else None,
-        "U_users": int(p_pv.shape[1]),
-        "T_steps": int(p_pv.shape[0]),
-        "user_names": user_names,
-        "out_dir": str(out),
-    }
+        "U_users": int(p_pv.shape[1]), "T_steps": int(p_pv.shape[0]), "user_names": user_names, "out_dir": str(out), }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return summary
 
@@ -406,16 +320,10 @@ def run(
 def main(argv: list[str] | None = None):
     # Ha nincs argumentum, kattintásos mód
     if argv is None and len(sys.argv) == 1:
-        summary = run(
-            sim_yaml="../Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml",
+        summary = run(sim_yaml="../Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml",
             profiles_csv="../Inputs/measurements_disaggregated_pv_original_increase_1.0.csv",
-            dhw_profiles_csv="../Inputs/dhw.csv",
-            out_dir=r".\results_disaggregated_hourly",
-            max_users=105,
-            run_lp=False,
-            pv_ratio=1.0,
-            use_hss=True,
-        )
+            dhw_profiles_csv="../Inputs/dhw.csv", out_dir=r".\results_disaggregated_hourly", max_users=105,
+            run_lp=False, pv_ratio=1.0, use_hss=True, )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
 
@@ -432,18 +340,11 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--mip", action="store_true", help="Bináris változók bekapcsolása (alap: LP).")
     args = ap.parse_args(argv)
 
-    summary = run(
-        sim_yaml=args.sim,
-        profiles_csv=args.profiles,
-        out_dir=args.out,
-        max_users=args.max_users,
-        run_lp=not args.mip,
-        pv_ratio=args.pv_ratio,
-        use_hss=args.use_hss,
-        dhw_profiles_csv=args.dhw_profiles,
-    )
+    summary = run(sim_yaml=args.sim, profiles_csv=args.profiles, out_dir=args.out, max_users=args.max_users,
+        run_lp=not args.mip, pv_ratio=args.pv_ratio, use_hss=args.use_hss, dhw_profiles_csv=args.dhw_profiles, )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 
 
+# Notes: a 2b esethez fogjuk használni
 if __name__ == "__main__":
     main()

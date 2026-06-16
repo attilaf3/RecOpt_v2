@@ -1,0 +1,1 @@
+# TODO: ide áthelyezni a gazdasági dolgokat, tarifákat, bevételeket, stb

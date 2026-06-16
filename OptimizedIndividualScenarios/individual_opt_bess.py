@@ -2,6 +2,7 @@ import numpy as np
 import pulp
 
 
+# Notes: ez van készen
 def individual_opt_bess(
     p_pv,                   # (T,) kW
     p_ue,                   # (T,) kW - alap villamos fogyasztás

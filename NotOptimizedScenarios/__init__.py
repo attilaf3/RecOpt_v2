@@ -1,0 +1,1 @@
+# Együtt vannak az Individual és Community opciók, mert nagyon hasonló kód számolja őket
