@@ -11,19 +11,16 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from InputReading.user_input_reading import read_users
-
-DT = 1.0
-
-# --- import optimizer locally ---------------------------------------------------
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.append(str(HERE))
-from optimize_disaggregated import \
-    optimize_multi_users_economic  # expects (T,U) arrays, sizes, etc. :contentReference[oaicite:1]{index=1}
+
+from optimize_disaggregated import (
+    disaggregated_opt_bess_shared,
+    save_disaggregated_opt_results,
+)
 
 
-# --- helpers -------------------------------------------------------------------
 def _keep_15min(v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=float).ravel()
     if v.size != 35040:
@@ -31,21 +28,12 @@ def _keep_15min(v: np.ndarray) -> np.ndarray:
     return v
 
 
-def _aggregate_to_hourly(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=float).ravel()
-    if v.size == 8760:
-        return v
-    if v.size != 35040:
-        raise ValueError(f"A profil hossza {v.size}, de itt 35040 vagy 8760 kell.")
-    return v.reshape(8760, 4).sum(axis=1)
+def _energy_profile_kwh_step(v: np.ndarray) -> np.ndarray:
+    return np.maximum(_keep_15min(v), 0.0)
 
 
-def _norm_to_annual(profile: np.ndarray, annual_kwh: float | None) -> np.ndarray:
-    p = np.maximum(np.asarray(profile, float), 0.0)
-    if annual_kwh is None:
-        return np.zeros_like(p)
-    s = p.sum()
-    return np.zeros_like(p) if s <= 0 else p / s * float(annual_kwh)
+def _power_profile_kw_from_energy(v: np.ndarray, dt: float) -> np.ndarray:
+    return _energy_profile_kwh_step(v) / float(dt)
 
 
 def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
@@ -57,68 +45,60 @@ def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
     return None
 
 
-# --- input builder -------------------------------------------------------------
-def build_inputs(sim_yaml_path: os.PathLike, profiles_csv_path: os.PathLike, dhw_profile_path: os.PathLike,
-        max_users: int = 10, pv_ratio: float = 1.0, use_hss: bool = True,
-        search_roots: Iterable[os.PathLike] | None = None, ) -> Tuple[np.ndarray,  # p_pv (8760, U)
-np.ndarray,  # p_ue (8760, U)
-np.ndarray,  # p_dhw (8760, U)
-np.ndarray,  # p_el_heater (8760, U)
-np.ndarray,  # size_elh (U,)
-np.ndarray,  # vol_hss_water (U,)
-list[float],  # T_env_u
-list[float],  # T_max_u
-list[float],  # T_min_u
-list[float],  # T_in_u
-list[float],  # a_hss_u
-list[float],  # eta_elh_u
-list[str],  # user_names
+def build_inputs(
+    sim_yaml_path: os.PathLike,
+    profiles_csv_path: os.PathLike,
+    max_users: int = 10,
+    pv_ratio: float = 1.0,
+    search_roots: Iterable[os.PathLike] | None = None,
+    dt: float = 0.25,
+) -> Tuple[
+    np.ndarray,  # p_pv (35040, U) kW
+    np.ndarray,  # p_ue (35040, U) kW
+    np.ndarray,  # p_el_heater (35040, U) kW
+    np.ndarray,  # size_elh (U,)
+    np.ndarray,  # vol_hss_water (U,)
+    np.ndarray,  # size_bess (U,)
+    np.ndarray,  # eta_bess_in_u (U,)
+    np.ndarray,  # eta_bess_out_u (U,)
+    np.ndarray,  # eta_bess_stor_u (U,)
+    np.ndarray,  # soc_bess_min_u (U,)
+    np.ndarray,  # soc_bess_max_u (U,)
+    np.ndarray,  # t_bess_min_u (U,)
+    list[str],
 ]:
-    """
-    Return:
-      p_pv, p_ue, p_ut: np.ndarray (8760, U)
-      size_elh: np.ndarray (U,)
-      vol_hss_water: np.ndarray (U,)
-      user_names: list[str]
-    """
     sim_yaml_path = Path(sim_yaml_path)
     profiles_csv_path = Path(profiles_csv_path)
+
     if search_roots is None:
         search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
 
-    users_list = read_users(sim_yaml_path, max_users)
+    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
+    users_list = list(sim.get("users_list", []))[: int(max_users)]
+
+    EXCLUDE = {"battery", "bess", "community"}
+    users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
+    if not users_list:
+        raise RuntimeError("A simulation YAML nem tartalmaz users_list-et vagy max_users=0.")
 
     df = pd.read_csv(profiles_csv_path, index_col=0)
-    df.columns = [str(c) for c in df.columns]  # oszlopnevek legyenek stringek
-    df = df[[c for c in df.columns if c.lower() not in {"battery", "bess", "community"}]]
+    df.columns = [str(c) for c in df.columns]
+    df = df[[c for c in df.columns if c.lower() not in EXCLUDE]]
 
-    n = 1
-    dhw_profile_path = Path(dhw_profile_path)
-    dhw = pd.read_csv(dhw_profile_path, index_col=0) / n
-    dhw.columns = [str(c) for c in dhw.columns]
+    p_pv_cols: list[np.ndarray] = []
+    p_ue_cols: list[np.ndarray] = []
+    p_el_heater_cols: list[np.ndarray] = []
 
-    p_pv_cols, p_ue_cols, p_el_heater_cols, dhw_cols = [], [], [], []
-
-    size_elh = []
-    vol_hss_water = []
-    user_names = []
-
-    T_env_u = []
-    T_min_u = []
-    T_max_u = []
-    a_hss_u = []
-    T_in_u = []
-    T_out_u = []
-    eta_elh_u = []
-    t_hss_min_in_u = []
-
-    size_bess = []
-    eta_bess_in_u = []
-    eta_bess_out_u = []
-    eta_bess_stor_u = []
-    soc_bess_min_u = []
-    soc_bess_max_u = []
-    t_bess_min_u = []
+    size_elh: list[float] = []
+    vol_hss_water: list[float] = []
+    size_bess: list[float] = []
+    eta_bess_in_u: list[float] = []
+    eta_bess_out_u: list[float] = []
+    eta_bess_stor_u: list[float] = []
+    soc_bess_min_u: list[float] = []
+    soc_bess_max_u: list[float] = []
+    t_bess_min_u: list[float] = []
+    user_names: list[str] = []
 
     for user_key in users_list:
         ypath = _find_user_yaml(search_roots, user_key)
@@ -127,225 +107,329 @@ list[str],  # user_names
             continue
 
         u = yaml.safe_load(ypath.read_text(encoding="utf-8")) or {}
-        units = (u.get("units") or {})
+        units = u.get("units") or {}
         name = (units.get("name") or {}).get("name", str(user_key))
         user_names.append(name)
 
-        # --- UE (villamos fogyasztás) ---
         ue = units.get("ue") or {}
         ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
-        ue_size = float(ue.get("size")) if ue.get("size") is not None else None
-        if ue_prof and ue_prof in df.columns and ue_size is not None:
-            base = _aggregate_to_hourly(df[ue_prof].to_numpy())
-            p_ue_cols.append(_norm_to_annual(base, ue_size))
+        if ue_prof and ue_prof in df.columns:
+            p_ue_cols.append(_power_profile_kw_from_energy(df[ue_prof].to_numpy(), dt))
         else:
-            p_ue_cols.append(np.zeros(8760))
+            p_ue_cols.append(np.zeros(35040, dtype=float))
 
-        # --- PV (termelés) ---
-        n_pv = 7.0
         pv = units.get("pv") or {}
         pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
-        pv_size = float(pv.get("size")) if pv.get("size") is not None else None
-        if pv_prof and pv_prof in df.columns and pv_size is not None:
-            base = _aggregate_to_hourly(df[pv_prof].to_numpy())
-            p_pv_cols.append(_norm_to_annual(base, pv_size / n_pv))
+        if pv_prof and pv_prof in df.columns:
+            p_pv_cols.append(_power_profile_kw_from_energy(df[pv_prof].to_numpy(), dt) * float(pv_ratio))
         else:
-            p_pv_cols.append(np.zeros(8760))
-
-        # BESS
+            p_pv_cols.append(np.zeros(35040, dtype=float))
 
         bess = units.get("bess") or {}
         size_bess.append(float(bess.get("bess_size", 0.0)))
         eta_bess_in_u.append(float(bess.get("eta_bess_in", 0.98)))
         eta_bess_out_u.append(float(bess.get("eta_bess_out", 0.96)))
         eta_bess_stor_u.append(float(bess.get("eta_bess_stor", 0.995)))
-        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.2)))
-        soc_bess_max_u.append(float(bess.get("soc_bess_max", 1.0)))
+        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.10)))
+        soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.90)))
         t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
 
-        # --- HSS / UT (bojleres hőtároló, ELH szolgálja ki) ---
         hss = units.get("hss") or {}
         heater = units.get("ut") or {}
-
-        if use_hss:
-            # DHW profil: liter → kW (kWh/h), órára aggregálva
-            if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-                base_L_per_step = dhw[str(hss["profile"])].to_numpy()
-                base_L_per_hour = _aggregate_to_hourly(base_L_per_step)
-
-                RHO_WATER_KG_PER_L = 1.0
-                CP_WATER_J_PER_KGK = 4186.0
-                J_PER_KWH = 3_600_000.0
-                KWH_PER_L_PER_K = RHO_WATER_KG_PER_L * CP_WATER_J_PER_KGK / J_PER_KWH
-
-                T_in = float(hss.get("T_in", 10))
-                T_out = float(hss.get("T_out", 55))
-                dT = max(0.0, T_out - T_in)
-
-                # órás energiaigény [kWh / óra-lépés]
-                e_kwh_per_hour = base_L_per_hour * KWH_PER_L_PER_K * dT
-                dhw_cols.append(e_kwh_per_hour.astype(float))
-            else:
-                dhw_cols.append(np.zeros(8760, dtype=float))
+        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
+        if p_el_heater_prof and p_el_heater_prof in df.columns:
+            p_el_heater_cols.append(_power_profile_kw_from_energy(df[p_el_heater_prof].to_numpy(), dt))
         else:
-            # Ha nincs HSS, de van UT profil éves energiával (elektromos betét profil)
-            p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-            heater_number = float(heater.get("size")) if heater.get("size") is not None else None
-            if p_el_heater_prof and p_el_heater_prof in df.columns and heater_number is not None:
-                base = _aggregate_to_hourly(df[p_el_heater_prof].to_numpy())
-                p_el_heater_cols.append(_norm_to_annual(base, heater_number))
-            else:
-                p_el_heater_cols.append(np.zeros(8760, dtype=float))
+            p_el_heater_cols.append(np.zeros(35040, dtype=float))
 
-        # Ha nincs HSS, akkor nulla méretű bojlert feltételezünk
         size_elh.append(float(hss.get("size_elh", 0.0)))
         vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
-        # kiegészítő HSS paraméterek (nem kötelezőek)
-        T_env_u.append(float(hss.get("T_env", 20)))
-        T_max_u.append(float(hss.get("T_max", 65)))
-        T_min_u.append(float(hss.get("T_min", 10)))
-        T_in_u.append(float(hss.get("T_in", 10)))
-        T_out_u.append(float(hss.get("T_out", 55)))
-        a_hss_u.append(float(hss.get("a_hss", 0.01275)))
-        eta_elh_u.append(float(hss.get("eta_elh", 0.95)))
-        t_hss_min_in_u.append(float(hss.get("t_hss_min_in", 0.0)))
 
     if not user_names:
         raise RuntimeError("Nincs érvényes felhasználó.")
 
-    # (T,U) mátrixok
-    size_elh = np.asarray(size_elh, float)
-    vol_hss_water = np.asarray(vol_hss_water, float)
-
-    U = len(user_names)
-
-    p_pv = np.column_stack(p_pv_cols).astype(float)
-    p_ue = np.column_stack(p_ue_cols).astype(float)
-
-    if use_hss:
-        p_dhw = np.column_stack(dhw_cols).astype(float) if dhw_cols else np.zeros((8760, U), float)
-        p_el_heater = np.zeros((8760, U), float)  # HSS módban nem használjuk az ELH profilt
-    else:
-        p_dhw = np.zeros((8760, U), float)
-        p_el_heater = np.column_stack(p_el_heater_cols).astype(float) if p_el_heater_cols else np.zeros((8760, U),
-                                                                                                        float)
-
-    return (p_pv, p_ue, p_dhw, p_el_heater, np.asarray(size_elh, float), np.asarray(vol_hss_water, float),
-            np.asarray(size_bess, float), np.asarray(eta_bess_in_u, float), np.asarray(eta_bess_out_u, float),
-            np.asarray(eta_bess_stor_u, float), np.asarray(soc_bess_min_u, float), np.asarray(soc_bess_max_u, float),
-            np.asarray(t_bess_min_u, float), T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
-            user_names,)
+    return (
+        np.column_stack(p_pv_cols).astype(float),
+        np.column_stack(p_ue_cols).astype(float),
+        np.column_stack(p_el_heater_cols).astype(float),
+        np.asarray(size_elh, dtype=float),
+        np.asarray(vol_hss_water, dtype=float),
+        np.asarray(size_bess, dtype=float),
+        np.asarray(eta_bess_in_u, dtype=float),
+        np.asarray(eta_bess_out_u, dtype=float),
+        np.asarray(eta_bess_stor_u, dtype=float),
+        np.asarray(soc_bess_min_u, dtype=float),
+        np.asarray(soc_bess_max_u, dtype=float),
+        np.asarray(t_bess_min_u, dtype=float),
+        user_names,
+    )
 
 
-# --- runner --------------------------------------------------------------------
+def _select_bess_users(
+    p_pv: np.ndarray,
+    size_bess: np.ndarray,
+    bess_share_pct: float,
+    include_bess: bool = True,
+    dt: float = 0.25,
+) -> np.ndarray:
+    """Deterministikus BESS-kiosztás: csak PV-s háztartások közül választ."""
+    U = p_pv.shape[1]
+    enabled = np.zeros(U, dtype=bool)
+    if not include_bess:
+        return enabled
 
-def run(sim_yaml: os.PathLike, profiles_csv: os.PathLike, dhw_profiles_csv: os.PathLike, out_dir: os.PathLike,
-        max_users: int = 10, run_lp: bool = True, pv_ratio: float = 1.0, use_hss: bool = True, ) -> dict:
-    (p_pv, p_ue, p_dhw, p_el_heater, size_elh, vol_hss_water, size_bess, eta_bess_in_u, eta_bess_out_u, eta_bess_stor_u,
-     soc_bess_min_u, soc_bess_max_u, t_bess_min_u, T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u,
-     t_hss_min_in_u, user_names) = build_inputs(sim_yaml_path=sim_yaml, profiles_csv_path=profiles_csv,
-        dhw_profile_path=dhw_profiles_csv, max_users=max_users, pv_ratio=pv_ratio, use_hss=use_hss, )
+    has_pv_arr = p_pv.sum(axis=0) * dt > 1e-9
+    candidates = np.where(has_pv_arr)[0]
+    candidates = np.array([u for u in candidates if float(size_bess[u]) > 1e-9], dtype=int)
 
-    print(f"[INFO] Betöltött felhasználók száma: {len(user_names)} → "
-          f"{', '.join(user_names[:10])}{'...' if len(user_names) > 10 else ''}")
+    n = int(round(len(candidates) * float(bess_share_pct) / 100.0))
+    n = max(0, min(n, len(candidates)))
+    enabled[candidates[:n]] = True
+    return enabled
 
-    import numpy as np
-    ue_active = int(((p_ue > 1e-9).sum(axis=0) > 0).sum())
-    pv_active = int(((p_pv > 1e-9).sum(axis=0) > 0).sum())
-    hss_active = int(((p_dhw > 1e-9).sum(axis=0) > 0).sum())
-    elh_active = int(((p_el_heater > 1e-9).sum(axis=0) > 0).sum())
-    print(
-        f"[INFO] Aktív oszlopok — UE:{ue_active}, PV:{pv_active}, HSS:{hss_active}, ELH:{elh_active}, Use HSS:{use_hss} / {p_ue.shape[1]}")
 
-    # --- hívjuk az optimalizálót ------------------------------------------------
-    # optimize_multi_users pontos interface-e: p_pv/p_ue/p_ut alak (T,U), dt, size_elh, size_bess, vol_hss_water stb. :contentReference[oaicite:2]{index=2}
-    results, status, objective, n_vars, n_cons, infeas_gap = optimize_multi_users_economic(p_pv=p_pv, p_ue=p_ue,
-        p_dhw=p_dhw, p_el_heater=p_el_heater, dt=1.0, hss_flag=use_hss, size_elh=size_elh, vol_hss_water=vol_hss_water,
-        size_bess=size_bess, eta_bess_in=eta_bess_in_u, eta_bess_out=eta_bess_out_u, eta_bess_stor=eta_bess_stor_u,
-        soc_bess_min=soc_bess_min_u, soc_bess_max=soc_bess_max_u, t_bess_min=t_bess_min_u, T_env=T_env_u, T_max=T_max_u,
-        T_min=T_min_u, T_in=T_in_u, a_hss=a_hss_u, eta_elh=eta_elh_u, run_lp=run_lp, msg=True, gapRel=0.01,
-        timeLimit=None, t_hss_min_in=t_hss_min_in_u, )
+def run(
+    sim_yaml: os.PathLike,
+    profiles_csv: os.PathLike,
+    out_dir: os.PathLike,
+    max_users: int = 10,
+    run_lp: bool = False,
+    pv_ratio: float = 1.0,
+    bess_share_pct: float = 100.0,
+    include_bess: bool = True,
+    boiler_tariff: str = "B",
+    objective: str = "bill",
+    sharing_mode: str = "proportional",
+    pairing_mode: str | None = None,
+    bess_min_mode_steps: int = 4,
+    gap_rel: float | None = 0.005,
+    time_limit: float | None = None,
+    msg: bool = False,
+    save_user_timeseries: bool = True,
+) -> dict:
+    dt = 0.25
+    boiler_tariff = str(boiler_tariff).upper().strip()
+    if boiler_tariff not in {"A", "B"}:
+        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
-    # --- kimenetek mentése ------------------------------------------------------
+    (
+        p_pv,
+        p_ue,
+        p_el_heater,
+        _size_elh,
+        _vol_hss_water,
+        size_bess,
+        eta_bess_in_u,
+        eta_bess_out_u,
+        eta_bess_stor_u,
+        soc_bess_min_u,
+        soc_bess_max_u,
+        t_bess_min_u,
+        user_names,
+    ) = build_inputs(
+        sim_yaml_path=sim_yaml,
+        profiles_csv_path=profiles_csv,
+        max_users=max_users,
+        pv_ratio=pv_ratio,
+        dt=dt,
+    )
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Community (1D sorozatok)
-    comm = pd.DataFrame(
-        {"p_inj_comm": results["p_inj_comm"], "p_with_comm": results["p_with_comm"], "p_grid_in": results["p_grid_in"],
-            "p_grid_out": results["p_grid_out"], "p_grid_bess_total": results["p_grid_bess_total"],
-            "p_bess_in_total": results["p_bess_in_total"], "p_bess_out_total": results["p_bess_out_total"],
-            "e_bess_total": results["e_bess_total"], "d_bess_any": results["d_bess_any"],
-            "d_grid": results["d_grid"], })
-    comm.to_csv(out / "community_timeseries.csv", index=False)
+    bess_enabled_arr = _select_bess_users(
+        p_pv=p_pv,
+        size_bess=size_bess,
+        bess_share_pct=bess_share_pct,
+        include_bess=include_bess,
+        dt=dt,
+    )
 
-    # Per-user mátrixok (T×U) → CSV (oszlopok: user_names)
-    def save_mat(filename: str, key: str):
-        if key in results and isinstance(results[key], np.ndarray) and results[key].ndim == 2:
-            pd.DataFrame(results[key], columns=user_names).to_csv(out / filename, index=False)
+    has_pv_arr = p_pv.sum(axis=0) * dt > 1e-9
+    print(f"[INFO] Háztartások száma: {len(user_names)}")
+    print(f"[INFO] PV-s háztartások száma: {int(has_pv_arr.sum())}")
+    print(f"[INFO] BESS arány: {bess_share_pct}%")
+    print(f"[INFO] BESS-t kapó háztartások száma: {int(bess_enabled_arr.sum())}")
+    print(f"[INFO] Objective: {objective}")
+    print(f"[INFO] Boiler tariff: {boiler_tariff}")
+    print(f"[INFO] Sharing mode: {sharing_mode}")
 
-    save_mat("p_pv_load.csv", "p_pv_load")
-    save_mat("p_pv_bess.csv", "p_pv_bess")
-    save_mat("p_pv_elh.csv", "p_pv_elh")
-    save_mat("p_pv_rec.csv", "p_pv_rec")
-    save_mat("p_grid_load.csv", "p_grid_load")
-    save_mat("p_grid_bess.csv", "p_grid_bess")
-    save_mat("p_rec_load.csv", "p_rec_load")
-    save_mat("p_rec_elh.csv", "p_rec_elh")
-    save_mat("p_grid_elh.csv", "p_grid_elh")
-    save_mat("p_bess_load.csv", "p_bess_load")
-    save_mat("e_bess.csv", "e_bess")
-    save_mat("p_hss_in.csv", "p_hss_in")
-    save_mat("p_hss_out.csv", "p_hss_out")
-    save_mat("t_hss.csv", "t_hss")
-    save_mat("p_with_user.csv", "p_with_user")
-    save_mat("p_inj_user.csv", "p_inj_user")
+    result = disaggregated_opt_bess_shared(
+        p_pv=p_pv,
+        p_ue=p_ue,
+        p_el_heater=p_el_heater,
+        dt=dt,
+        user_names=user_names,
+        bess_enabled=bess_enabled_arr,
+        size_bess=size_bess,
+        eta_bess_in=eta_bess_in_u,
+        eta_bess_out=eta_bess_out_u,
+        eta_bess_stor=eta_bess_stor_u,
+        soc_bess_min=soc_bess_min_u,
+        soc_bess_max=soc_bess_max_u,
+        soc_bess_init=0.5,
+        t_bess_min=t_bess_min_u,
+        boiler_tariff=boiler_tariff,
+        objective=objective,  # bill vagy grid
+        run_lp=run_lp,
+        msg=msg,
+        gapRel=gap_rel,
+        timeLimit=time_limit,
+        bess_min_mode_steps=bess_min_mode_steps,
+        sharing_mode=sharing_mode,
+        pairing_mode=pairing_mode,
+    )
 
-    pd.DataFrame([results["e_grid_low"]], columns=user_names).to_csv(out / "e_grid_low.csv", index=False)
-    pd.DataFrame([results["e_grid_high"]], columns=user_names).to_csv(out / "e_grid_high.csv", index=False)
+    result["summary"]["out_dir"] = str(out)
+    result["summary"]["bess_share_pct"] = float(bess_share_pct)
+    result["summary"]["pv_ratio"] = float(pv_ratio)
+    result["summary"]["include_bess"] = bool(include_bess)
 
-    # Itt vannak gazdasági számítások is
-    pd.DataFrame({"user_name": user_names, "grid_cost_Ft": results["grid_cost_user"],
-        "rec_buy_cost_Ft": results["rec_buy_cost_user"], "rec_sell_revenue_Ft": results["rec_sell_revenue_user"],
-        "grid_export_revenue_Ft": results["grid_export_revenue_user"],
-        "net_cost_Ft": results["net_cost_user"], }).to_csv(out / "user_bills.csv", index=False)
+    save_disaggregated_opt_results(result, out, save_user_timeseries=save_user_timeseries)
+    print(json.dumps(result["summary"], indent=2, ensure_ascii=False))
+    return result["summary"]
 
-    summary = {"status": int(status), "objective": float(objective), "n_vars": int(n_vars), "n_cons": int(n_cons),
-        "infeas_gap": float(infeas_gap) if isinstance(infeas_gap, (int, float, np.floating)) else None,
-        "U_users": int(p_pv.shape[1]), "T_steps": int(p_pv.shape[0]), "user_names": user_names, "out_dir": str(out), }
-    (out / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def run_case(
+    case_name: str,
+    sim_yaml: os.PathLike,
+    profiles_csv: os.PathLike,
+    dhw_profiles_csv: os.PathLike | None = None,
+    out_dir: os.PathLike = "results_disaggregated_opt_bess_shared",
+    max_users: int = 105,
+    *,
+    include_bess: bool = True,
+    bess_share_pct: float = 100.0,
+    boiler_tariff: str = "B",
+    sharing_mode: str = "proportional",
+    objective: str = "bill",
+    run_lp: bool = False,
+    pv_ratio: float = 1.0,
+    bess_min_mode_steps: int = 4,
+    gap_rel: float | None = 0.005,
+    time_limit: float | None = None,
+    msg: bool = False,
+    save_user_timeseries: bool = True,
+) -> dict:
+    """Egyszerű hívó wrapper. A dhw_profiles_csv itt csak kompatibilitási paraméter;
+    az optimalizált kód a bojlerprofilt a profiles_csv-ből olvassa."""
+    summary = run(
+        sim_yaml=sim_yaml,
+        profiles_csv=profiles_csv,
+        out_dir=out_dir,
+        max_users=max_users,
+        run_lp=run_lp,
+        pv_ratio=pv_ratio,
+        bess_share_pct=bess_share_pct,
+        include_bess=include_bess,
+        boiler_tariff=boiler_tariff,
+        objective=objective,
+        sharing_mode=sharing_mode,
+        pairing_mode=None,
+        bess_min_mode_steps=bess_min_mode_steps,
+        gap_rel=gap_rel,
+        time_limit=time_limit,
+        msg=msg,
+        save_user_timeseries=save_user_timeseries,
+    )
+    summary["case_name"] = case_name
     return summary
 
 
-# --- CLI -----------------------------------------------------------------------
-def main(argv: list[str] | None = None):
-    # Ha nincs argumentum, kattintásos mód
-    if argv is None and len(sys.argv) == 1:
-        summary = run(sim_yaml="../Inputs/simulation_config_disaggregated_pv_original_increase_1.0.yaml",
-            profiles_csv="../Inputs/measurements_disaggregated_pv_original_increase_1.0.csv",
-            dhw_profiles_csv="../Inputs/dhw.csv", out_dir=r".\results_disaggregated_hourly", max_users=105,
-            run_lp=False, pv_ratio=1.0, use_hss=True, )
-        print(json.dumps(summary, indent=2, ensure_ascii=False))
-        return
-
-    ap = argparse.ArgumentParser(description="Optimize multi-user from YAMLs (subset).")
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description="Disaggregált optimalizált BESS + energiaközösségi megosztás.")
     ap.add_argument("--sim", required=True, help="Path to simulation_config YAML.")
     ap.add_argument("--profiles", required=True, help="Path to disaggregated profiles CSV.")
-    ap.add_argument("--dhw_profiles", help="Domestic hot water profiles CSV.")
-    ap.add_argument("--out", default="results_subset", help="Output directory.")
-    ap.add_argument("--max-users", type=int, default=10, help="Első N user a users_list-ből.")
-    ap.add_argument("--pv-ratio", type=float, default=1.0, help="PV éves energia szorzó.")
-    ap.add_argument("--use-hss", action="store_true", help="HSS logika (ΔT·c_víz) használata.")
-    ap.add_argument("--no-use-hss", dest="use_hss", action="store_false")
-    ap.set_defaults(use_hss=True)
-    ap.add_argument("--mip", action="store_true", help="Bináris változók bekapcsolása (alap: LP).")
+    ap.add_argument("--out", default="results_disaggregated_opt_bess_shared", help="Output directory.")
+    ap.add_argument("--max-users", type=int, default=10)
+    ap.add_argument("--pv-ratio", type=float, default=1.0)
+    ap.add_argument("--bess-share-pct", type=float, default=100.0)
+    ap.add_argument("--no-bess", action="store_true", help="BESS kikapcsolása.")
+    ap.add_argument("--lp", action="store_true", help="LP relaxáció, binárisok nélkül.")
+    ap.add_argument("--boiler-tariff", choices=["A", "B"], default="B")
+    ap.add_argument("--objective", choices=["bill", "grid"], default="bill")
+    ap.add_argument("--sharing-mode", choices=["proportional", "equal"], default="proportional", help="Fizikai megosztási mód a vevői oldalon: proportional vagy equal.")
+    ap.add_argument("--pairing-mode", choices=["proportional", "equal"], default=None, help="Eladó-vevő pénzügyi párosítás. Ha nincs megadva, megegyezik a sharing-mode-dal.")
+    ap.add_argument("--bess-min-mode-steps", type=int, default=4, help="Minimum BESS üzemmódhossz 15 perces lépésekben. 4 = 1 óra.")
+    ap.add_argument("--gap-rel", type=float, default=0.005)
+    ap.add_argument("--time-limit", type=float, default=None)
+    ap.add_argument("--msg", action="store_true")
+    ap.add_argument("--no-user-timeseries", action="store_true", help="Ne írjon külön timeseries_*.csv fájlokat háztartásonként.")
     args = ap.parse_args(argv)
 
-    summary = run(sim_yaml=args.sim, profiles_csv=args.profiles, out_dir=args.out, max_users=args.max_users,
-        run_lp=not args.mip, pv_ratio=args.pv_ratio, use_hss=args.use_hss, dhw_profiles_csv=args.dhw_profiles, )
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    run(
+        sim_yaml=args.sim,
+        profiles_csv=args.profiles,
+        out_dir=args.out,
+        max_users=args.max_users,
+        run_lp=args.lp,
+        pv_ratio=args.pv_ratio,
+        bess_share_pct=args.bess_share_pct,
+        include_bess=not args.no_bess,
+        boiler_tariff=args.boiler_tariff,
+        objective=args.objective,
+        sharing_mode=args.sharing_mode,
+        pairing_mode=args.pairing_mode,
+        bess_min_mode_steps=args.bess_min_mode_steps,
+        gap_rel=args.gap_rel,
+        time_limit=args.time_limit,
+        msg=args.msg,
+        save_user_timeseries=not args.no_user_timeseries,
+    )
 
 
-# Notes: a 2b esethez fogjuk használni
+SIM_YAML = "../Input/simulation_config_disaggregated_with_userlist.yaml"
+PROFILES_CSV = "../Input/measurements_disaggregated.csv"
+DHW_PROFILES_CSV = "../Input/dhw.csv"
+
+MAX_USERS = 105
+
+INCLUDE_BESS = True
+BESS_SHARE_PCT = 100.0
+
+# "A": bojler ugyanazon a körön van, saját PV/BESS is kiszolgálhatja.
+# "B": bojler külön körön van, saját PV/BESS nem szolgálhatja ki,
+#      de közösségi megosztott energiát kaphat.
+BOILER_TARIFF: str = "B"
+
+# "proportional": fogyasztásarányosan osztja a megosztott energiát.
+# "equal": egyenlő kvótát próbál adni minden aktív hiányos vevőnek.
+SHARING_MODE: str = "proportional"
+
+OBJECTIVE = "bill"
+RUN_LP = False
+PV_RATIO = 1.0
+BESS_MIN_MODE_STEPS = 4
+GAP_REL = 0.005
+TIME_LIMIT = None
+MSG = False
+SAVE_USER_TIMESERIES = True
+
+CASE_NAME = f"opt_community_{BOILER_TARIFF}_{SHARING_MODE}"
+OUT_DIR = f"results_opt_community_{BOILER_TARIFF}_{SHARING_MODE}"
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        main()
+    else:
+        summary = run_case(
+            case_name=CASE_NAME,
+            sim_yaml=SIM_YAML,
+            profiles_csv=PROFILES_CSV,
+            dhw_profiles_csv=DHW_PROFILES_CSV,
+            out_dir=OUT_DIR,
+            max_users=MAX_USERS,
+            include_bess=INCLUDE_BESS,
+            bess_share_pct=BESS_SHARE_PCT,
+            boiler_tariff=BOILER_TARIFF,
+            sharing_mode=SHARING_MODE,
+            objective=OBJECTIVE,
+            run_lp=RUN_LP,
+            pv_ratio=PV_RATIO,
+            bess_min_mode_steps=BESS_MIN_MODE_STEPS,
+            gap_rel=GAP_REL,
+            time_limit=TIME_LIMIT,
+            msg=MSG,
+            save_user_timeseries=SAVE_USER_TIMESERIES,
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
