@@ -394,7 +394,7 @@ BOILER_TARIFF: str = "B"
 
 # "proportional": fogyasztásarányosan osztja a megosztott energiát.
 # "equal": egyenlő kvótát próbál adni minden aktív hiányos vevőnek.
-SHARING_MODE: str = "proportional"
+SHARING_MODE: str = "equal"
 
 OBJECTIVE = "bill"
 RUN_LP = False
@@ -432,4 +432,3 @@ if __name__ == "__main__":
             msg=MSG,
             save_user_timeseries=SAVE_USER_TIMESERIES,
         )
-        print(json.dumps(summary, indent=2, ensure_ascii=False))

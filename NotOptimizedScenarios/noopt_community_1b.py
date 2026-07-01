@@ -1018,7 +1018,7 @@ DHW_PROFILES_CSV = "../Input/dhw.csv"
 MAX_USERS = 105
 
 INCLUDE_BESS = True
-BESS_SHARE_PCT = 100.0
+BESS_SHARE_PCT = 0
 
 # "A": bojler ugyanazon a körön van,
 #      saját PV/BESS is kiszolgálhatja.
@@ -1033,7 +1033,8 @@ SHARING_MODE: SharingMode = "proportional"
 
 CASE_NAME = f"nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
 OUT_DIR = f"results_nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
-
+if BESS_SHARE_PCT == 0:
+    OUT_DIR = f"results_nonopt_community_basecase"
 if __name__ == "__main__":
     run_case_disaggregated_nonopt_shared(
         case_name=CASE_NAME,

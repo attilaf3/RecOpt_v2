@@ -15,7 +15,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.append(str(HERE))
-from individual_opt_boiler import \
+from OptimizedIndividualScenarios.individual_opt_boiler import \
     individual_opt_boiler # expects (T,U) arrays, sizes, etc. :contentReference[oaicite:1]{index=1}
 
 
