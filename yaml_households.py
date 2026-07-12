@@ -44,7 +44,8 @@ def run_yaml_inventory(
     EXCLUDE = {"battery", "bess", "community"}
     users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
 
-    users_roots = [sim_yaml.parent / "Users", sim_yaml.parent]
+    # users_roots = [sim_yaml.parent / "Users", sim_yaml.parent]
+    users_roots = [sim_yaml.parent / "Users_v2", sim_yaml.parent]
 
     rows = []
     missing = 0

@@ -32,6 +32,29 @@ def _load_matrix(results_dir: Path, filename: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def _load_optional_household_series(
+    results_dir: Path,
+    filename: str,
+    household_name: str,
+) -> np.ndarray | None:
+    """
+    Opcionális idősor betöltése.
+
+    Ha a fájl nincs jelen, vagy a kiválasztott háztartás nem szerepel benne,
+    None értékkel tér vissza. Így a régebbi, bojlermodell nélküli
+    eredménymappák is továbbra is ábrázolhatók.
+    """
+    path = results_dir / filename
+    if not path.exists():
+        return None
+
+    df = pd.read_csv(path)
+    if household_name not in df.columns:
+        return None
+
+    return df[household_name].to_numpy(dtype=float)
+
+
 def _get_series(df: pd.DataFrame, household_name: str, filename: str) -> np.ndarray:
     if household_name not in df.columns:
         raise KeyError(
@@ -85,6 +108,24 @@ def _load_household_series(
     for key, filename in files.items():
         df = _load_matrix(results_dir, filename)
         out[key] = _get_series(df, household_name, filename)
+
+    # Dinamikus bojlermodellhez tartozó opcionális idősorok.
+    # A t_hss.csv csak akkor értelmezhető az adott háztartásra,
+    # ha a hőmérséklet-idősorban van pozitív, véges érték.
+    optional_files = {
+        "t_hss": "t_hss.csv",
+        "d_boiler_available": "d_boiler_available.csv",
+        "d_boiler_on": "d_boiler_on.csv",
+    }
+
+    for key, filename in optional_files.items():
+        values = _load_optional_household_series(
+            results_dir,
+            filename,
+            household_name,
+        )
+        if values is not None:
+            out[key] = values
 
     return out
 
@@ -181,21 +222,46 @@ def _plot_one_season(
     # oszlopszélesség órában
     bar_width = 0.8 * dt
 
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=2,
-        figsize=(22, 11),
-        gridspec_kw={
-            "width_ratios": [0.82, 0.18],
-            "height_ratios": [0.5, 0.5],
-        },
-        sharex="col",
+    # Az adott háztartásnál akkor tekintjük aktívnak a dinamikus
+    # bojlermodellt, ha van értelmezhető t_hss idősor.
+    t_hss_full = series.get("t_hss")
+    has_boiler_model = (
+        t_hss_full is not None
+        and len(t_hss_full) == T
+        and np.any(np.isfinite(t_hss_full) & (t_hss_full > 0.0))
     )
+
+    if has_boiler_model:
+        fig, axes = plt.subplots(
+            nrows=3,
+            ncols=2,
+            figsize=(22, 15),
+            gridspec_kw={
+                "width_ratios": [0.82, 0.18],
+                "height_ratios": [0.50, 0.25, 0.25],
+            },
+            sharex="col",
+        )
+    else:
+        fig, axes = plt.subplots(
+            nrows=2,
+            ncols=2,
+            figsize=(22, 11),
+            gridspec_kw={
+                "width_ratios": [0.82, 0.18],
+                "height_ratios": [0.5, 0.5],
+            },
+            sharex="col",
+        )
 
     ax = axes[0, 0]
     ax_leg = axes[0, 1]
     ax_soc = axes[1, 0]
     ax_soc_leg = axes[1, 1]
+
+    if has_boiler_model:
+        ax_temp = axes[2, 0]
+        ax_temp_leg = axes[2, 1]
 
     # ======================
     # 0 FELETT: bejövő teljesítmények
@@ -380,10 +446,96 @@ def _plot_one_season(
     )
     ax_soc_leg.axis("off")
 
+    # ======================
+    # Harmadik panel: HSS-hőmérséklet
+    # ======================
+    if has_boiler_model:
+        t_hss = np.asarray(t_hss_full[sl], dtype=float)
+
+        h_temp, = ax_temp.plot(
+            time_h,
+            t_hss,
+            linewidth=2.0,
+            label="HSS hőmérséklet",
+        )
+
+        temp_handles = [h_temp]
+        temp_labels = ["HSS hőmérséklet [°C]"]
+
+        d_boiler_available_full = series.get("d_boiler_available")
+        d_boiler_on_full = series.get("d_boiler_on")
+
+        ax_temp_ctrl = None
+        if (
+            d_boiler_available_full is not None
+            or d_boiler_on_full is not None
+        ):
+            ax_temp_ctrl = ax_temp.twinx()
+
+        if d_boiler_available_full is not None:
+            d_available = np.asarray(
+                d_boiler_available_full[sl],
+                dtype=float,
+            )
+            h_available, = ax_temp_ctrl.step(
+                time_h,
+                d_available,
+                where="post",
+                linewidth=1.3,
+                alpha=0.65,
+                label="Bojler engedélyezve",
+            )
+            temp_handles.append(h_available)
+            temp_labels.append("Bojler engedélyezve")
+
+        if d_boiler_on_full is not None:
+            d_on = np.asarray(
+                d_boiler_on_full[sl],
+                dtype=float,
+            )
+            h_on, = ax_temp_ctrl.step(
+                time_h,
+                d_on,
+                where="post",
+                linewidth=1.5,
+                alpha=0.85,
+                label="Bojler bekapcsolva",
+            )
+            temp_handles.append(h_on)
+            temp_labels.append("Bojler bekapcsolva")
+
+        ax_temp.set_ylabel("Hőmérséklet [°C]")
+        ax_temp.set_xlabel("Idő [h]")
+        ax_temp.set_title("Bojlertartály hőmérsékletének alakulása")
+        ax_temp.grid(True, alpha=0.3)
+
+        finite_temp = t_hss[np.isfinite(t_hss) & (t_hss > 0.0)]
+        if finite_temp.size:
+            temp_min = float(np.min(finite_temp))
+            temp_max = float(np.max(finite_temp))
+            margin = max(2.0, 0.10 * max(temp_max - temp_min, 1.0))
+            ax_temp.set_ylim(temp_min - margin, temp_max + margin)
+
+        if ax_temp_ctrl is not None:
+            ax_temp_ctrl.set_ylabel("Vezérlőjel [-]")
+            ax_temp_ctrl.set_ylim(-0.05, 1.05)
+            ax_temp_ctrl.set_yticks([0, 1])
+
+        ax_temp_leg.legend(
+            temp_handles,
+            temp_labels,
+            loc="center",
+            frameon=False,
+        )
+        ax_temp_leg.axis("off")
 
     fig.tight_layout()
 
-    out_png = results_dir / f"household_{household_name}_{season_key}_{WINDOW_DAYS}days_power_stack.png"
+    suffix = "power_stack_bess_boiler" if has_boiler_model else "power_stack_bess"
+    out_png = (
+        results_dir
+        / f"household_{household_name}_{season_key}_{WINDOW_DAYS}days_{suffix}.png"
+    )
     fig.savefig(out_png, dpi=DPI)
     plt.close(fig)
 
@@ -432,8 +584,8 @@ def plot_household_power_stack_seasons(
 
 if __name__ == "__main__":
     plot_household_power_stack_seasons(
-        results_dir=r"results_base_with_bess_A_tariff",
-        household_name="0420144888439778",
+        results_dir=r"results_nonopt_individual_B_0.0%bess_boiler_model",
+        household_name="0420144888377089",
         window_days=3,
         dt=DT,
     )

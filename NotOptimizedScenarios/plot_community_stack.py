@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
-RESULTS_DIR = r"./results_nonopt_community_B_proportional"  # run_case output mappája
+RESULTS_DIR = r"./results_nonopt_community_B_proportional_boiler_model_40.0%bess"  # run_case output mappája
 WINDOW_DAYS = 3                                      # hány nap / évszak
 DT = 0.25                                           # 15 perc = 0.25 h
 DPI = 300

@@ -2,14 +2,14 @@ from pathlib import Path
 import yaml
 
 # ---- Beállítások ----
-USERS_DIR = Path(r"Input/Users")   # ezt módosítsd, ha más a mappa útvonala
+USERS_DIR = Path(r"Input/Users_v2")   # ezt módosítsd, ha más a mappa útvonala
 
 # Csak a bojler / HSS hőmérsékletparaméterei
 HSS_TEMPERATURE_PARAMS = {
     "T_env": "20.0",
-    "T_in": "10.0",
+    "T_in": "12.0",
     "T_max": "65.0",
-    "T_min": "35.0",
+    "T_min": "12.0",
     "T_out": "40.0",
     "T_set": "50.0",
 }

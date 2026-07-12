@@ -30,12 +30,14 @@ nonopt_common importálható.
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Iterable, Literal, Optional
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from nonopt_common import (
     DT,
@@ -44,11 +46,398 @@ from nonopt_common import (
     LOW_TARIFF_FT_PER_KWH,
     LOW_TARIFF_LIMIT_KWH,
     _group_label,
-    build_inputs,
     plot_community_energy_balance,
     plot_household_percentiles_by_group,
     plot_household_percentiles_by_group_with_global_scurve,
 )
+
+
+C_HSS = 0.00116667  # kWh/(liter*K)
+
+
+def _as_15min_energy(profile: np.ndarray) -> np.ndarray:
+    """15 perces energia-idősor ellenőrzése [kWh/lépés]."""
+    p = np.asarray(profile, dtype=float).ravel()
+    if p.size != 35040:
+        raise ValueError(f"A profil hossza {p.size}, de 35040 kell.")
+    return np.maximum(p, 0.0)
+
+
+def _find_user_yaml(
+    roots: Iterable[os.PathLike],
+    name: str,
+) -> Optional[Path]:
+    for root in roots:
+        for candidate in (name, f"{name}.yaml"):
+            path = Path(root) / candidate
+            if path.exists():
+                return path
+    return None
+
+
+def _dhw_liter_to_thermal_power_kw(
+    dhw: pd.DataFrame,
+    hss: dict,
+    dt: float = DT,
+) -> np.ndarray:
+    """Liter/lépés DHW-profil átalakítása kW hőigénnyé."""
+    profile = hss.get("profile")
+    if profile is None or str(profile) not in dhw.columns:
+        return np.zeros(35040, dtype=float)
+
+    liters = np.maximum(
+        np.asarray(dhw[str(profile)].to_numpy(), dtype=float).ravel(),
+        0.0,
+    )
+    if liters.size != 35040:
+        raise ValueError(f"A DHW profil hossza {liters.size}, de 35040 kell.")
+
+    T_in = float(hss.get("T_in", 10.0))
+    T_out = float(hss.get("T_out", 40.0))
+    return liters * C_HSS * max(T_out - T_in, 0.0) / float(dt)
+
+
+def build_inputs(
+    sim_yaml_path: os.PathLike,
+    profiles_csv_path: os.PathLike,
+    dhw_profile_path: os.PathLike,
+    max_users: int = 10,
+    search_roots: Iterable[os.PathLike] | None = None,
+):
+    """
+    Közös bemenetolvasó.
+
+    A fix UT-profil minden felhasználónál megmarad. A HSS/DHW paramétereket
+    azért is beolvassa, hogy PV-s háztartásnál dinamikus bojlermodell
+    válthassa fel a fix profilt.
+    """
+    sim_yaml_path = Path(sim_yaml_path)
+    profiles_csv_path = Path(profiles_csv_path)
+    dhw_profile_path = Path(dhw_profile_path)
+
+    if search_roots is None:
+        search_roots = [
+            sim_yaml_path.parent / "Users_v2",
+            sim_yaml_path.parent,
+        ]
+
+    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
+    users_list = list(sim.get("users_list", []))[: int(max_users)]
+
+    exclude = {"battery", "bess", "community"}
+    users_list = [
+        user for user in users_list
+        if str(user).strip().lower() not in exclude
+    ]
+    if not users_list:
+        raise RuntimeError(
+            "A simulation YAML nem tartalmaz users_list-et vagy max_users=0."
+        )
+
+    profiles = pd.read_csv(profiles_csv_path, index_col=0)
+    profiles.columns = [str(column) for column in profiles.columns]
+    profiles = profiles[
+        [column for column in profiles.columns if column.lower() not in exclude]
+    ]
+
+    dhw = pd.read_csv(dhw_profile_path, index_col=0)
+    dhw.columns = [str(column) for column in dhw.columns]
+
+    e_pv_cols = []
+    e_ue_cols = []
+    e_el_heater_fixed_cols = []
+    p_dhw_cols = []
+    user_names = []
+
+    size_bess = []
+    eta_bess_in = []
+    eta_bess_out = []
+    eta_bess_stor = []
+    soc_bess_min = []
+    soc_bess_max = []
+    t_bess_min = []
+
+    size_elh = []
+    vol_hss_water = []
+    T_env = []
+    T_max = []
+    T_min = []
+    T_in = []
+    T_set = []
+    a_hss = []
+    eta_elh = []
+
+    for user_key in users_list:
+        yaml_path = _find_user_yaml(search_roots, str(user_key))
+        if yaml_path is None:
+            print(f"[WARN] YAML nem található: {user_key} — kihagyom.")
+            continue
+
+        user_yaml = yaml.safe_load(
+            yaml_path.read_text(encoding="utf-8")
+        ) or {}
+        units = user_yaml.get("units") or {}
+
+        user_names.append(
+            str((units.get("name") or {}).get("name", user_key))
+        )
+
+        ue = units.get("ue") or {}
+        pv = units.get("pv") or {}
+        ut = units.get("ut") or {}
+        hss = units.get("hss") or {}
+        bess = units.get("bess") or {}
+
+        ue_profile = ue.get("profile")
+        pv_profile = pv.get("profile")
+        ut_profile = ut.get("profile")
+
+        e_ue_cols.append(
+            _as_15min_energy(profiles[str(ue_profile)].to_numpy())
+            if ue_profile is not None and str(ue_profile) in profiles.columns
+            else np.zeros(35040, dtype=float)
+        )
+        e_pv_cols.append(
+            _as_15min_energy(profiles[str(pv_profile)].to_numpy())
+            if pv_profile is not None and str(pv_profile) in profiles.columns
+            else np.zeros(35040, dtype=float)
+        )
+        e_el_heater_fixed_cols.append(
+            _as_15min_energy(profiles[str(ut_profile)].to_numpy())
+            if ut_profile is not None and str(ut_profile) in profiles.columns
+            else np.zeros(35040, dtype=float)
+        )
+        p_dhw_cols.append(
+            _dhw_liter_to_thermal_power_kw(dhw, hss, dt=DT)
+        )
+
+        size_bess.append(float(bess.get("bess_size", 0.0)))
+        eta_bess_in.append(float(bess.get("eta_bess_in", 0.98)))
+        eta_bess_out.append(float(bess.get("eta_bess_out", 0.96)))
+        eta_bess_stor.append(float(bess.get("eta_bess_stor", 0.995)))
+        soc_bess_min.append(float(bess.get("soc_bess_min", 0.10)))
+        soc_bess_max.append(float(bess.get("soc_bess_max", 0.90)))
+        t_bess_min.append(float(bess.get("t_bess_min", 2.0)))
+
+        size_elh.append(float(hss.get("size_elh", 0.0)))
+        vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
+        T_env.append(float(hss.get("T_env", 20.0)))
+        T_max.append(float(hss.get("T_max", 65.0)))
+        T_min.append(float(hss.get("T_min", 38.0)))
+        T_in.append(float(hss.get("T_in", 10.0)))
+        T_set.append(
+            float(hss.get("T_set", hss.get("T_setpoint", 50.0)))
+        )
+        a_hss.append(float(hss.get("a_hss", 0.01275)))
+        eta_elh.append(float(hss.get("eta_elh", 0.95)))
+
+    if not user_names:
+        raise RuntimeError("Nincs érvényes felhasználó.")
+
+    return (
+        np.column_stack(e_pv_cols).astype(float),
+        np.column_stack(e_ue_cols).astype(float),
+        np.column_stack(e_el_heater_fixed_cols).astype(float),
+        np.column_stack(p_dhw_cols).astype(float),
+        np.asarray(size_bess, dtype=float),
+        np.asarray(eta_bess_in, dtype=float),
+        np.asarray(eta_bess_out, dtype=float),
+        np.asarray(eta_bess_stor, dtype=float),
+        np.asarray(soc_bess_min, dtype=float),
+        np.asarray(soc_bess_max, dtype=float),
+        np.asarray(t_bess_min, dtype=float),
+        np.asarray(size_elh, dtype=float),
+        np.asarray(vol_hss_water, dtype=float),
+        np.asarray(T_env, dtype=float),
+        np.asarray(T_max, dtype=float),
+        np.asarray(T_min, dtype=float),
+        np.asarray(T_in, dtype=float),
+        np.asarray(T_set, dtype=float),
+        np.asarray(a_hss, dtype=float),
+        np.asarray(eta_elh, dtype=float),
+        user_names,
+    )
+
+
+def _b_tariff_available(step: int, dt: float = DT) -> bool:
+    """B tarifa engedélyezése: 22–04 és 10–16."""
+    hour = (step * dt) % 24.0
+    return (
+        hour < 4.0
+        or 10.0 <= hour < 16.0
+        or hour >= 22.0
+    )
+
+
+def simulate_rule_based_hss(
+    p_dhw_kw: np.ndarray,
+    *,
+    size_elh_kw: float,
+    vol_hss_water_l: float,
+    T_env: float,
+    T_max: float,
+    T_min: float,
+    T_in: float,
+    T_set: float,
+    a_hss_kw_per_k: float,
+    eta_elh: float,
+    boiler_tariff: str,
+    dt: float = DT,
+) -> dict:
+    """Termosztatikus, nem optimalizált HSS-modell."""
+    p_dhw_kw = np.maximum(
+        np.asarray(p_dhw_kw, dtype=float).ravel(),
+        0.0,
+    )
+    T = len(p_dhw_kw)
+
+    tariff = str(boiler_tariff).upper().strip()
+    if tariff not in {"A", "B"}:
+        raise ValueError("boiler_tariff csak 'A' vagy 'B' lehet.")
+
+    result = {
+        "e_boiler": np.zeros(T, dtype=float),
+        "p_elh_in": np.zeros(T, dtype=float),
+        "p_hss_in": np.zeros(T, dtype=float),
+        "p_hss_out": p_dhw_kw.copy(),
+        "t_hss": np.zeros(T, dtype=float),
+        "d_boiler_available": np.zeros(T, dtype=float),
+        "d_boiler_on": np.zeros(T, dtype=float),
+        "temperature_violation": np.zeros(T, dtype=float),
+    }
+
+    if size_elh_kw <= 1e-9 or vol_hss_water_l <= 1e-9:
+        return result
+
+    thermal_capacity = vol_hss_water_l * C_HSS
+    temperature = float(np.clip(T_set, T_min, T_max))
+
+    for t in range(T):
+        available = tariff == "A" or _b_tariff_available(t, dt)
+        result["d_boiler_available"][t] = float(available)
+        result["t_hss"][t] = temperature
+
+        required_thermal_power = (
+            p_dhw_kw[t]
+            + a_hss_kw_per_k * (temperature - T_env)
+            + thermal_capacity * max(T_set - temperature, 0.0) / dt
+        )
+
+        if available:
+            p_elh = min(
+                size_elh_kw,
+                max(required_thermal_power, 0.0) / max(eta_elh, 1e-9),
+            )
+        else:
+            p_elh = 0.0
+
+        result["p_elh_in"][t] = p_elh
+        result["p_hss_in"][t] = eta_elh * p_elh
+        result["e_boiler"][t] = p_elh * dt
+        result["d_boiler_on"][t] = float(p_elh > 1e-9)
+
+        next_temperature = temperature + dt * (
+            eta_elh * p_elh
+            - p_dhw_kw[t]
+            - a_hss_kw_per_k * (temperature - T_env)
+        ) / thermal_capacity
+
+        if (
+            next_temperature < T_min - 1e-6
+            or next_temperature > T_max + 1e-6
+        ):
+            result["temperature_violation"][t] = 1.0
+
+        temperature = float(
+            np.clip(next_temperature, T_in, T_max)
+        )
+
+    return result
+
+
+def build_effective_boiler_profiles(
+    *,
+    e_pv: np.ndarray,
+    e_el_heater_fixed: np.ndarray,
+    p_dhw_kw: np.ndarray,
+    size_elh: np.ndarray,
+    vol_hss_water: np.ndarray,
+    T_env: np.ndarray,
+    T_max: np.ndarray,
+    T_min: np.ndarray,
+    T_in: np.ndarray,
+    T_set: np.ndarray,
+    a_hss: np.ndarray,
+    eta_elh: np.ndarray,
+    boiler_tariff: str,
+    use_boiler_model: bool = True,
+) -> dict:
+    """
+    PV-s és megfelelő HSS-adattal rendelkező háztartásnál dinamikus modellt
+    használ. PV nélkül, illetve hiányos HSS-adatnál a fix UT-profil marad.
+    """
+    T, U = e_pv.shape
+    e_boiler = np.asarray(e_el_heater_fixed, dtype=float).copy()
+
+    dynamic_boiler = np.zeros(U, dtype=bool)
+    t_hss = np.zeros((T, U), dtype=float)
+    p_elh_in = np.zeros((T, U), dtype=float)
+    p_hss_in = np.zeros((T, U), dtype=float)
+    p_hss_out = np.zeros((T, U), dtype=float)
+    d_boiler_available = np.zeros((T, U), dtype=float)
+    d_boiler_on = np.zeros((T, U), dtype=float)
+    temperature_violation = np.zeros((T, U), dtype=float)
+
+    has_pv = np.asarray(e_pv, dtype=float).sum(axis=0) > 1e-12
+
+    for u in range(U):
+        valid_hss = (
+            float(size_elh[u]) > 1e-9
+            and float(vol_hss_water[u]) > 1e-9
+            and float(np.sum(p_dhw_kw[:, u])) > 1e-9
+        )
+
+        if not (bool(use_boiler_model) and has_pv[u] and valid_hss):
+            continue
+
+        model = simulate_rule_based_hss(
+            p_dhw_kw[:, u],
+            size_elh_kw=float(size_elh[u]),
+            vol_hss_water_l=float(vol_hss_water[u]),
+            T_env=float(T_env[u]),
+            T_max=float(T_max[u]),
+            T_min=float(T_min[u]),
+            T_in=float(T_in[u]),
+            T_set=float(T_set[u]),
+            a_hss_kw_per_k=float(a_hss[u]),
+            eta_elh=float(eta_elh[u]),
+            boiler_tariff=boiler_tariff,
+            dt=DT,
+        )
+
+        e_boiler[:, u] = model["e_boiler"]
+        t_hss[:, u] = model["t_hss"]
+        p_elh_in[:, u] = model["p_elh_in"]
+        p_hss_in[:, u] = model["p_hss_in"]
+        p_hss_out[:, u] = model["p_hss_out"]
+        d_boiler_available[:, u] = model["d_boiler_available"]
+        d_boiler_on[:, u] = model["d_boiler_on"]
+        temperature_violation[:, u] = model["temperature_violation"]
+        dynamic_boiler[u] = True
+
+    return {
+        "e_boiler": e_boiler,
+        "dynamic_boiler": dynamic_boiler,
+        "t_hss": t_hss,
+        "p_dhw_kw": p_dhw_kw,
+        "p_elh_in_kw": p_elh_in,
+        "p_hss_in_kw": p_hss_in,
+        "p_hss_out_kw": p_hss_out,
+        "d_boiler_available": d_boiler_available,
+        "d_boiler_on": d_boiler_on,
+        "temperature_violation": temperature_violation,
+    }
+
 
 SHARED_BUYER_LOW_LIMIT_KWH = 2523.0
 SHARED_BUYER_LOW_FT_PER_KWH = 5.0
@@ -113,31 +502,26 @@ def _split_two_streams_by_shared_low_cap(
     Visszatér:
         grid_a_low, grid_a_high, shared_low, shared_high, new_remaining_low
 
-    Ha ugyanabban az időlépésben hálózati A-import és megosztott vásárlás is
-    van, a még rendelkezésre álló kedvezményes mennyiség arányosan oszlik meg
-    a két energiaáram között. Ez elkerüli az önkényes "előbb grid, aztán shared"
-    vagy fordított sorrendet.
+    Sorrend: először a közösségből vásárolt energia fogyasztja a még
+    rendelkezésre álló kedvezményes vevői sávot, és csak a maradék
+    kedvezményes keret jut az A-tarifás hálózati importra.
     """
     e_grid = max(float(e_grid_a_step), 0.0)
     e_shared = max(float(e_shared_in_step), 0.0)
-    total = e_grid + e_shared
     remaining = max(float(remaining_low_kwh), 0.0)
 
-    if total <= EPS:
+    if e_grid + e_shared <= EPS:
         return 0.0, 0.0, 0.0, 0.0, remaining
 
-    low_total = min(total, remaining)
-    high_total = total - low_total
+    shared_low = min(e_shared, remaining)
+    shared_high = max(e_shared - shared_low, 0.0)
+    remaining_after_shared = remaining - shared_low
 
-    grid_weight = e_grid / total
-    shared_weight = e_shared / total
+    grid_low = min(e_grid, remaining_after_shared)
+    grid_high = max(e_grid - grid_low, 0.0)
+    new_remaining = remaining_after_shared - grid_low
 
-    grid_low = low_total * grid_weight
-    shared_low = low_total * shared_weight
-    grid_high = high_total * grid_weight
-    shared_high = high_total * shared_weight
-
-    return grid_low, grid_high, shared_low, shared_high, remaining - low_total
+    return grid_low, grid_high, shared_low, shared_high, new_remaining
 
 
 def settle_shared_payments_buyer_tiered(
@@ -381,8 +765,8 @@ def simulate_nonopt_disaggregated_shared(
     ts_e_grid_to_bess = np.zeros((T, U), dtype=float)
 
     # Komponensenkénti követés.
-    # B tarifa esetén a saját PV/BESS csak az alapfogyasztást látja,
-    # a bojler csak a közösségi megosztásnál és a hálózatnál jelenik meg.
+    # B tarifa esetén a saját PV/BESS és a közösségi megosztás is csak
+    # az alapfogyasztást látja; a bojler kizárólag B tarifás hálózatból vételez.
     ts_e_local_to_base = np.zeros((T, U), dtype=float)
     ts_e_local_to_boiler = np.zeros((T, U), dtype=float)
     ts_e_base_deficit_before_share = np.zeros((T, U), dtype=float)
@@ -535,8 +919,8 @@ def simulate_nonopt_disaggregated_shared(
             if boiler_tariff == "A":
                 boiler_deficit = max(boiler_load_t - local_to_boiler, 0.0)
             else:
-                # B tarifás bojler: saját PV/BESS után is teljes egészében
-                # megosztásra/hálózatra váró külön bojlerigény.
+                # B tarifás bojler: külön körön maradó teljes bojlerigény;
+                # megosztásra nem jogosult, csak B tarifás hálózat látja el.
                 boiler_deficit = boiler_load_t
 
             ts_e_local_to_base[t, u] = local_to_base
@@ -547,7 +931,21 @@ def simulate_nonopt_disaggregated_shared(
             # BESS után még megmaradó pozíciók. BESS nem exportál közösségbe,
             # csak a saját PV-felesleg mehet megosztásba.
             ts_e_surplus_before_share[t, u] = max(remaining_pv, 0.0)
-            ts_e_deficit_before_share[t, u] = max(base_deficit + boiler_deficit, 0.0)
+
+            # Megosztásra jogosult hiány:
+            # - A tarifán: alapfogyasztás + bojler;
+            # - B tarifán: kizárólag az A-körös alapfogyasztás.
+            # A B tarifás bojler külön elszámolási kör, ezért közösségi
+            # megosztott energia sem fizikailag, sem elszámolásban nem jut rá.
+            if boiler_tariff == "A":
+                share_eligible_deficit = base_deficit + boiler_deficit
+            else:
+                share_eligible_deficit = base_deficit
+
+            ts_e_deficit_before_share[t, u] = max(
+                share_eligible_deficit,
+                0.0,
+            )
 
             if use_bess_u:
                 # Az eredetkövetés és SOC összegének kerekítési rendezése.
@@ -579,37 +977,69 @@ def simulate_nonopt_disaggregated_shared(
         ts_e_shared_in[t, :] = shared_in
         ts_e_shared_out[t, :] = shared_out
 
-        # A kapott közösségi energiát komponensenként is bontjuk.
-        # Itt arányos belső bontást használunk a háztartáson belüli
-        # alapfogyasztási és bojlerhiány között. Így B tarifánál egyértelműen
-        # látszik: e_shared_to_boiler és e_grid_to_boiler.
+        # A kapott közösségi energia komponensbontása.
         base_def = ts_e_base_deficit_before_share[t, :]
         boiler_def = ts_e_boiler_deficit_before_share[t, :]
-        total_def = np.maximum(base_def + boiler_def, 0.0)
-        boiler_ratio = np.divide(boiler_def, total_def, out=np.zeros_like(boiler_def), where=total_def > EPS)
 
-        shared_to_boiler = np.minimum(boiler_def, shared_in * boiler_ratio)
-        shared_to_base = np.minimum(base_def, shared_in - shared_to_boiler)
-
-        # Kerekítési korrekció: ha a proportional belső bontás miatt marad pár Wh,
-        # először az alapfogyasztás, utána a bojler kapja.
-        rem_shared = np.maximum(shared_in - shared_to_base - shared_to_boiler, 0.0)
-        add_base = np.minimum(np.maximum(base_def - shared_to_base, 0.0), rem_shared)
-        shared_to_base += add_base
-        rem_shared = np.maximum(rem_shared - add_base, 0.0)
-        add_boiler = np.minimum(np.maximum(boiler_def - shared_to_boiler, 0.0), rem_shared)
-        shared_to_boiler += add_boiler
+        if boiler_tariff == "B":
+            # B tarifa: a megosztott energia kizárólag az alapfogyasztásra
+            # számolható el. A bojler teljes igénye a B tarifás hálózatra kerül.
+            shared_to_base = np.minimum(base_def, shared_in)
+            shared_to_boiler = np.zeros(U, dtype=float)
+        else:
+            # A tarifa: a közös kör teljes hiánya jogosult megosztásra.
+            # A háztartáson belül először az alapfogyasztás, majd a bojler kap.
+            shared_to_base = np.minimum(base_def, shared_in)
+            shared_to_boiler = np.minimum(
+                boiler_def,
+                np.maximum(shared_in - shared_to_base, 0.0),
+            )
 
         ts_e_shared_to_base[t, :] = shared_to_base
         ts_e_shared_to_boiler[t, :] = shared_to_boiler
-        ts_e_grid_to_base[t, :] = np.maximum(base_def - shared_to_base, 0.0)
-        ts_e_grid_to_boiler[t, :] = np.maximum(boiler_def - shared_to_boiler, 0.0)
+        ts_e_grid_to_base[t, :] = np.maximum(
+            base_def - shared_to_base,
+            0.0,
+        )
+        ts_e_grid_to_boiler[t, :] = np.maximum(
+            boiler_def - shared_to_boiler,
+            0.0,
+        )
 
         ts_e_grid_to_load[t, :] = ts_e_grid_to_base[t, :] + ts_e_grid_to_boiler[t, :]
         ts_e_grid_export[t, :] = np.maximum(surplus - shared_out, 0.0)
 
         # A pénzügyi megosztási elszámolás később készül, mert a vevői
         # 2523 kWh-os sávot az A-tarifás hálózati importtal együtt kell vezetni.
+
+    # Fizikai/elszámolási ellenőrzések.
+    if boiler_tariff == "B":
+        if float(np.max(np.abs(ts_e_local_to_boiler))) > 1e-9:
+            raise RuntimeError(
+                "B tarifán saját PV/BESS energia jutott a bojlerre."
+            )
+        if float(np.max(np.abs(ts_e_shared_to_boiler))) > 1e-9:
+            raise RuntimeError(
+                "B tarifán megosztott energia jutott a bojlerre."
+            )
+        if not np.allclose(
+            ts_e_grid_to_boiler,
+            e_boiler,
+            atol=1e-9,
+        ):
+            raise RuntimeError(
+                "B tarifán a bojlerigény nem teljes egészében "
+                "B tarifás hálózati importként jelent meg."
+            )
+
+    if not np.allclose(
+        ts_e_shared_in.sum(axis=1),
+        ts_e_shared_out.sum(axis=1),
+        atol=1e-9,
+    ):
+        raise RuntimeError(
+            "A megosztott be- és kimenő energia időlépésenként nem egyezik."
+        )
 
     # --- Éves per-user elszámolás ---
     rows = []
@@ -866,6 +1296,7 @@ def run_case_disaggregated_nonopt_shared(
     bess_share_pct: float = 100.0,
     sharing_mode: SharingMode = "proportional",
     boiler_tariff: BoilerTariff = "B",
+    use_boiler_model: bool = True,
 ) -> dict:
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
@@ -873,7 +1304,8 @@ def run_case_disaggregated_nonopt_shared(
     (
         e_pv,
         e_ue,
-        e_el_heater,
+        e_el_heater_fixed,
+        p_dhw_kw,
         size_bess,
         eta_bess_in,
         eta_bess_out,
@@ -881,6 +1313,15 @@ def run_case_disaggregated_nonopt_shared(
         soc_bess_min,
         soc_bess_max,
         t_bess_min,
+        size_elh,
+        vol_hss_water,
+        T_env,
+        T_max,
+        T_min,
+        T_in,
+        T_set,
+        a_hss,
+        eta_elh,
         user_names,
     ) = build_inputs(
         sim_yaml_path=sim_yaml,
@@ -889,10 +1330,28 @@ def run_case_disaggregated_nonopt_shared(
         max_users=max_users,
     )
 
+    boiler_profiles = build_effective_boiler_profiles(
+        e_pv=e_pv,
+        e_el_heater_fixed=e_el_heater_fixed,
+        p_dhw_kw=p_dhw_kw,
+        size_elh=size_elh,
+        vol_hss_water=vol_hss_water,
+        T_env=T_env,
+        T_max=T_max,
+        T_min=T_min,
+        T_in=T_in,
+        T_set=T_set,
+        a_hss=a_hss,
+        eta_elh=eta_elh,
+        boiler_tariff=boiler_tariff,
+        use_boiler_model=use_boiler_model,
+    )
+    e_boiler = boiler_profiles["e_boiler"]
+
     result = simulate_nonopt_disaggregated_shared(
         e_pv=e_pv,
         e_ue=e_ue,
-        e_boiler=e_el_heater,
+        e_boiler=e_boiler,
         size_bess=size_bess,
         eta_bess_in=eta_bess_in,
         eta_bess_out=eta_bess_out,
@@ -913,6 +1372,30 @@ def run_case_disaggregated_nonopt_shared(
     user_names = result["user_names"]
 
     total["case_name"] = case_name
+    total["use_boiler_model"] = bool(use_boiler_model)
+    total["dynamic_boiler_user_count"] = int(
+        boiler_profiles["dynamic_boiler"].sum()
+    )
+    total["fixed_boiler_user_count"] = int(
+        (
+            (~boiler_profiles["dynamic_boiler"])
+            & (e_el_heater_fixed.sum(axis=0) > EPS)
+        ).sum()
+    )
+
+    per_user_df["dynamic_boiler"] = boiler_profiles["dynamic_boiler"]
+    per_user_df["fixed_boiler_profile"] = (
+        (~boiler_profiles["dynamic_boiler"])
+        & (e_el_heater_fixed.sum(axis=0) > EPS)
+    )
+    per_user_df["boiler_temperature_violation_steps"] = (
+        boiler_profiles["temperature_violation"].sum(axis=0).astype(int)
+    )
+    per_user_df["boiler_min_temperature_c"] = np.where(
+        boiler_profiles["dynamic_boiler"],
+        np.min(boiler_profiles["t_hss"], axis=0),
+        np.nan,
+    )
 
     per_user_df.to_csv(out_case / "per_user_summary.csv", index=False)
     (out_case / "summary.json").write_text(json.dumps(total, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -954,6 +1437,25 @@ def run_case_disaggregated_nonopt_shared(
         "d_bess_dis",
     ]:
         save_ts(key)
+
+    boiler_diagnostics = {
+        "e_boiler_fixed_input": e_el_heater_fixed,
+        "t_hss": boiler_profiles["t_hss"],
+        "p_dhw_kw": boiler_profiles["p_dhw_kw"],
+        "p_elh_in_kw": boiler_profiles["p_elh_in_kw"],
+        "p_hss_in_kw": boiler_profiles["p_hss_in_kw"],
+        "p_hss_out_kw": boiler_profiles["p_hss_out_kw"],
+        "d_boiler_available": boiler_profiles["d_boiler_available"],
+        "d_boiler_on": boiler_profiles["d_boiler_on"],
+        "boiler_temperature_violation": boiler_profiles[
+            "temperature_violation"
+        ],
+    }
+    for key, array in boiler_diagnostics.items():
+        pd.DataFrame(array, columns=user_names).to_csv(
+            out_case / f"{key}.csv",
+            index=False,
+        )
 
     pd.DataFrame(result["shared_pair_kwh"], index=user_names, columns=user_names).to_csv(
         out_case / "shared_pair_kwh_seller_x_buyer.csv"
@@ -1005,6 +1507,10 @@ def run_case_disaggregated_nonopt_shared(
     except Exception as exc:
         print(f"[WARN] Ábrakészítés kihagyva vagy részben sikertelen: {exc}")
 
+    print(
+        f"[INFO] Bojlerprofil mód: "
+        f"{'dinamikus modell PV-seknél' if use_boiler_model else 'fix profil mindenkinél'}"
+    )
     print(f"[INFO] Kész: {case_name}")
     print(f"[INFO] Output: {out_case}")
     print(json.dumps(total, indent=2, ensure_ascii=False))
@@ -1012,29 +1518,49 @@ def run_case_disaggregated_nonopt_shared(
 
 
 SIM_YAML = "../Input/simulation_config_disaggregated_with_userlist.yaml"
-PROFILES_CSV = "../Input/measurements_disaggregated.csv"
-DHW_PROFILES_CSV = "../Input/dhw.csv"
+PROFILES_CSV = "../Input/measurements_disaggregated_v2.csv"
+DHW_PROFILES_CSV = "../Input/dhw_v2.csv"
 
 MAX_USERS = 105
 
 INCLUDE_BESS = True
-BESS_SHARE_PCT = 0
+BESS_SHARE_PCT = 40.0
 
 # "A": bojler ugyanazon a körön van,
 #      saját PV/BESS is kiszolgálhatja.
 # "B": bojler külön körön van,
-#      saját PV/BESS nem szolgálhatja ki,
-#      de közösségi megosztott energiát kaphat.
+#      saját PV/BESS és közösségi megosztás sem szolgálhatja ki;
+#      kizárólag a vezérlőjel szerinti B tarifás hálózati import látja el.
 BOILER_TARIFF: BoilerTariff = "B"
+
+# True:
+#   PV-s és megfelelő HSS/DHW-adattal rendelkező háztartásnál
+#   dinamikus bojlermodell; a többieknél fix profil.
+# False:
+#   minden háztartásnál a mért fix UT-profil.
+USE_BOILER_MODEL = True
 
 # "proportional": fogyasztásarányos megosztás
 # "equal": egyenlő kvótás megosztás
 SHARING_MODE: SharingMode = "proportional"
 
-CASE_NAME = f"nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
-OUT_DIR = f"results_nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
+BOILER_PROFILE_MODE = (
+    "boiler_model" if USE_BOILER_MODEL else "fixed_boiler"
+)
+
+CASE_NAME = (
+    f"nonopt_community_{BOILER_TARIFF}_"
+    f"{SHARING_MODE}_{BOILER_PROFILE_MODE}_{BESS_SHARE_PCT}%bess"
+)
+OUT_DIR = (
+    f"results_nonopt_community_{BOILER_TARIFF}_"
+    f"{SHARING_MODE}_{BOILER_PROFILE_MODE}_{BESS_SHARE_PCT}%bess"
+)
 if BESS_SHARE_PCT == 0:
-    OUT_DIR = f"results_nonopt_community_basecase"
+    OUT_DIR = (
+        f"results_nonopt_community_basecase_"
+        f"{SHARING_MODE}_{BOILER_PROFILE_MODE}"
+    )
 if __name__ == "__main__":
     run_case_disaggregated_nonopt_shared(
         case_name=CASE_NAME,
@@ -1047,4 +1573,5 @@ if __name__ == "__main__":
         bess_share_pct=BESS_SHARE_PCT,
         sharing_mode=SHARING_MODE,
         boiler_tariff=BOILER_TARIFF,
+        use_boiler_model=USE_BOILER_MODEL,
     )
