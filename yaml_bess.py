@@ -1,9 +1,10 @@
 from pathlib import Path
 import re
 import yaml
+from Utility.configuration import config
 
 # ---- Beállítások ----
-USERS_DIR = Path(r"Input/Users")
+USERS_DIR = config.getpath("paths", "users_directory")
 
 BESS_BLOCK = {
     "bess_size": "12.0",

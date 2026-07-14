@@ -4,13 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 import matplotlib.pyplot as plt
 
 
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
-RESULTS_DIR = r"./results_nonopt_community_B_proportional"  # run_case output mappája
+RESULTS_DIR = config.getpath("paths", "noopt_community_plot_results")
 WINDOW_DAYS = 3                                      # hány nap / évszak
 DT = 0.25                                           # 15 perc = 0.25 h
 DPI = 300

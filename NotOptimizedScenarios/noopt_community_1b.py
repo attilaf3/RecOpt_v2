@@ -37,6 +37,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from InputReading import read_simulation_inputs
+from Utility.configuration import config
 
 try:
     from .nonopt_common import (
@@ -63,10 +64,10 @@ except ImportError:  # direct script execution from this directory
     plot_household_percentiles_by_group_with_global_scurve,
     )
 
-SHARED_BUYER_LOW_LIMIT_KWH = 2523.0
-SHARED_BUYER_LOW_FT_PER_KWH = 5.0
-SHARED_BUYER_HIGH_FT_PER_KWH = 21.0
-SHARED_RHD_FT_PER_KWH = 31.0
+SHARED_BUYER_LOW_LIMIT_KWH = config.getfloat("tariffs", "shared_buyer_low_limit_kwh")
+SHARED_BUYER_LOW_FT_PER_KWH = config.getfloat("tariffs", "shared_buyer_low_ft_per_kwh")
+SHARED_BUYER_HIGH_FT_PER_KWH = config.getfloat("tariffs", "shared_buyer_high_ft_per_kwh")
+SHARED_RHD_FT_PER_KWH = config.getfloat("tariffs", "shared_rhd_ft_per_kwh")
 
 EPS = 1e-12
 
@@ -75,9 +76,9 @@ BoilerTariff = Literal["A", "B"]
 
 # B tarifa a bojler hálózati importjára.
 # Az A tarifa értékei a nonopt_common importból jönnek.
-B_LOW_TARIFF_LIMIT_KWH = 2523.0
-B_LOW_TARIFF_FT_PER_KWH = 23.0
-B_HIGH_TARIFF_FT_PER_KWH = 61.0
+B_LOW_TARIFF_LIMIT_KWH = config.getfloat("tariffs", "grid_b_low_limit_kwh")
+B_LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_low_ft_per_kwh")
+B_HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_high_ft_per_kwh")
 
 
 def _as_nonnegative_2d(a: np.ndarray, name: str) -> np.ndarray:
@@ -1030,9 +1031,9 @@ def run_case_disaggregated_nonopt_shared(
     return result
 
 
-SIM_YAML = "../Input/simulation_config_disaggregated_with_userlist.yaml"
-PROFILES_CSV = "../Input/measurements_disaggregated.csv"
-DHW_PROFILES_CSV = "../Input/dhw.csv"
+SIM_YAML = config.getpath("paths", "simulation_yaml")
+PROFILES_CSV = config.getpath("paths", "profiles_csv")
+DHW_PROFILES_CSV = config.getpath("paths", "dhw_profiles_csv")
 
 MAX_USERS = 105
 
@@ -1051,9 +1052,9 @@ BOILER_TARIFF: BoilerTariff = "B"
 SHARING_MODE: SharingMode = "proportional"
 
 CASE_NAME = f"nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
-OUT_DIR = f"results_nonopt_community_{BOILER_TARIFF}_{SHARING_MODE}"
+OUT_DIR = config.getpath("paths", "noopt_output") / CASE_NAME
 if BESS_SHARE_PCT == 0:
-    OUT_DIR = f"results_nonopt_community_basecase"
+    OUT_DIR = config.getpath("paths", "noopt_output") / "results_nonopt_community_basecase"
 if __name__ == "__main__":
     run_case_disaggregated_nonopt_shared(
         case_name=CASE_NAME,

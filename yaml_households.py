@@ -6,6 +6,7 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import pandas as pd
 import yaml
+from Utility.configuration import config
 
 
 def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
@@ -125,8 +126,8 @@ def run_yaml_inventory(
 
 
 if __name__ == "__main__":
-    SIM_YAML = "Input/simulation_config_disaggregated_with_userlist.yaml"
-    OUT_DIR = "results_yaml_inventory"
+    SIM_YAML = config.getpath("paths", "simulation_yaml")
+    OUT_DIR = config.getpath("paths", "yaml_inventory_output")
 
 
     run_yaml_inventory(sim_yaml=SIM_YAML, out_dir=OUT_DIR, max_users=None)

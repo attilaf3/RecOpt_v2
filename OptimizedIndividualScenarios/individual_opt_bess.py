@@ -1,5 +1,6 @@
 import numpy as np
 import pulp
+from Utility.configuration import config
 
 
 # Notes: ez van készen
@@ -16,13 +17,13 @@ def individual_opt_bess(
     soc_bess_max=0.90,
     soc_bess_init=0.5,
     t_bess_min=2.0,         # h -> max teljesítmény = size_bess / t_bess_min
-    price_grid_a_low=36.0,
-    price_grid_a_high=71.0,
-    price_grid_b_low=23.0,
-    price_grid_b_high=61.0,
-    price_pv_grid=5.0,
-    grid_a_low_cap_kwh=2523.0,
-    grid_b_low_cap_kwh=2523.0,
+    price_grid_a_low=config.getfloat("tariffs", "grid_a_low_ft_per_kwh"),
+    price_grid_a_high=config.getfloat("tariffs", "grid_a_high_ft_per_kwh"),
+    price_grid_b_low=config.getfloat("tariffs", "grid_b_low_ft_per_kwh"),
+    price_grid_b_high=config.getfloat("tariffs", "grid_b_high_ft_per_kwh"),
+    price_pv_grid=config.getfloat("tariffs", "pv_export_ft_per_kwh"),
+    grid_a_low_cap_kwh=config.getfloat("tariffs", "grid_a_low_limit_kwh"),
+    grid_b_low_cap_kwh=config.getfloat("tariffs", "grid_b_low_limit_kwh"),
     boiler_tariff="B",
     objective="bill",
     run_lp=False,

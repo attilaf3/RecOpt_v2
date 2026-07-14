@@ -5,6 +5,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 
 
 __all__ = [
@@ -34,25 +35,25 @@ class Tariffs:
         - költségek/bevételek: Ft
     """
 
-    grid_a_low_limit_kwh: float = 2523.0
-    grid_b_low_limit_kwh: float = 2523.0
-    grid_hp_low_limit_kwh: float = 2523.0
+    grid_a_low_limit_kwh: float = config.getfloat("tariffs", "grid_a_low_limit_kwh")
+    grid_b_low_limit_kwh: float = config.getfloat("tariffs", "grid_b_low_limit_kwh")
+    grid_hp_low_limit_kwh: float = config.getfloat("tariffs", "grid_hp_low_limit_kwh")
 
-    grid_a_low_ft_per_kwh: float = 36.0
-    grid_a_high_ft_per_kwh: float = 71.0
+    grid_a_low_ft_per_kwh: float = config.getfloat("tariffs", "grid_a_low_ft_per_kwh")
+    grid_a_high_ft_per_kwh: float = config.getfloat("tariffs", "grid_a_high_ft_per_kwh")
 
-    grid_b_low_ft_per_kwh: float = 23.0
-    grid_b_high_ft_per_kwh: float = 61.0
+    grid_b_low_ft_per_kwh: float = config.getfloat("tariffs", "grid_b_low_ft_per_kwh")
+    grid_b_high_ft_per_kwh: float = config.getfloat("tariffs", "grid_b_high_ft_per_kwh")
 
-    grid_hp_low_ft_per_kwh: float = 29.34
-    grid_hp_high_ft_per_kwh: float = 60.1
+    grid_hp_low_ft_per_kwh: float = config.getfloat("tariffs", "grid_hp_low_ft_per_kwh")
+    grid_hp_high_ft_per_kwh: float = config.getfloat("tariffs", "grid_hp_high_ft_per_kwh")
 
-    pv_export_ft_per_kwh: float = 5.0
+    pv_export_ft_per_kwh: float = config.getfloat("tariffs", "pv_export_ft_per_kwh")
 
-    shared_buyer_low_limit_kwh: float = 2523.0
-    shared_buyer_low_ft_per_kwh: float = 5.0
-    shared_buyer_high_ft_per_kwh: float = 21.0
-    shared_rhd_ft_per_kwh: float = 31.0
+    shared_buyer_low_limit_kwh: float = config.getfloat("tariffs", "shared_buyer_low_limit_kwh")
+    shared_buyer_low_ft_per_kwh: float = config.getfloat("tariffs", "shared_buyer_low_ft_per_kwh")
+    shared_buyer_high_ft_per_kwh: float = config.getfloat("tariffs", "shared_buyer_high_ft_per_kwh")
+    shared_rhd_ft_per_kwh: float = config.getfloat("tariffs", "shared_rhd_ft_per_kwh")
 
 
 DEFAULT_TARIFFS = Tariffs()

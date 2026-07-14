@@ -10,6 +10,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from InputReading import read_simulation_inputs
+from Utility.configuration import config
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -27,7 +28,7 @@ def build_inputs(
     max_users: int | None = 10,
     pv_ratio: float = 1.0,
     search_roots: Iterable[os.PathLike] | None = None,
-    dt: float = 0.25,
+    dt: float = config.getfloat("simulation", "dt_hours"),
 ) -> tuple:
     """Compatibility adapter backed exclusively by :mod:`InputReading`."""
     inputs = read_simulation_inputs(
@@ -52,7 +53,7 @@ def _select_bess_users(
     size_bess: np.ndarray,
     bess_share_pct: float,
     include_bess: bool = True,
-    dt: float = 0.25,
+    dt: float = config.getfloat("simulation", "dt_hours"),
 ) -> np.ndarray:
     """Deterministikus BESS-kiosztás: csak PV-s háztartások közül választ."""
     U = p_pv.shape[1]
@@ -89,7 +90,7 @@ def run(
     msg: bool = False,
     save_user_timeseries: bool = True,
 ) -> dict:
-    dt = 0.25
+    dt = config.getfloat("simulation", "dt_hours")
     boiler_tariff = str(boiler_tariff).upper().strip()
     if boiler_tariff not in {"A", "B"}:
         raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
@@ -174,7 +175,7 @@ def run_case(
     sim_yaml: os.PathLike,
     profiles_csv: os.PathLike,
     dhw_profiles_csv: os.PathLike | None = None,
-    out_dir: os.PathLike = "results_disaggregated_opt_bess_shared",
+    out_dir: os.PathLike = config.getpath("paths", "community_output"),
     max_users: int = 105,
     *,
     include_bess: bool = True,
@@ -219,7 +220,7 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Disaggregált optimalizált BESS + energiaközösségi megosztás.")
     ap.add_argument("--sim", required=True, help="Path to simulation_config YAML.")
     ap.add_argument("--profiles", required=True, help="Path to disaggregated profiles CSV.")
-    ap.add_argument("--out", default="results_disaggregated_opt_bess_shared", help="Output directory.")
+    ap.add_argument("--out", default=str(config.getpath("paths", "community_output")), help="Output directory.")
     ap.add_argument("--max-users", type=int, default=10)
     ap.add_argument("--pv-ratio", type=float, default=1.0)
     ap.add_argument("--bess-share-pct", type=float, default=100.0)
@@ -257,9 +258,9 @@ def main(argv: list[str] | None = None) -> None:
     )
 
 
-SIM_YAML = "../Input/simulation_config_disaggregated_with_userlist.yaml"
-PROFILES_CSV = "../Input/measurements_disaggregated.csv"
-DHW_PROFILES_CSV = "../Input/dhw.csv"
+SIM_YAML = config.getpath("paths", "simulation_yaml")
+PROFILES_CSV = config.getpath("paths", "profiles_csv")
+DHW_PROFILES_CSV = config.getpath("paths", "dhw_profiles_csv")
 
 MAX_USERS = 105
 
@@ -285,7 +286,7 @@ MSG = False
 SAVE_USER_TIMESERIES = True
 
 CASE_NAME = f"opt_community_{BOILER_TARIFF}_{SHARING_MODE}"
-OUT_DIR = f"results_opt_community_{BOILER_TARIFF}_{SHARING_MODE}"
+OUT_DIR = config.getpath("paths", "community_output")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

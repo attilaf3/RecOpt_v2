@@ -4,13 +4,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 import matplotlib.pyplot as plt
 
 
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
-RESULTS_DIR = r"./results_nonopt"      # run_case output mappája
+RESULTS_DIR = config.getpath("paths", "noopt_household_plot_results")
 HOUSEHOLD_NAME = "Household_1"         # pontos oszlopnév az e_*.csv fájlokban
 
 WINDOW_DAYS = 3                        # hány nap / évszak
@@ -432,7 +433,7 @@ def plot_household_power_stack_seasons(
 
 if __name__ == "__main__":
     plot_household_power_stack_seasons(
-        results_dir=r"results_base_with_bess_A_tariff",
+        results_dir=RESULTS_DIR,
         household_name="0420144888439778",
         window_days=3,
         dt=DT,

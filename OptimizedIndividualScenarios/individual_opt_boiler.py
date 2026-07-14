@@ -1,5 +1,6 @@
 import numpy as np
 import pulp
+from Utility.configuration import config
 
 
 def individual_opt_boiler(
@@ -16,13 +17,13 @@ def individual_opt_boiler(
     a_hss=0.01275,
     eta_elh=0.95,
     p_el_heater_fixed=None,
-    price_grid_a_low=36.0,
-    price_grid_a_high=71.0,
-    price_grid_b_low=23.0,
-    price_grid_b_high=61.0,
-    price_pv_grid=5.0,
-    grid_a_low_cap_kwh=2523.0,
-    grid_b_low_cap_kwh=2523.0,
+    price_grid_a_low=config.getfloat("tariffs", "grid_a_low_ft_per_kwh"),
+    price_grid_a_high=config.getfloat("tariffs", "grid_a_high_ft_per_kwh"),
+    price_grid_b_low=config.getfloat("tariffs", "grid_b_low_ft_per_kwh"),
+    price_grid_b_high=config.getfloat("tariffs", "grid_b_high_ft_per_kwh"),
+    price_pv_grid=config.getfloat("tariffs", "pv_export_ft_per_kwh"),
+    grid_a_low_cap_kwh=config.getfloat("tariffs", "grid_a_low_limit_kwh"),
+    grid_b_low_cap_kwh=config.getfloat("tariffs", "grid_b_low_limit_kwh"),
     run_lp=False,
     msg=True,
     enforce_cl_rules=True,

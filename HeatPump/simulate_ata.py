@@ -36,16 +36,16 @@ from typing import Dict, Mapping, Tuple, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 
 # ===================== FÁJL UTAK =====================
-root = "C:\\NextCloud\\Doktori\\8_felev\\Onlab\\EnergiakozossegOptimalizalas\\bemeneti_fajlok\\optimize_yaml_detailed_input_file"
-CSV_TEMP = join(root, "homerseklet_sugarzas_interpolated_polynomial_fixed.csv")
-CSV_SOLAR = join(root, "zsombo_window_irradiance_2021_fixed_interpolated_polynomial.csv")
+CSV_TEMP = config.getpath("paths", "heat_pump_temperature_csv")
+CSV_SOLAR = config.getpath("paths", "heat_pump_solar_csv")
 
 SOLAR_COLS = {"S": "G_ablak_D", "E": "G_ablak_K", "W": "G_ablak_Ny", "N": "G_ablak_É"}  # [W/m²]
 
 # ===================== ÁLLANDÓK =====================
-DT_H = 0.25  # 15 perc
+DT_H = config.getfloat("simulation", "hp_dt_hours")
 T_SET = 23.0  # termosztát setpoint [°C]
 DEADBAND = 2.0  # ±2 °C
 

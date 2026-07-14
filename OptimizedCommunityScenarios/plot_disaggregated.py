@@ -3,6 +3,7 @@ from pathlib import Path
 import argparse
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 import matplotlib.pyplot as plt
 
 dpi = 300
@@ -224,7 +225,7 @@ def main():
     # PyCharm Run gombos futtatás / dupla kattintás esetén
     if len(sys.argv) == 1:
         plot_community_node(
-            out_dir=r".\results_disaggregated_hourly",
+            out_dir=config.getpath("paths", "community_plot_results"),
             window_len=72,   # 48 = 2 nap, 72 = 3 nap
         )
         return
@@ -233,7 +234,7 @@ def main():
     ap = argparse.ArgumentParser(description="Disaggregált közösségi csomópont plot")
     ap.add_argument(
         "--out",
-        default=r".\results_disaggregated_hourly",
+        default=str(config.getpath("paths", "community_plot_results")),
         help="Eredménymappa, ahol a CSV-k vannak.",
     )
     ap.add_argument(
@@ -245,7 +246,7 @@ def main():
     args = ap.parse_args()
 
     plot_community_node(
-        out_dir=r".\results_disaggregated_hourly",
+        out_dir=config.getpath("paths", "community_plot_results"),
         window_len = 72,
     )
 

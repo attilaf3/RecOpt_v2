@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 
@@ -24,7 +25,7 @@ import matplotlib.patheffects as pe
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
-RESULTS_DIR = r"results_individual_opt_bess_boiler"
+RESULTS_DIR = config.getpath("paths", "individual_bess_boiler_output")
 HOUSEHOLD_NAME = "0420144653422463"   # timeseries_<...>.csv-ben a <...> rész
 WINDOW_DAYS = 3                       # 2 vagy 3
 DT = 0.25                             # 15 perc (óra)

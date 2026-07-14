@@ -5,13 +5,14 @@ from typing import Dict, Tuple, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 
-from simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
+try:
+    from .simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
+except ImportError:  # direct script execution
+    from simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
 
-DEFAULT_GEOPROFIL = (
-    "C:\\NextCloud\\Doktori\\8_felev\\Onlab\\EnergiakozossegOptimalizalas\\bemeneti_fajlok\\hoszivattyu"
-    "\\geoprofil.csv"
-)
+DEFAULT_GEOPROFIL = config.getpath("paths", "heat_pump_geoprofile_csv")
 
 # -----------------------------------------------------------------------------
 # Editable run configuration (constants, no command line arguments required)
@@ -19,7 +20,7 @@ DEFAULT_GEOPROFIL = (
 ROOT = Path(__file__).resolve().parent.parent
 NUM_HOUSES = 200
 GEOPROFIL_PATH = DEFAULT_GEOPROFIL
-OUTPUT_CSV_PATH = ""  # e.g. str(ROOT / "HeatPump" / "hp_profile_avg.csv")
+OUTPUT_CSV_PATH = config.getpath("paths", "heat_pump_aggregate_output_csv")
 ENABLE_SEASONAL_PLOTS = True
 
 def _clamp(value: float, low: float, high: float) -> float:

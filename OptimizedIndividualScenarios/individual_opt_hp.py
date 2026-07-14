@@ -1,5 +1,6 @@
 import numpy as np
 import pulp
+from Utility.configuration import config
 
 
 def hp_profiles_from_temperature(
@@ -71,10 +72,10 @@ def individual_opt_hp(
     cop_a1=-0.05,
     cop_min=0.5,
     dt=0.25,                # h, kept for metadata/API compatibility
-    price_grid_low=36.0,    # Ft/kWh
-    price_grid_high=71.0,   # Ft/kWh
-    price_pv_grid=5.0,      # Ft/kWh
-    grid_low_cap_kwh=2523.0,
+    price_grid_low=config.getfloat("tariffs", "grid_a_low_ft_per_kwh"),
+    price_grid_high=config.getfloat("tariffs", "grid_a_high_ft_per_kwh"),
+    price_pv_grid=config.getfloat("tariffs", "pv_export_ft_per_kwh"),
+    grid_low_cap_kwh=config.getfloat("tariffs", "grid_a_low_limit_kwh"),
     run_lp=False,
     msg=False,
     gapRel=None,

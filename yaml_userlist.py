@@ -3,17 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import yaml
+from Utility.configuration import config
 
 
 # =========================
 # BEÁLLÍTÁSOK
 # =========================
 
-INPUT_YAML = Path("Input/simulation_config_disaggregated.yaml")
-OUTPUT_YAML = Path("Input/simulation_config_disaggregated_with_userlist.yaml")
+INPUT_YAML = config.getpath("paths", "simulation_yaml_base")
+OUTPUT_YAML = config.getpath("paths", "userlist_output_yaml")
 
 # Az a mappa, amelyben a user fájlok vannak
-USERS_FOLDER = Path("Input/Users")
+USERS_FOLDER = config.getpath("paths", "users_directory")
 
 # Ha kell a hosszabb nevű YAML-hez hasonlóan az elejére:
 ADD_LOAD_BATTERY = True

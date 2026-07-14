@@ -1,8 +1,9 @@
 from pathlib import Path
 import yaml
+from Utility.configuration import config
 
 # ---- Beállítások ----
-USERS_DIR = Path(r"Input/Users")   # ezt módosítsd, ha más a mappa útvonala
+USERS_DIR = config.getpath("paths", "users_directory")
 
 # Csak a bojler / HSS hőmérsékletparaméterei
 HSS_TEMPERATURE_PARAMS = {

@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import pandas as pd
+from Utility.configuration import config
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 
@@ -25,7 +26,7 @@ import matplotlib.patheffects as pe
 # BEÁLLÍTÁSOK
 # =========================
 BOILER_TARIFF = 'B'
-RESULTS_DIR = f"results_individual_opt_bess_{BOILER_TARIFF}_tariff"
+RESULTS_DIR = config.getpath("paths", "individual_bess_output")
 HOUSEHOLD_NAME = "0420144653458813"
 # HOUSEHOLD_NAME = "0420144888439778"
 WINDOW_DAYS = 3                       # 2 vagy 3

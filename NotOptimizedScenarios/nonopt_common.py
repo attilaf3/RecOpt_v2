@@ -17,22 +17,23 @@ from HeatPump.simulate_ata import (HOUSES_RAW,
                                    load_or_make_inputs as load_hp_weather, simulate_5r2c, solar_gain_sepsi,
                                    tabula_to_5r2c_iso_sepsi, )
 from InputReading import read_simulation_inputs
+from Utility.configuration import config
 from Visualization import (
     plot_community_energy_balance,
     plot_household_percentiles_by_group,
     plot_household_percentiles_by_group_with_global_scurve,
 )
 
-DT = 0.25  # 15 perc
-HP_DT = 0.25  # 5R2C időlépés
-LOW_TARIFF_LIMIT_KWH = 2523.0
-LOW_TARIFF_FT_PER_KWH = 36.0
-HIGH_TARIFF_FT_PER_KWH = 71.0
+DT = config.getfloat("simulation", "dt_hours")
+HP_DT = config.getfloat("simulation", "hp_dt_hours")
+LOW_TARIFF_LIMIT_KWH = config.getfloat("tariffs", "grid_a_low_limit_kwh")
+LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_a_low_ft_per_kwh")
+HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_a_high_ft_per_kwh")
 # Separate tariffs for Boilers and Heat Pumps (two-tier, same annual low-tariff limit)
-BOILER_LOW_TARIFF_FT_PER_KWH = 23.0
-BOILER_HIGH_TARIFF_FT_PER_KWH = 60.9
-HP_LOW_TARIFF_FT_PER_KWH = 29.34
-HP_HIGH_TARIFF_FT_PER_KWH = 60.1
+BOILER_LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_low_ft_per_kwh")
+BOILER_HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_high_ft_per_kwh")
+HP_LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_hp_low_ft_per_kwh")
+HP_HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_hp_high_ft_per_kwh")
 
 
 def build_inputs(sim_yaml_path: os.PathLike, profiles_csv_path: os.PathLike, dhw_profile_path: os.PathLike,
@@ -56,15 +57,15 @@ def build_inputs(sim_yaml_path: os.PathLike, profiles_csv_path: os.PathLike, dhw
     )
 
 
-LOW_TARIFF_LIMIT_KWH = 2523.0
-LOW_TARIFF_FT_PER_KWH = 36.0
-HIGH_TARIFF_FT_PER_KWH = 71.0
+LOW_TARIFF_LIMIT_KWH = config.getfloat("tariffs", "grid_a_low_limit_kwh")
+LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_a_low_ft_per_kwh")
+HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_a_high_ft_per_kwh")
 
-B_LOW_TARIFF_LIMIT_KWH = 2523.0
-B_LOW_TARIFF_FT_PER_KWH = 23.0
-B_HIGH_TARIFF_FT_PER_KWH = 61.0
+B_LOW_TARIFF_LIMIT_KWH = config.getfloat("tariffs", "grid_b_low_limit_kwh")
+B_LOW_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_low_ft_per_kwh")
+B_HIGH_TARIFF_FT_PER_KWH = config.getfloat("tariffs", "grid_b_high_ft_per_kwh")
 
-EXPORT_FT_PER_KWH = 5.0
+EXPORT_FT_PER_KWH = config.getfloat("tariffs", "pv_export_ft_per_kwh")
 # Default HP forbidden windows: allow season-specific configuration.
 # By default use earlier-morning forbidden window in winter (5-8) and
 # slightly later in summer (6-9). The evening window remains the same.
@@ -625,14 +626,16 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
             e_grid_to_load_boiler[t] = def_boiler
             e_grid_to_load_hp[t] = def_hp
 
-            total_deficit = def_base + def_boiler + def_hp
             e_inj[t] = max(pv_t - assigned_to_load, 0.0)
             e_bess[t] = 0.0
 
-        e_pv_to_load = np.minimum(e_dispatch_load, e_pv)
-        e_grid_to_load = np.maximum(e_dispatch_load - e_pv_to_load, 0.0)
-        e_inj = np.maximum(e_pv - e_pv_to_load, 0.0)
-        e_bess[:] = 0.0
+        # Preserve the component-wise allocation calculated above. Recomputing
+        # these flows here would discard the boiler/HP split.
+        e_grid_to_load = (
+            e_grid_to_load_base
+            + e_grid_to_load_boiler
+            + e_grid_to_load_hp
+        )
     else:
         soc_min_kwh = max(0.0, soc_bess_min) * bess_size_kwh
         soc_max_kwh = max(soc_min_kwh, soc_bess_max * bess_size_kwh)
@@ -852,7 +855,6 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
 
     return {"timeseries": {"e_load": e_load, "e_pv": e_pv, "e_pv_to_load": e_pv_to_load, "e_pv_to_bess": e_pv_to_bess,
         "e_bess_to_load": e_bess_to_load,
-        "e_grid_to_load": e_grid_to_load_base + e_grid_to_load_boiler + e_grid_to_load_hp,
         "e_grid_to_load": e_grid_to_load, "e_grid_to_bess": e_grid_to_bess, "e_grid_to_base": e_grid_to_base,
         "e_grid_to_boiler": e_grid_to_boiler, "e_local_to_base": e_local_to_base,
         "e_local_to_boiler": e_local_to_boiler, "e_inj": e_inj, "e_bess": e_bess, "d_bess_ch": d_bess_ch,

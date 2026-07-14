@@ -27,24 +27,25 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import pulp
+from Utility.configuration import config
 
-DT_DEFAULT = 0.25
+DT_DEFAULT = config.getfloat("simulation", "dt_hours")
 EPS = 1e-9
 
 # Alap A/B és PV árak, az individual modellhez igazítva.
-LOW_TARIFF_LIMIT_KWH = 2523.0
-PRICE_GRID_A_LOW = 36.0
-PRICE_GRID_A_HIGH = 71.0
-PRICE_GRID_B_LOW = 23.0
-PRICE_GRID_B_HIGH = 61.0
-PRICE_PV_GRID = 5.0
+LOW_TARIFF_LIMIT_KWH = config.getfloat("tariffs", "grid_a_low_limit_kwh")
+PRICE_GRID_A_LOW = config.getfloat("tariffs", "grid_a_low_ft_per_kwh")
+PRICE_GRID_A_HIGH = config.getfloat("tariffs", "grid_a_high_ft_per_kwh")
+PRICE_GRID_B_LOW = config.getfloat("tariffs", "grid_b_low_ft_per_kwh")
+PRICE_GRID_B_HIGH = config.getfloat("tariffs", "grid_b_high_ft_per_kwh")
+PRICE_PV_GRID = config.getfloat("tariffs", "pv_export_ft_per_kwh")
 
 # Energiaközösségi megosztás elszámolása.
 # Nincs külön eladói megosztási keret: a megosztott energia a vevő
 # ugyanazon éves A-sávját fogyasztja, mint a hálózati A-vételezés.
-SHARED_BUYER_LOW_FT_PER_KWH = 5.0
-SHARED_BUYER_HIGH_FT_PER_KWH = 21.0
-SHARED_RHD_FT_PER_KWH = 31.0
+SHARED_BUYER_LOW_FT_PER_KWH = config.getfloat("tariffs", "shared_buyer_low_ft_per_kwh")
+SHARED_BUYER_HIGH_FT_PER_KWH = config.getfloat("tariffs", "shared_buyer_high_ft_per_kwh")
+SHARED_RHD_FT_PER_KWH = config.getfloat("tariffs", "shared_rhd_ft_per_kwh")
 
 Objective = Literal["bill", "grid"]
 SharingMode = Literal["proportional", "equal"]
