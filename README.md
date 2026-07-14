@@ -37,7 +37,7 @@ python aggregate_hp_profile.py --no-seasonal-plots
 Call `run_case(...)` from Python and enable the new heat-pump option:
 
 ```powershell
-python -c "from NotOptimizedScenarios.nonopt_common import run_case; run_case(case_name='demo_hp', sim_yaml=r'PATH\\TO\\sim.yaml', profiles_csv=r'PATH\\TO\\profiles.csv', dhw_profiles_csv=r'PATH\\TO\\dhw_profiles.csv', out_dir=r'PATH\\TO\\output', max_users=100, pv_ratio=1.0, include_bess=True, include_boiler=False, include_heat_pumm=True, heat_pump_share_pct=30.0, bess_share_pct=100.0)"
+python -c "from NotOptimizedScenarios.nonopt_common import run_case; run_case(case_name='demo_hp', sim_yaml=r'PATH\\TO\\sim.yaml', profiles_csv=r'PATH\\TO\\profiles.csv', dhw_profiles_csv=r'PATH\\TO\\dhw_profiles.csv', out_dir=r'PATH\\TO\\output', max_users=100, pv_ratio=1.0, include_bess=True, include_boiler=False, include_heat_pump=True, heat_pump_share_pct=30.0, bess_share_pct=100.0)"
 ```
 
 The HP households are selected randomly, and the output folder also includes heat-pump-specific CSVs and plots.
@@ -51,4 +51,8 @@ Edit the constants near the top of `run_noopt.py`. The script now builds paths a
 ```powershell
 python run_noopt.py
 ```
+
+Set `SCENARIO = "a"` for independent household simulations. Set
+`SCENARIO = "b"` to enable community surplus sharing and virtual seller-buyer
+energy flows; `SHARING_MODE` controls proportional or equal allocation.
 

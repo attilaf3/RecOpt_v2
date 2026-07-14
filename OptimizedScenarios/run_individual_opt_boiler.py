@@ -5,12 +5,12 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import yaml
 
+from InputReading import read_simulation_inputs
 # --- import optimizer locally ---------------------------------------------------
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -19,230 +19,31 @@ from OptimizedIndividualScenarios.individual_opt_boiler import \
     individual_opt_boiler # expects (T,U) arrays, sizes, etc. :contentReference[oaicite:1]{index=1}
 
 
-# --- helpers -------------------------------------------------------------------
-def _keep_15min(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=float).ravel()
-    if v.size != 35040:
-        raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
-    return v
-
-def _energy_profile_kwh_step(v: np.ndarray) -> np.ndarray:
-    """
-    Beolvasott idősor energiaként kezelve: e [kWh/lépés].
-    """
-    return np.maximum(_keep_15min(v), 0.0)
-
-
-def _power_profile_kw_from_energy(v: np.ndarray, dt: float) -> np.ndarray:
-    """
-    e [kWh/lépés] -> p [kW].
-    """
-    e_kwh_step = _energy_profile_kwh_step(v)
-    return e_kwh_step / float(dt)
-
-
-def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
-    for r in roots:
-        for cand in (name, f"{name}.yaml"):
-            p = Path(r) / cand
-            if p.exists():
-                return p
-    return None
-
-
 # --- input builder -------------------------------------------------------------
 def build_inputs(
         sim_yaml_path: os.PathLike,
         profiles_csv_path: os.PathLike,
         dhw_profile_path: os.PathLike,
-        max_users: int = 10,
+        max_users: int | None = 10,
         target_user: str | None = None,
         search_roots: Iterable[os.PathLike] | None = None,
         dt: float = 0.25,
-) -> Tuple[
-    np.ndarray,  # p_pv (35040, U)
-    np.ndarray,  # p_ue (35040, U)
-    np.ndarray,  # p_dhw (35040, U)
-    np.ndarray,  # p_el_heater (35040, U)
-    np.ndarray,  # size_elh (U,)
-    np.ndarray,  # vol_hss_water (U,)
-    list[float], # T_env_u
-    list[float], # T_max_u
-    list[float], # T_min_u
-    list[float], # T_in_u
-    list[float], # a_hss_u
-    list[float], # eta_elh_u
-    list[str],   # user_names
-]:
-    """
-    Return:
-      p_pv, p_ue, p_ut: np.ndarray (35040, U)
-      size_elh: np.ndarray (U,)
-      vol_hss_water: np.ndarray (U,)
-      user_names: list[str]
-    """
-    sim_yaml_path = Path(sim_yaml_path)
-    profiles_csv_path = Path(profiles_csv_path)
-    if search_roots is None:
-        search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
-
-    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
-    users_list_all = list(sim.get("users_list", []))
-
-    EXCLUDE = {"battery", "bess", "community"}
-    users_list_all = [
-        u for u in users_list_all
-        if str(u).strip().lower() not in EXCLUDE
-    ]
-
-    if target_user is not None:
-        target_user = str(target_user).strip()
-        users_list = [
-            u for u in users_list_all
-            if str(u).strip() == target_user
-        ]
-
-        if not users_list:
-            raise RuntimeError(
-                f"A megadott háztartás nem található a users_list-ben: {target_user}"
-            )
-    else:
-        users_list = users_list_all[: int(max_users)]
-
-    df = pd.read_csv(profiles_csv_path, index_col=0)
-    df.columns = [str(c) for c in df.columns]  # oszlopnevek legyenek stringek
-    df = df[[c for c in df.columns if c.lower() not in {"battery", "bess", "community"}]]
-
-    n = 1
-    dhw_profile_path = Path(dhw_profile_path)
-    dhw = pd.read_csv(dhw_profile_path, index_col=0) / n
-    dhw.columns = [str(c) for c in dhw.columns]
-
-    p_pv_cols, p_ue_cols, p_el_heater_cols, dhw_cols = [], [], [], []
-
-    size_elh = []
-    vol_hss_water = []
-    user_names = []
-
-    T_env_u = []
-    T_min_u = []
-    T_max_u = []
-    a_hss_u = []
-    T_in_u = []
-    T_out_u = []
-    eta_elh_u = []
-    t_hss_min_in_u = []
-
-    for user_key in users_list:
-        ypath = _find_user_yaml(search_roots, user_key)
-        if not ypath:
-            print(f"[WARN] YAML nem található: {user_key} — kihagyom.")
-            continue
-
-        u = yaml.safe_load(ypath.read_text(encoding="utf-8")) or {}
-        units = (u.get("units") or {})
-        name = (units.get("name") or {}).get("name", str(user_key))
-        user_names.append(name)
-
-        # --- UE (villamos fogyasztás) ---
-        ue = units.get("ue") or {}
-        ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
-
-        if ue_prof and ue_prof in df.columns:
-            e_ue_kwh_step = _energy_profile_kwh_step(df[ue_prof].to_numpy())
-            p_ue_kw = e_ue_kwh_step / dt
-            p_ue_cols.append(p_ue_kw)
-        else:
-            p_ue_cols.append(np.zeros(35040, dtype=float))
-
-        # --- PV (termelés) ---
-        pv = units.get("pv") or {}
-        pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
-
-        n_pv = 1.0
-        if pv_prof and pv_prof in df.columns:
-            e_pv_kwh_step = _energy_profile_kwh_step(df[pv_prof].to_numpy()) / n_pv
-            p_pv_kw = e_pv_kwh_step / dt
-            p_pv_cols.append(p_pv_kw)
-        else:
-            p_pv_cols.append(np.zeros(35040, dtype=float))
-
-
-        # --- HSS / bojler adatok ---
-        hss = units.get("hss") or {}
-        heater = units.get("ut") or {}
-
-        # DHW profil: liter/lépés -> e_dhw [kWh/lépés] -> p_dhw [kW]
-        if hss.get("profile") is not None and str(hss["profile"]) in dhw.columns:
-            L_dhw_step = np.maximum(_keep_15min(dhw[str(hss["profile"])].to_numpy()), 0.0)
-
-            RHO_WATER_KG_PER_L = 1.0
-            CP_WATER_J_PER_KGK = 4186.0
-            J_PER_KWH = 3_600_000.0
-            KWH_PER_L_PER_K = RHO_WATER_KG_PER_L * CP_WATER_J_PER_KGK / J_PER_KWH
-
-            T_in = float(hss.get("T_in", 10))
-            T_out = float(hss.get("T_out", 55))
-            dT = max(0.0, T_out - T_in)
-
-            e_dhw_kwh_step = L_dhw_step * KWH_PER_L_PER_K * dT
-            p_dhw_kw = e_dhw_kwh_step / dt
-            dhw_cols.append(p_dhw_kw.astype(float))
-        else:
-            dhw_cols.append(np.zeros(35040, dtype=float))
-
-        # Fix villamos bojlerprofil / UT profil
-        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-        if p_el_heater_prof and p_el_heater_prof in df.columns:
-            p_el_heater_cols.append(
-                _power_profile_kw_from_energy(df[p_el_heater_prof].to_numpy(), dt)
-            )
-        else:
-            p_el_heater_cols.append(np.zeros(35040, dtype=float))
-
-        # Ha nincs HSS, akkor nulla méretű bojlert feltételezünk
-        size_elh.append(float(hss.get("size_elh", 0.0)))
-        vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
-        # HSS paraméterek
-        T_env_u.append(float(hss.get("T_env", 20)))
-        T_max_u.append(float(hss.get("T_max", 65)))
-        T_min_u.append(float(hss.get("T_min", 35)))
-        T_in_u.append(float(hss.get("T_in", 12)))
-        T_out_u.append(float(hss.get("T_out", 55)))
-        a_hss_u.append(float(hss.get("a_hss", 0.01275)))
-        eta_elh_u.append(float(hss.get("eta_elh", 0.95)))
-        t_hss_min_in_u.append(float(hss.get("t_hss_min_in", 0.0)))
-
-    if not user_names:
-        raise RuntimeError("Nincs érvényes felhasználó.")
-
-    # (T,U) mátrixok
-    size_elh = np.asarray(size_elh, float)
-    vol_hss_water = np.asarray(vol_hss_water, float)
-
-    U = len(user_names)
-
-    p_pv = np.column_stack(p_pv_cols).astype(float)
-    p_ue = np.column_stack(p_ue_cols).astype(float)
-
-    p_dhw = np.column_stack(dhw_cols).astype(float)
-    p_el_heater = np.column_stack(p_el_heater_cols).astype(float)
-
+) -> tuple:
+    """Compatibility adapter backed exclusively by :mod:`InputReading`."""
+    inputs = read_simulation_inputs(
+        sim_yaml_path=sim_yaml_path,
+        profiles_csv_path=profiles_csv_path,
+        dhw_profile_path=dhw_profile_path,
+        max_users=max_users,
+        target_user=target_user,
+        search_roots=search_roots,
+        dt=dt,
+    )
     return (
-        p_pv,
-        p_ue,
-        p_dhw,
-        p_el_heater,
-        np.asarray(size_elh, float),
-        np.asarray(vol_hss_water, float),
-        T_env_u,
-        T_max_u,
-        T_min_u,
-        T_in_u,
-        a_hss_u,
-        eta_elh_u,
-        t_hss_min_in_u,
-        user_names,
+        inputs.p_pv_kw, inputs.p_ue_kw, inputs.p_dhw_kw, inputs.p_el_heater_kw,
+        inputs.size_elh, inputs.vol_hss_water, inputs.T_env, inputs.T_max,
+        inputs.T_min, inputs.T_in, inputs.a_hss, inputs.eta_elh,
+        inputs.t_hss_min_in, inputs.user_names,
     )
 
 
@@ -264,12 +65,7 @@ def run(
     if boiler_tariff not in {"A", "B"}:
         raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
-    (
-        p_pv, p_ue, p_dhw, p_el_heater,
-        size_elh, vol_hss_water,
-        T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
-        user_names
-    ) = build_inputs(
+    inputs = read_simulation_inputs(
         sim_yaml_path=sim_yaml,
         profiles_csv_path=profiles_csv,
         dhw_profile_path=dhw_profiles_csv,
@@ -277,6 +73,20 @@ def run(
         dt=dt,
         target_user=target_user,
     )
+    p_pv = inputs.p_pv_kw
+    p_ue = inputs.p_ue_kw
+    p_dhw = inputs.p_dhw_kw
+    p_el_heater = inputs.p_el_heater_kw
+    size_elh = inputs.size_elh
+    vol_hss_water = inputs.vol_hss_water
+    T_env_u = inputs.T_env
+    T_max_u = inputs.T_max
+    T_min_u = inputs.T_min
+    T_in_u = inputs.T_in
+    a_hss_u = inputs.a_hss
+    eta_elh_u = inputs.eta_elh
+    t_hss_min_in_u = inputs.t_hss_min_in
+    user_names = inputs.user_names
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

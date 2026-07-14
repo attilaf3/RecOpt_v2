@@ -74,6 +74,7 @@ class SimulationInputs:
     T_out: np.ndarray
     a_hss: np.ndarray
     eta_elh: np.ndarray
+    t_hss_min_in: np.ndarray
 
     # BESS paraméterek
     size_bess: np.ndarray
@@ -195,6 +196,7 @@ def _read_users(
     sim_yaml_path: os.PathLike | str,
     max_users: int | None,
     exclude: Iterable[str] | None,
+    target_user: str | None = None,
 ) -> list[str]:
     """
     Felhasználólista beolvasása.
@@ -240,6 +242,12 @@ def _read_users(
         u for u in users_list
         if str(u).strip().lower() not in exclude_set
     ]
+
+    if target_user is not None:
+        target = str(target_user).strip()
+        users_list = [u for u in users_list if str(u).strip() == target]
+        if not users_list:
+            raise RuntimeError(f"A megadott háztartás nem található a users_list-ben: {target}")
 
     if max_users is not None:
         users_list = users_list[: int(max_users)]
@@ -376,6 +384,7 @@ def read_simulation_inputs(
     search_roots: Iterable[os.PathLike | str] | None = None,
     exclude: Iterable[str] | None = None,
     warn_missing_user_yaml: bool = True,
+    target_user: str | None = None,
 ) -> SimulationInputs:
     """
     Egyetlen központi input-beolvasó minden szcenárióhoz.
@@ -410,6 +419,7 @@ def read_simulation_inputs(
         sim_yaml_path=sim_yaml_path,
         max_users=max_users,
         exclude=exclude,
+        target_user=target_user,
     )
 
     profiles_df = _read_profiles_csv(
@@ -438,6 +448,7 @@ def read_simulation_inputs(
     T_out: list[float] = []
     a_hss: list[float] = []
     eta_elh: list[float] = []
+    t_hss_min_in: list[float] = []
 
     size_bess: list[float] = []
     eta_bess_in: list[float] = []
@@ -542,6 +553,7 @@ def read_simulation_inputs(
         T_out_u = _safe_float(hss.get("T_out"), 55.0)
         a_hss_u = _safe_float(hss.get("a_hss"), 0.01275)
         eta_elh_u = _safe_float(hss.get("eta_elh"), 0.95)
+        t_hss_min_in_u = _safe_float(hss.get("t_hss_min_in"), 0.0)
 
         size_elh.append(size_elh_u)
         vol_hss_water.append(vol_hss_water_u)
@@ -553,6 +565,7 @@ def read_simulation_inputs(
         T_out.append(T_out_u)
         a_hss.append(a_hss_u)
         eta_elh.append(eta_elh_u)
+        t_hss_min_in.append(t_hss_min_in_u)
 
         # ---------------------------------------------------------------------
         # DHW literprofil -> hőenergia-idősor
@@ -612,6 +625,7 @@ def read_simulation_inputs(
         T_out=np.asarray(T_out, dtype=float),
         a_hss=np.asarray(a_hss, dtype=float),
         eta_elh=np.asarray(eta_elh, dtype=float),
+        t_hss_min_in=np.asarray(t_hss_min_in, dtype=float),
 
         size_bess=np.asarray(size_bess, dtype=float),
         eta_bess_in=np.asarray(eta_bess_in, dtype=float),

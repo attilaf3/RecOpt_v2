@@ -13,6 +13,7 @@ __all__ = [
     "two_tier_cost_steps",
     "calculate_economics",
     "calculate_grid_bill",
+    "calculate_component_grid_bill",
     "settle_shared_payments",
 ]
 
@@ -401,6 +402,72 @@ def calculate_grid_bill(
         "grid_import_cost_ft": import_cost_ft,
         "grid_export_revenue_ft": export_revenue_ft,
         "brt_bill_ft": import_cost_ft - export_revenue_ft,
+    }
+
+
+def calculate_component_grid_bill(
+    e_grid_import_base: np.ndarray,
+    e_grid_import_boiler: np.ndarray,
+    e_grid_import_hp: np.ndarray,
+    e_grid_export: np.ndarray,
+    *,
+    tariffs: Tariffs = DEFAULT_TARIFFS,
+) -> dict:
+    """Calculate a gross bill with separate A, B and heat-pump tariffs.
+
+    Every input is energy in kWh per timestep. Each import component consumes
+    its own annual low-price block; exports are credited at the PV export rate.
+    """
+    e_base = _as_nonnegative_array(e_grid_import_base, "e_grid_import_base")
+    expected_shape = e_base.shape
+
+    def component(values, name: str) -> np.ndarray:
+        arr = _as_nonnegative_array(values, name)
+        if arr.shape != expected_shape:
+            raise ValueError(f"{name} alakja {arr.shape}, de {expected_shape} kellene.")
+        return arr
+
+    e_boiler = component(e_grid_import_boiler, "e_grid_import_boiler")
+    e_hp = component(e_grid_import_hp, "e_grid_import_hp")
+    e_export = component(e_grid_export, "e_grid_export")
+
+    base = two_tier_cost_steps(
+        e_base,
+        tariffs.grid_a_low_limit_kwh,
+        tariffs.grid_a_low_ft_per_kwh,
+        tariffs.grid_a_high_ft_per_kwh,
+    )
+    boiler = two_tier_cost_steps(
+        e_boiler,
+        tariffs.grid_b_low_limit_kwh,
+        tariffs.grid_b_low_ft_per_kwh,
+        tariffs.grid_b_high_ft_per_kwh,
+    )
+    hp = two_tier_cost_steps(
+        e_hp,
+        tariffs.grid_hp_low_limit_kwh,
+        tariffs.grid_hp_low_ft_per_kwh,
+        tariffs.grid_hp_high_ft_per_kwh,
+    )
+
+    import_cost_ft = float(base["cost_ft"] + boiler["cost_ft"] + hp["cost_ft"])
+    export_revenue_ft = float(e_export.sum() * tariffs.pv_export_ft_per_kwh)
+
+    return {
+        "grid_import_low_kwh": base["low_kwh"] + boiler["low_kwh"] + hp["low_kwh"],
+        "grid_import_high_kwh": base["high_kwh"] + boiler["high_kwh"] + hp["high_kwh"],
+        "import_cost_ft": import_cost_ft,
+        "export_revenue_ft": export_revenue_ft,
+        "net_bill_ft": import_cost_ft - export_revenue_ft,
+        "grid_import_base_low_kwh": base["low_kwh"],
+        "grid_import_base_high_kwh": base["high_kwh"],
+        "grid_import_boiler_low_kwh": boiler["low_kwh"],
+        "grid_import_boiler_high_kwh": boiler["high_kwh"],
+        "grid_import_hp_low_kwh": hp["low_kwh"],
+        "grid_import_hp_high_kwh": hp["high_kwh"],
+        "import_cost_base_ft": base["cost_ft"],
+        "import_cost_boiler_ft": boiler["cost_ft"],
+        "import_cost_hp_ft": hp["cost_ft"],
     }
 
 

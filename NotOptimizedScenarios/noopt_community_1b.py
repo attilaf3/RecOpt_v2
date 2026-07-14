@@ -36,19 +36,32 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from InputReading import read_simulation_inputs
 
-from nonopt_common import (
+try:
+    from .nonopt_common import (
+        DT,
+        EXPORT_FT_PER_KWH,
+        HIGH_TARIFF_FT_PER_KWH,
+        LOW_TARIFF_FT_PER_KWH,
+        LOW_TARIFF_LIMIT_KWH,
+        _group_label,
+        plot_community_energy_balance,
+        plot_household_percentiles_by_group,
+        plot_household_percentiles_by_group_with_global_scurve,
+    )
+except ImportError:  # direct script execution from this directory
+    from nonopt_common import (
     DT,
     EXPORT_FT_PER_KWH,
     HIGH_TARIFF_FT_PER_KWH,
     LOW_TARIFF_FT_PER_KWH,
     LOW_TARIFF_LIMIT_KWH,
     _group_label,
-    build_inputs,
     plot_community_energy_balance,
     plot_household_percentiles_by_group,
     plot_household_percentiles_by_group_with_global_scurve,
-)
+    )
 
 SHARED_BUYER_LOW_LIMIT_KWH = 2523.0
 SHARED_BUYER_LOW_FT_PER_KWH = 5.0
@@ -860,34 +873,40 @@ def run_case_disaggregated_nonopt_shared(
     profiles_csv: str,
     dhw_profiles_csv: str,
     out_dir: str,
-    max_users: int,
+    max_users: int | None,
     *,
     include_bess: bool = True,
+    include_boiler: bool = True,
     bess_share_pct: float = 100.0,
     sharing_mode: SharingMode = "proportional",
     boiler_tariff: BoilerTariff = "B",
+    pv_ratio: float = 1.0,
 ) -> dict:
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
 
-    (
-        e_pv,
-        e_ue,
-        e_el_heater,
-        size_bess,
-        eta_bess_in,
-        eta_bess_out,
-        eta_bess_stor,
-        soc_bess_min,
-        soc_bess_max,
-        t_bess_min,
-        user_names,
-    ) = build_inputs(
+    inputs = read_simulation_inputs(
         sim_yaml_path=sim_yaml,
         profiles_csv_path=profiles_csv,
         dhw_profile_path=dhw_profiles_csv,
         max_users=max_users,
+        pv_ratio=pv_ratio,
+        dt=DT,
     )
+    e_pv = inputs.e_pv_kwh
+    e_ue = inputs.e_ue_kwh
+    e_el_heater = inputs.e_el_heater_kwh
+    size_bess = inputs.size_bess
+    eta_bess_in = inputs.eta_bess_in
+    eta_bess_out = inputs.eta_bess_out
+    eta_bess_stor = inputs.eta_bess_stor
+    soc_bess_min = inputs.soc_bess_min
+    soc_bess_max = inputs.soc_bess_max
+    t_bess_min = inputs.t_bess_min
+    user_names = inputs.user_names
+
+    if not include_boiler:
+        e_el_heater = np.zeros_like(e_el_heater)
 
     result = simulate_nonopt_disaggregated_shared(
         e_pv=e_pv,

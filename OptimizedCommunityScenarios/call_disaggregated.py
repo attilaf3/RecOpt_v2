@@ -5,11 +5,11 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
-import yaml
+from InputReading import read_simulation_inputs
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -21,147 +21,29 @@ from optimize_disaggregated import (
 )
 
 
-def _keep_15min(v: np.ndarray) -> np.ndarray:
-    v = np.asarray(v, dtype=float).ravel()
-    if v.size != 35040:
-        raise ValueError(f"A profil hossza {v.size}, de itt 35040 kell.")
-    return v
-
-
-def _energy_profile_kwh_step(v: np.ndarray) -> np.ndarray:
-    return np.maximum(_keep_15min(v), 0.0)
-
-
-def _power_profile_kw_from_energy(v: np.ndarray, dt: float) -> np.ndarray:
-    return _energy_profile_kwh_step(v) / float(dt)
-
-
-def _find_user_yaml(roots: Iterable[os.PathLike], name: str) -> Optional[Path]:
-    for r in roots:
-        for cand in (name, f"{name}.yaml"):
-            p = Path(r) / cand
-            if p.exists():
-                return p
-    return None
-
-
 def build_inputs(
     sim_yaml_path: os.PathLike,
     profiles_csv_path: os.PathLike,
-    max_users: int = 10,
+    max_users: int | None = 10,
     pv_ratio: float = 1.0,
     search_roots: Iterable[os.PathLike] | None = None,
     dt: float = 0.25,
-) -> Tuple[
-    np.ndarray,  # p_pv (35040, U) kW
-    np.ndarray,  # p_ue (35040, U) kW
-    np.ndarray,  # p_el_heater (35040, U) kW
-    np.ndarray,  # size_elh (U,)
-    np.ndarray,  # vol_hss_water (U,)
-    np.ndarray,  # size_bess (U,)
-    np.ndarray,  # eta_bess_in_u (U,)
-    np.ndarray,  # eta_bess_out_u (U,)
-    np.ndarray,  # eta_bess_stor_u (U,)
-    np.ndarray,  # soc_bess_min_u (U,)
-    np.ndarray,  # soc_bess_max_u (U,)
-    np.ndarray,  # t_bess_min_u (U,)
-    list[str],
-]:
-    sim_yaml_path = Path(sim_yaml_path)
-    profiles_csv_path = Path(profiles_csv_path)
-
-    if search_roots is None:
-        search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
-
-    sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
-    users_list = list(sim.get("users_list", []))[: int(max_users)]
-
-    EXCLUDE = {"battery", "bess", "community"}
-    users_list = [u for u in users_list if str(u).strip().lower() not in EXCLUDE]
-    if not users_list:
-        raise RuntimeError("A simulation YAML nem tartalmaz users_list-et vagy max_users=0.")
-
-    df = pd.read_csv(profiles_csv_path, index_col=0)
-    df.columns = [str(c) for c in df.columns]
-    df = df[[c for c in df.columns if c.lower() not in EXCLUDE]]
-
-    p_pv_cols: list[np.ndarray] = []
-    p_ue_cols: list[np.ndarray] = []
-    p_el_heater_cols: list[np.ndarray] = []
-
-    size_elh: list[float] = []
-    vol_hss_water: list[float] = []
-    size_bess: list[float] = []
-    eta_bess_in_u: list[float] = []
-    eta_bess_out_u: list[float] = []
-    eta_bess_stor_u: list[float] = []
-    soc_bess_min_u: list[float] = []
-    soc_bess_max_u: list[float] = []
-    t_bess_min_u: list[float] = []
-    user_names: list[str] = []
-
-    for user_key in users_list:
-        ypath = _find_user_yaml(search_roots, user_key)
-        if not ypath:
-            print(f"[WARN] YAML nem található: {user_key} — kihagyom.")
-            continue
-
-        u = yaml.safe_load(ypath.read_text(encoding="utf-8")) or {}
-        units = u.get("units") or {}
-        name = (units.get("name") or {}).get("name", str(user_key))
-        user_names.append(name)
-
-        ue = units.get("ue") or {}
-        ue_prof = str(ue.get("profile")) if ue.get("profile") is not None else None
-        if ue_prof and ue_prof in df.columns:
-            p_ue_cols.append(_power_profile_kw_from_energy(df[ue_prof].to_numpy(), dt))
-        else:
-            p_ue_cols.append(np.zeros(35040, dtype=float))
-
-        pv = units.get("pv") or {}
-        pv_prof = str(pv.get("profile")) if pv.get("profile") is not None else None
-        if pv_prof and pv_prof in df.columns:
-            p_pv_cols.append(_power_profile_kw_from_energy(df[pv_prof].to_numpy(), dt) * float(pv_ratio))
-        else:
-            p_pv_cols.append(np.zeros(35040, dtype=float))
-
-        bess = units.get("bess") or {}
-        size_bess.append(float(bess.get("bess_size", 0.0)))
-        eta_bess_in_u.append(float(bess.get("eta_bess_in", 0.98)))
-        eta_bess_out_u.append(float(bess.get("eta_bess_out", 0.96)))
-        eta_bess_stor_u.append(float(bess.get("eta_bess_stor", 0.995)))
-        soc_bess_min_u.append(float(bess.get("soc_bess_min", 0.10)))
-        soc_bess_max_u.append(float(bess.get("soc_bess_max", 0.90)))
-        t_bess_min_u.append(float(bess.get("t_bess_min", 2.0)))
-
-        hss = units.get("hss") or {}
-        heater = units.get("ut") or {}
-        p_el_heater_prof = str(heater.get("profile")) if heater.get("profile") is not None else None
-        if p_el_heater_prof and p_el_heater_prof in df.columns:
-            p_el_heater_cols.append(_power_profile_kw_from_energy(df[p_el_heater_prof].to_numpy(), dt))
-        else:
-            p_el_heater_cols.append(np.zeros(35040, dtype=float))
-
-        size_elh.append(float(hss.get("size_elh", 0.0)))
-        vol_hss_water.append(float(hss.get("vol_hss_water", 0.0)))
-
-    if not user_names:
-        raise RuntimeError("Nincs érvényes felhasználó.")
-
+) -> tuple:
+    """Compatibility adapter backed exclusively by :mod:`InputReading`."""
+    inputs = read_simulation_inputs(
+        sim_yaml_path=sim_yaml_path,
+        profiles_csv_path=profiles_csv_path,
+        max_users=max_users,
+        pv_ratio=pv_ratio,
+        search_roots=search_roots,
+        dt=dt,
+    )
     return (
-        np.column_stack(p_pv_cols).astype(float),
-        np.column_stack(p_ue_cols).astype(float),
-        np.column_stack(p_el_heater_cols).astype(float),
-        np.asarray(size_elh, dtype=float),
-        np.asarray(vol_hss_water, dtype=float),
-        np.asarray(size_bess, dtype=float),
-        np.asarray(eta_bess_in_u, dtype=float),
-        np.asarray(eta_bess_out_u, dtype=float),
-        np.asarray(eta_bess_stor_u, dtype=float),
-        np.asarray(soc_bess_min_u, dtype=float),
-        np.asarray(soc_bess_max_u, dtype=float),
-        np.asarray(t_bess_min_u, dtype=float),
-        user_names,
+        inputs.p_pv_kw, inputs.p_ue_kw, inputs.p_el_heater_kw,
+        inputs.size_elh, inputs.vol_hss_water, inputs.size_bess,
+        inputs.eta_bess_in, inputs.eta_bess_out, inputs.eta_bess_stor,
+        inputs.soc_bess_min, inputs.soc_bess_max, inputs.t_bess_min,
+        inputs.user_names,
     )
 
 
@@ -212,27 +94,24 @@ def run(
     if boiler_tariff not in {"A", "B"}:
         raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
-    (
-        p_pv,
-        p_ue,
-        p_el_heater,
-        _size_elh,
-        _vol_hss_water,
-        size_bess,
-        eta_bess_in_u,
-        eta_bess_out_u,
-        eta_bess_stor_u,
-        soc_bess_min_u,
-        soc_bess_max_u,
-        t_bess_min_u,
-        user_names,
-    ) = build_inputs(
+    inputs = read_simulation_inputs(
         sim_yaml_path=sim_yaml,
         profiles_csv_path=profiles_csv,
         max_users=max_users,
         pv_ratio=pv_ratio,
         dt=dt,
     )
+    p_pv = inputs.p_pv_kw
+    p_ue = inputs.p_ue_kw
+    p_el_heater = inputs.p_el_heater_kw
+    size_bess = inputs.size_bess
+    eta_bess_in_u = inputs.eta_bess_in
+    eta_bess_out_u = inputs.eta_bess_out
+    eta_bess_stor_u = inputs.eta_bess_stor
+    soc_bess_min_u = inputs.soc_bess_min
+    soc_bess_max_u = inputs.soc_bess_max
+    t_bess_min_u = inputs.t_bess_min
+    user_names = inputs.user_names
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
