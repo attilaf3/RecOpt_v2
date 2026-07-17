@@ -226,9 +226,21 @@ def plot_household_fourpack_seasons(
 
 
 if __name__ == "__main__":
-    plot_household_fourpack_seasons(
-        results_dir="results_individual_opt_boiler",
-        household_name="0420144888439778",
-        window_days=3,
-        dt=DT,
-    )
+    # plot_household_fourpack_seasons(
+    #     results_dir=r"..\OptimizedScenarios\results_individual_opt_boiler_A_tariff",
+    #     household_name="0420144888371155",
+    #     window_days=3,
+    #     dt=DT,
+    # )
+
+    if __name__ == "__main__":
+        plot_household_fourpack_seasons(
+            results_dir=(
+                r"..\OptimizedScenarios"
+                r"\results_individual_opt_boiler_load_0420144888295341_B"
+                r"\load_0420144888295341"
+            ),
+            household_name="0420144888295341",
+            window_days=3,
+            dt=DT,
+        )

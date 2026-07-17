@@ -15,8 +15,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.append(str(HERE))
-from OptimizedIndividualScenarios.individual_opt_boiler import \
-    individual_opt_boiler # expects (T,U) arrays, sizes, etc. :contentReference[oaicite:1]{index=1}
+from OptimizedIndividualScenarios.individual_opt_boiler_A_only import individual_opt_boiler
 
 
 # --- helpers -------------------------------------------------------------------
@@ -70,6 +69,7 @@ def build_inputs(
     list[float], # T_max_u
     list[float], # T_min_u
     list[float], # T_in_u
+    list[float], # T_set_u
     list[float], # a_hss_u
     list[float], # eta_elh_u
     list[str],   # user_names
@@ -84,7 +84,7 @@ def build_inputs(
     sim_yaml_path = Path(sim_yaml_path)
     profiles_csv_path = Path(profiles_csv_path)
     if search_roots is None:
-        search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
+        search_roots = [sim_yaml_path.parent / "Users_v3", sim_yaml_path.parent]
 
     sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
     users_list_all = list(sim.get("users_list", []))
@@ -129,6 +129,7 @@ def build_inputs(
     T_max_u = []
     a_hss_u = []
     T_in_u = []
+    T_set_u = []
     T_out_u = []
     eta_elh_u = []
     t_hss_min_in_u = []
@@ -207,8 +208,9 @@ def build_inputs(
         T_env_u.append(float(hss.get("T_env", 20)))
         T_max_u.append(float(hss.get("T_max", 65)))
         T_min_u.append(float(hss.get("T_min", 35)))
-        T_in_u.append(float(hss.get("T_in", 12)))
-        T_out_u.append(float(hss.get("T_out", 55)))
+        T_in_u.append(float(hss.get("T_in", 10)))
+        T_set_u.append(float(hss.get("T_set", hss.get("T_setpoint", 50))))
+        T_out_u.append(float(hss.get("T_out", 40)))
         a_hss_u.append(float(hss.get("a_hss", 0.01275)))
         eta_elh_u.append(float(hss.get("eta_elh", 0.95)))
         t_hss_min_in_u.append(float(hss.get("t_hss_min_in", 0.0)))
@@ -239,6 +241,7 @@ def build_inputs(
         T_max_u,
         T_min_u,
         T_in_u,
+        T_set_u,
         a_hss_u,
         eta_elh_u,
         t_hss_min_in_u,
@@ -256,18 +259,14 @@ def run(
         max_users: int = 10,
         target_user: str | None = None,
         run_lp: bool = True,
-        boiler_tariff: str = "B",
 ) -> dict:
     dt = 0.25
 
-    boiler_tariff = str(boiler_tariff).upper().strip()
-    if boiler_tariff not in {"A", "B"}:
-        raise ValueError(f"boiler_tariff csak 'A' vagy 'B' lehet, nem: {boiler_tariff}")
 
     (
         p_pv, p_ue, p_dhw, p_el_heater,
         size_elh, vol_hss_water,
-        T_env_u, T_max_u, T_min_u, T_in_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
+        T_env_u, T_max_u, T_min_u, T_in_u, T_set_u, a_hss_u, eta_elh_u, t_hss_min_in_u,
         user_names
     ) = build_inputs(
         sim_yaml_path=sim_yaml,
@@ -324,26 +323,30 @@ def run(
             T_max=float(T_max_u[u]),
             T_min=float(T_min_u[u]),
             T_in=float(T_in_u[u]),
+            T_set=float(T_set_u[u]),
             a_hss=float(a_hss_u[u]),
             eta_elh=float(eta_elh_u[u]),
             p_el_heater_fixed=p_el_heater_fixed_eff,
 
             price_grid_a_low=36.0,
             price_grid_a_high=71.0,
-            price_grid_b_low=23.0,
-            price_grid_b_high=61.0,
             price_pv_grid=5.0,
             grid_a_low_cap_kwh=2523.0,
-            grid_b_low_cap_kwh=2523.0,
 
             run_lp=run_lp,
             msg=False,
-            enforce_cl_rules=True,
-            cl_max_on_hours_per_day=8.0,
-            cl_min_midday_hours_per_day=4.0,
+
+            # Optimalizált bojlermodell:
+            # nincs kötelező napi 8–12 órás működés,
+            # nincs kötelező 10–16 közötti 4 órás működés.
+            # A bojler teljes évben vezérelhető, a hőtároló korlátain belül.
+            enforce_cl_rules=False,
+            cl_min_on_hours_per_day=0.0,
+            cl_max_on_hours_per_day=24.0,
+            cl_min_midday_hours_per_day=0.0,
+
             gapRel=0.005,
             timeLimit=None,
-            boiler_tariff=boiler_tariff,
             objective="bill",
         )
 
@@ -398,7 +401,9 @@ def run(
             "household": name,
             "has_pv": int(np.sum(p_pv[:, u]) > 1e-9),
             "has_boiler": int((size_elh[u] > 1e-9) and (vol_hss_water[u] > 1e-9)),
-            "boiler_tariff": boiler_tariff,
+            "boiler_tariff": "A",
+            "T_set_c": float(T_set_u[u]),
+            "final_t_hss_c": float(res["final_t_hss"]),
 
             "pv_gen_kwh": float(np.sum(p_pv[:, u]) * dt),
             "load_kwh": float(np.sum(p_ue[:, u]) * dt),
@@ -463,7 +468,9 @@ def run(
         "total_brt_bill_ft": float(finance_df["brt_bill_ft"].sum()),
         "total_import_cost_ft": float(finance_df["import_cost_ft"].sum()),
         "total_export_revenue_ft": float(finance_df["export_revenue_ft"].sum()),
-        "boiler_tariff": boiler_tariff,
+        "boiler_tariff": "A",
+        "daily_runtime_constraints_enabled": False,
+        "boiler_availability": "continuous; limited only by HSS constraints",
     }
 
     (out / "summary.json").write_text(
@@ -502,23 +509,10 @@ if __name__ == "__main__":
     # A tarifa
     summary = run(
         sim_yaml="../Input/simulation_config_disaggregated_with_userlist.yaml",
-        profiles_csv="../Input/measurements_disaggregated.csv",
+        profiles_csv="../Input/measurements_disaggregated_v2.csv",
         dhw_profiles_csv="../Input/dhw_v2.csv",
-        out_dir="results_individual_opt_boiler_B_tariff",
+        out_dir="results_individual_opt_boiler_A_tariff",
         max_users=105,
         run_lp=False,
-        boiler_tariff="A",
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-
-    # B tarifa
-    # summary = run(
-    #     sim_yaml="../Input/simulation_config_disaggregated_with_userlist.yaml",
-    #     profiles_csv="../Input/measurements_disaggregated.csv",
-    #     dhw_profiles_csv="../Input/dhw_v2.csv",
-    #     out_dir="results_individual_opt_boiler_B_tariff",
-    #     max_users=105,
-    #     run_lp=False,
-    #     boiler_tariff="B",
-    # )
-    # print(json.dumps(summary, indent=2, ensure_ascii=False))
