@@ -91,22 +91,122 @@ def _split_low_high_step(
     high = max(e - low, 0.0)
     return low, high, max(float(remaining_low_kwh) - low, 0.0)
 
-def _allocate_equal_waterfill(demand: np.ndarray, total_share: float) -> np.ndarray:
+def _allocate_equal_no_redistribution(demand: np.ndarray, total_share: float) -> np.ndarray:
+    """
+    Equal megosztás újraosztás nélkül.
+
+    Minden aktív vevő egyszeri azonos jogosultsági kvótát kap:
+        quota = total_share / n_active.
+    Ha egy vevő ennél kevesebbet tud felvenni, a maradék nem kerül át
+    másik vevőhöz, hanem nem lesz shared energia.
+    """
     d = np.maximum(np.asarray(demand, dtype=float), 0.0)
     total_share = min(max(float(total_share), 0.0), float(d.sum()))
     out = np.zeros_like(d)
-    remaining = total_share
-    while remaining > EPS:
-        room = d - out
-        active = room > EPS
-        n = int(active.sum())
-        if n == 0:
-            break
-        quota = remaining / n
-        take = np.minimum(room[active], quota)
-        out[active] += take
-        remaining -= float(take.sum())
+
+    if total_share <= EPS or d.sum() <= EPS:
+        return out
+
+    active = d > EPS
+    n = int(active.sum())
+    if n == 0:
+        return out
+
+    quota = total_share / n
+    out[active] = np.minimum(d[active], quota)
     return out
+
+
+
+def _deterministic_shared_from_residuals(
+    residual_surplus: np.ndarray,
+    residual_deficit_ue: np.ndarray,
+    residual_deficit_elh: np.ndarray,
+    *,
+    boiler_tariff: str,
+    sharing_mode: SharingMode,
+) -> dict:
+    """
+    Noopt-tal egyező determinisztikus közösségi megosztás a BESS utáni
+    maradék PV-többlet és maradék, sharedre jogosult hiány alapján.
+
+    Fontos:
+      - B tarifán a bojler nem jogosult sharedre, ezért residual_deficit_elh
+        teljesen grid_elh marad.
+      - A kapott shared energiát háztartáson belül először az alapfogyasztásra,
+        majd A tarifán a bojlerre könyveli, ugyanúgy, mint a nonopt modell.
+    """
+    surplus = np.maximum(np.asarray(residual_surplus, dtype=float), 0.0)
+    def_ue = np.maximum(np.asarray(residual_deficit_ue, dtype=float), 0.0)
+    def_elh_raw = np.maximum(np.asarray(residual_deficit_elh, dtype=float), 0.0)
+
+    T, U = surplus.shape
+    if def_ue.shape != (T, U) or def_elh_raw.shape != (T, U):
+        raise ValueError("A determinisztikus shared bemeneti mátrixainak alakja nem egyezik")
+
+    tariff = str(boiler_tariff).upper().strip()
+    if tariff == "A":
+        eligible_elh = def_elh_raw.copy()
+    elif tariff == "B":
+        eligible_elh = np.zeros_like(def_elh_raw)
+    else:
+        raise ValueError("boiler_tariff csak 'A' vagy 'B' lehet")
+
+    eligible_def = def_ue + eligible_elh
+
+    p_shared_total = np.zeros((T, U), dtype=float)
+    p_shared_ue = np.zeros((T, U), dtype=float)
+    p_shared_elh = np.zeros((T, U), dtype=float)
+    p_shared_out = np.zeros((T, U), dtype=float)
+    p_pv_grid = np.zeros((T, U), dtype=float)
+    p_grid_ue = np.zeros((T, U), dtype=float)
+    p_grid_elh = np.zeros((T, U), dtype=float)
+
+    for t in range(T):
+        S = float(surplus[t, :].sum())
+        D = float(eligible_def[t, :].sum())
+        total_share = min(S, D)
+
+        if total_share > EPS:
+            if sharing_mode == "proportional":
+                shared_in_t = eligible_def[t, :] * (total_share / D) if D > EPS else np.zeros(U, dtype=float)
+            elif sharing_mode == "equal":
+                shared_in_t = _allocate_equal_no_redistribution(eligible_def[t, :], total_share)
+            else:
+                raise ValueError("sharing_mode csak 'proportional' vagy 'equal' lehet")
+            actual_share = float(shared_in_t.sum())
+            # Equal módban a kvótából fel nem vett rész nem osztódik újra,
+            # ezért csak a ténylegesen felvett shared_in mennyiség kerül
+            # eladói shared_out-ba; a maradék PV-többlet grid export lesz.
+            shared_out_t = surplus[t, :] * (actual_share / S) if S > EPS and actual_share > EPS else np.zeros(U, dtype=float)
+        else:
+            shared_in_t = np.zeros(U, dtype=float)
+            shared_out_t = np.zeros(U, dtype=float)
+
+        # Háztartáson belüli sorrend: alapfogyasztás előbb, bojler utána.
+        shared_ue_t = np.minimum(def_ue[t, :], shared_in_t)
+        shared_elh_t = np.minimum(eligible_elh[t, :], np.maximum(shared_in_t - shared_ue_t, 0.0))
+
+        p_shared_total[t, :] = shared_in_t
+        p_shared_ue[t, :] = shared_ue_t
+        p_shared_elh[t, :] = shared_elh_t
+        p_shared_out[t, :] = shared_out_t
+        p_pv_grid[t, :] = np.maximum(surplus[t, :] - shared_out_t, 0.0)
+        p_grid_ue[t, :] = np.maximum(def_ue[t, :] - shared_ue_t, 0.0)
+        if tariff == "A":
+            p_grid_elh[t, :] = np.maximum(def_elh_raw[t, :] - shared_elh_t, 0.0)
+        else:
+            p_grid_elh[t, :] = def_elh_raw[t, :]
+
+    return {
+        "p_shared_total": p_shared_total,
+        "p_shared_ue": p_shared_ue,
+        "p_shared_elh": p_shared_elh,
+        "p_shared_out": p_shared_out,
+        "p_pv_grid": p_pv_grid,
+        "p_grid_ue": p_grid_ue,
+        "p_grid_elh": p_grid_elh,
+    }
 
 
 def _allocate_seller_to_buyers(
@@ -159,11 +259,11 @@ def settle_shared_payments(
     buyer_low_remaining keretet fogyasztja, mint az A-tarifás hálózati import.
 
     Időlépésen belül elszámolási sorrend:
-        1) A-tarifás hálózati import,
-        2) közösségből vett energia.
+        1) közösségből vett energia,
+        2) A-tarifás hálózati import.
 
-    Ez az éves közös sávot modellezi; egy 15 perces időlépésen belül az
-    elszámolási sorrend csak akkor számít, ha pont a sávhatáron vagyunk.
+    Tehát a shared_in fogyasztja először a vevő 2523 kWh-os
+    kedvezményes A-sávját, és csak a maradék keret jut grid_import_a-ra.
 
     Ez biztosítja, hogy a megosztott energia ára:
         low sávban:  5 + 31 Ft/kWh,
@@ -201,20 +301,20 @@ def settle_shared_payments(
         sout = e_shared_out[t, :]
         total_share = min(float(sin.sum()), float(sout.sum()))
 
-        # Vevői közös sáv fogyasztása: először A hálózati import, utána shared.
-        # Így a post-process elszámolás összhangban marad a MILP sávkorlátjaival.
+        # Vevői közös sáv fogyasztása: először shared, utána A hálózati import.
+        # Így a shared_in kap elsőbbséget a 2523 kWh-os kedvezményes A-sávban.
         buyer_shared_low_t = np.zeros(U, dtype=float)
         buyer_shared_high_t = np.zeros(U, dtype=float)
         for b in range(U):
-            low_g, high_g, rem = _split_low_high_step(e_grid_import_a[t, b], buyer_low_remaining[b])
-            buyer_grid_a_low_kwh[b] += low_g
-            buyer_grid_a_high_kwh[b] += high_g
-
-            low_s, high_s, rem = _split_low_high_step(sin[b], rem)
+            low_s, high_s, rem = _split_low_high_step(sin[b], buyer_low_remaining[b])
             buyer_shared_low_t[b] = low_s
             buyer_shared_high_t[b] = high_s
             buyer_shared_low_kwh[b] += low_s
             buyer_shared_high_kwh[b] += high_s
+
+            low_g, high_g, rem = _split_low_high_step(e_grid_import_a[t, b], rem)
+            buyer_grid_a_low_kwh[b] += low_g
+            buyer_grid_a_high_kwh[b] += high_g
             buyer_low_remaining[b] = rem
 
         if total_share <= EPS:
@@ -429,6 +529,10 @@ def disaggregated_opt_bess_shared(
     e_shared_a_low_step = _var_matrix("e_shared_a_low_step", T, U)
     e_shared_a_high_step = _var_matrix("e_shared_a_high_step", T, U)
     rem_a_low = [[pulp.LpVariable(f"rem_a_low_{t}_{u}", lowBound=0, upBound=grid_a_low_cap_kwh) for u in user_set] for t in time_set]
+    # Bináris a shared-first A-sávhoz:
+    # e_shared_a_low_step = min(e_shared_a_t, előző maradék A-sáv).
+    # LP relaxációban ez lazított, MILP-ben pontos.
+    d_shared_low_full = _bin_matrix("d_shared_low_full", T, U, run_lp)
 
     e_grid_b_low_step = _var_matrix("e_grid_b_low_step", T, U)
     e_grid_b_high_step = _var_matrix("e_grid_b_high_step", T, U)
@@ -444,9 +548,30 @@ def disaggregated_opt_bess_shared(
 
     M_pv_u = np.maximum(np.max(p_pv, axis=0) + np.max(battery_power) + 1.0, 1.0)
     M_grid_u = np.maximum(np.max(total_load, axis=0) + battery_power + 1.0, 1.0)
+    no_bess_active = not bool(np.any(np.asarray(bess_enabled, dtype=bool) & (size_bess > EPS)))
 
     # --- Korlátok ---
     for t in time_set:
+        det_shared_ue_const = det_shared_elh_const = None
+        det_shared_out_const = det_pv_grid_const = None
+        det_grid_ue_const = det_grid_elh_const = None
+        if no_bess_active:
+            # BESS nélküli esetben a shared kiosztás teljesen determinisztikus,
+            # ezért az optimalizált modell pontosan a nonopt megosztási szabályát kapja.
+            det = _deterministic_shared_from_residuals(
+                residual_surplus=p_surplus[t:t + 1, :],
+                residual_deficit_ue=p_deficit_ue[t:t + 1, :],
+                residual_deficit_elh=p_deficit_elh[t:t + 1, :],
+                boiler_tariff=boiler_tariff,
+                sharing_mode=sharing_mode,
+            )
+            det_shared_ue_const = det["p_shared_ue"][0, :]
+            det_shared_elh_const = det["p_shared_elh"][0, :]
+            det_shared_out_const = det["p_shared_out"][0, :]
+            det_pv_grid_const = det["p_pv_grid"][0, :]
+            det_grid_ue_const = det["p_grid_ue"][0, :]
+            det_grid_elh_const = det["p_grid_elh"][0, :]
+
         # Közösségi megosztási egyenleg: amit eladnak, azt ugyanabban a lépésben megveszik.
         prob += (
             pulp.lpSum(p_pv_shared[t][u] for u in user_set)
@@ -472,28 +597,49 @@ def disaggregated_opt_bess_shared(
             ), f"boiler_deficit_split_{t}_{u}"
 
             if boiler_tariff == "B":
-                # B tarifás bojler külön kör: saját PV-t és saját BESS-t nem kap,
-                # de energiaközösségi megosztott energiát kaphat.
+                # B tarifás bojler külön kör: saját PV-t, saját BESS-t és
+                # közösségi megosztott energiát sem kap. A teljes bojlerhiány
+                # B tarifás hálózati importként jelenik meg.
                 prob += p_bess_elh[t][u] == 0, f"no_bess_to_boiler_B_{t}_{u}"
+                prob += p_shared_elh[t][u] == 0, f"no_shared_to_boiler_B_{t}_{u}"
 
             p_shared_total_tu = p_shared_ue[t][u] + p_shared_elh[t][u]
-            deficit_total_const = float(p_deficit_ue[t, u] + p_deficit_elh[t, u])
-            if deficit_total_const <= EPS:
-                prob += p_shared_total_tu == 0, f"no_shared_without_deficit_{t}_{u}"
-            elif sharing_mode == "proportional":
-                prob += p_shared_total_tu == share_alpha[t] * deficit_total_const, f"shared_proportional_{t}_{u}"
-                # A megosztott energia alap/bojler bontása is a hiány bontását követi,
-                # ezért B tarifás bojlernél pontosan mérhető a shared_to_boiler.
-                prob += p_shared_ue[t][u] == share_alpha[t] * float(p_deficit_ue[t, u]), f"shared_ue_prop_{t}_{u}"
-                prob += p_shared_elh[t][u] == share_alpha[t] * float(p_deficit_elh[t, u]), f"shared_elh_prop_{t}_{u}"
+
+            if no_bess_active:
+                # Exact nonopt shared BESS nélkül: a megosztás mennyisége,
+                # eladói oldala és vevői kiosztása is determinisztikus.
+                prob += p_pv_shared[t][u] == float(det_shared_out_const[u]), f"det_pv_shared_no_bess_{t}_{u}"
+                prob += p_pv_grid[t][u] == float(det_pv_grid_const[u]), f"det_pv_grid_no_bess_{t}_{u}"
+                prob += p_shared_ue[t][u] == float(det_shared_ue_const[u]), f"det_shared_ue_no_bess_{t}_{u}"
+                prob += p_shared_elh[t][u] == float(det_shared_elh_const[u]), f"det_shared_elh_no_bess_{t}_{u}"
+                prob += p_grid_ue[t][u] == float(det_grid_ue_const[u]), f"det_grid_ue_no_bess_{t}_{u}"
+                prob += p_grid_elh[t][u] == float(det_grid_elh_const[u]), f"det_grid_elh_no_bess_{t}_{u}"
             else:
-                # Equal mód: minden aktív hiányos felhasználó ugyanakkora kvótáig kaphat.
-                # A kvóta feletti hiányt BESS vagy hálózat fedezheti.
-                prob += p_shared_total_tu <= share_quota[t], f"shared_equal_quota_{t}_{u}"
-                if deficit_total_const > EPS:
-                    # A kapott megosztott energia alap/bojler bontása a hiány bontását követi.
-                    prob += p_shared_ue[t][u] == p_shared_total_tu * float(p_deficit_ue[t, u] / deficit_total_const), f"shared_ue_equal_split_{t}_{u}"
-                    prob += p_shared_elh[t][u] == p_shared_total_tu * float(p_deficit_elh[t, u] / deficit_total_const), f"shared_elh_equal_split_{t}_{u}"
+                # BESS-es esetben a BESS változtatja meg a shared előtti maradék
+                # többletet/hiányt. Az exact BESS utáni proportional/equal kiosztás
+                # bilineáris lenne, ezért a MILP-ben lineáris reprezentáció marad,
+                # majd az eredményeket a végén determinisztikusan újraszámoljuk.
+                if boiler_tariff == "A":
+                    eligible_deficit_ue = float(p_deficit_ue[t, u])
+                    eligible_deficit_elh = float(p_deficit_elh[t, u])
+                else:
+                    eligible_deficit_ue = float(p_deficit_ue[t, u])
+                    eligible_deficit_elh = 0.0
+
+                deficit_total_const = eligible_deficit_ue + eligible_deficit_elh
+                if deficit_total_const <= EPS:
+                    prob += p_shared_total_tu == 0, f"no_shared_without_deficit_{t}_{u}"
+                elif sharing_mode == "proportional":
+                    prob += p_shared_total_tu == share_alpha[t] * deficit_total_const, f"shared_proportional_{t}_{u}"
+                    prob += p_shared_ue[t][u] == share_alpha[t] * eligible_deficit_ue, f"shared_ue_prop_{t}_{u}"
+                    prob += p_shared_elh[t][u] == share_alpha[t] * eligible_deficit_elh, f"shared_elh_prop_{t}_{u}"
+                else:
+                    # Equal mód: minden aktív, sharedre jogosult hiányos felhasználó
+                    # ugyanakkora kvótáig kaphat. B tarifás bojler nem jogosult.
+                    prob += p_shared_total_tu <= share_quota[t], f"shared_equal_quota_{t}_{u}"
+                    prob += p_shared_total_tu <= deficit_total_const, f"shared_equal_deficit_cap_{t}_{u}"
+                    prob += p_shared_ue[t][u] == p_shared_total_tu * float(eligible_deficit_ue / deficit_total_const), f"shared_ue_equal_split_{t}_{u}"
+                    prob += p_shared_elh[t][u] == p_shared_total_tu * float(eligible_deficit_elh / deficit_total_const), f"shared_elh_equal_split_{t}_{u}"
 
             prob += p_grid_export[t][u] == p_pv_grid[t][u], f"grid_export_def_{t}_{u}"
             prob += (
@@ -568,24 +714,37 @@ def disaggregated_opt_bess_shared(
 
             e_shared_a_t = dt * (p_shared_ue[t][u] + p_shared_elh[t][u])
 
-            # A vevő 2523 kWh-os A-sávját az A-tarifás hálózati import és a
-            # közösségi megosztás közösen fogyasztja. Nincs külön shared/seller keret.
+            # A vevő 2523 kWh-os A-sávját a közösségi megosztás és
+            # az A-tarifás hálózati import közösen fogyasztja.
+            # Sorrend: először shared_in, utána a maradék A-sávból grid_import_a.
             prob += e_shared_a_low_step[t][u] + e_shared_a_high_step[t][u] == e_shared_a_t, f"shared_a_tier_split_{t}_{u}"
             prob += e_grid_a_low_step[t][u] + e_grid_a_high_step[t][u] == e_imp_a_t, f"a_tier_split_{t}_{u}"
             prob += e_grid_b_low_step[t][u] + e_grid_b_high_step[t][u] == e_imp_b_t, f"b_tier_split_{t}_{u}"
 
             if t == 0:
-                prob += rem_a_low[t][u] == float(grid_a_low_cap_kwh) - e_shared_a_low_step[t][u] - e_grid_a_low_step[t][u], f"rem_a_init_{u}"
-                prob += e_shared_a_low_step[t][u] <= float(grid_a_low_cap_kwh), f"shared_a_low_cap_init_{u}"
-                prob += e_grid_a_low_step[t][u] <= float(grid_a_low_cap_kwh) - e_shared_a_low_step[t][u], f"a_low_cap_init_{u}"
-                prob += rem_b_low[t][u] == float(grid_b_low_cap_kwh) - e_grid_b_low_step[t][u], f"rem_b_init_{u}"
-                prob += e_grid_b_low_step[t][u] <= float(grid_b_low_cap_kwh), f"b_low_cap_init_{u}"
+                rem_a_prev = float(grid_a_low_cap_kwh)
+                rem_b_prev = float(grid_b_low_cap_kwh)
             else:
-                prob += rem_a_low[t][u] == rem_a_low[t - 1][u] - e_shared_a_low_step[t][u] - e_grid_a_low_step[t][u], f"rem_a_dyn_{t}_{u}"
-                prob += e_shared_a_low_step[t][u] <= rem_a_low[t - 1][u], f"shared_a_low_remaining_{t}_{u}"
-                prob += e_grid_a_low_step[t][u] <= rem_a_low[t - 1][u] - e_shared_a_low_step[t][u], f"a_low_remaining_{t}_{u}"
-                prob += rem_b_low[t][u] == rem_b_low[t - 1][u] - e_grid_b_low_step[t][u], f"rem_b_dyn_{t}_{u}"
-                prob += e_grid_b_low_step[t][u] <= rem_b_low[t - 1][u], f"b_low_remaining_{t}_{u}"
+                rem_a_prev = rem_a_low[t - 1][u]
+                rem_b_prev = rem_b_low[t - 1][u]
+
+            # Shared-first: e_shared_low = min(e_shared_a_t, rem_a_prev).
+            prob += e_shared_a_low_step[t][u] <= e_shared_a_t, f"shared_a_low_le_shared_{t}_{u}"
+            prob += e_shared_a_low_step[t][u] <= rem_a_prev, f"shared_a_low_le_remaining_{t}_{u}"
+
+            if not run_lp:
+                m_shared_first = float(grid_a_low_cap_kwh) + float(np.max(total_load[:, u]) * dt) + 1.0
+                prob += e_shared_a_low_step[t][u] >= e_shared_a_t - m_shared_first * (1 - d_shared_low_full[t][u]), f"shared_a_low_min_shared_{t}_{u}"
+                prob += e_shared_a_low_step[t][u] >= rem_a_prev - m_shared_first * d_shared_low_full[t][u], f"shared_a_low_min_remaining_{t}_{u}"
+
+            # A grid csak a shared után megmaradó kedvezményes A-sávot használhatja.
+            prob += e_grid_a_low_step[t][u] <= rem_a_prev - e_shared_a_low_step[t][u], f"a_low_after_shared_{t}_{u}"
+
+            prob += rem_a_low[t][u] == rem_a_prev - e_shared_a_low_step[t][u] - e_grid_a_low_step[t][u], f"rem_a_dyn_{t}_{u}"
+
+            # B-sáv külön keret: csak B tarifás bojler grid importja fogyasztja.
+            prob += e_grid_b_low_step[t][u] <= rem_b_prev, f"b_low_remaining_{t}_{u}"
+            prob += rem_b_low[t][u] == rem_b_prev - e_grid_b_low_step[t][u], f"rem_b_dyn_{t}_{u}"
 
     # Kezdeti SOC.
     for u in user_set:
@@ -675,6 +834,42 @@ def disaggregated_opt_bess_shared(
         p_grid_import_a_v = p_grid_ue_v + p_grid_elh_v + p_grid_bess_v
     else:
         p_grid_import_a_v = p_grid_ue_v + p_grid_bess_v
+
+    # Végső, noopt-tal egyező determinisztikus megosztás a BESS utáni
+    # maradék pozíciókból. Ez biztosítja, hogy a shared nem önálló
+    # optimalizálási döntés: a kiosztást csak a BESS által módosított
+    # surplus/deficit tudja befolyásolni.
+    det = _deterministic_shared_from_residuals(
+        residual_surplus=np.maximum(p_surplus - p_pv_bess_v, 0.0),
+        residual_deficit_ue=np.maximum(p_deficit_ue - p_bess_ue_v, 0.0),
+        residual_deficit_elh=np.maximum(p_deficit_elh - p_bess_elh_v, 0.0),
+        boiler_tariff=boiler_tariff,
+        sharing_mode=sharing_mode,
+    )
+    p_pv_shared_v = det["p_shared_out"]
+    p_pv_grid_v = det["p_pv_grid"]
+    p_grid_export_v = p_pv_grid_v.copy()
+    p_shared_ue_v = det["p_shared_ue"]
+    p_shared_elh_v = det["p_shared_elh"]
+    p_shared_in_v = det["p_shared_total"]
+    p_grid_ue_v = det["p_grid_ue"]
+    p_grid_elh_v = det["p_grid_elh"]
+    p_grid_load_v = p_grid_ue_v + p_grid_elh_v
+    if boiler_tariff == "A":
+        p_grid_import_a_v = p_grid_ue_v + p_grid_elh_v + p_grid_bess_v
+    else:
+        p_grid_import_a_v = p_grid_ue_v + p_grid_bess_v
+    p_grid_import_v = p_grid_ue_v + p_grid_elh_v + p_grid_bess_v
+
+    if boiler_tariff == "B":
+        if float(np.max(np.abs(p_pv_elh_fixed))) > 1e-7:
+            raise RuntimeError("B tarifán saját PV energia jutott a bojlerre.")
+        if float(np.max(np.abs(p_bess_elh_v))) > 1e-7:
+            raise RuntimeError("B tarifán saját BESS energia jutott a bojlerre.")
+        if float(np.max(np.abs(p_shared_elh_v))) > 1e-7:
+            raise RuntimeError("B tarifán shared energia jutott a bojlerre.")
+        if not np.allclose(p_grid_elh_v, p_el_heater, atol=1e-7):
+            raise RuntimeError("B tarifán a bojlerigény nem teljes egészében B tarifás grid importként jelent meg.")
 
     settlement = settle_shared_payments(
         p_shared_in=p_shared_in_v,
@@ -785,6 +980,8 @@ def disaggregated_opt_bess_shared(
         "boiler_tariff": boiler_tariff,
         "sharing_mode": sharing_mode,
         "pairing_mode": pairing_mode,
+        "deterministic_sharing_after_bess": True,
+        "exact_no_bess_matches_nonopt": bool(no_bess_active),
         "bess_min_mode_steps": int(bess_min_mode_steps),
         "bess_min_mode_minutes": float(bess_min_mode_steps) * dt * 60.0,
         "pv_user_count": int((p_pv.sum(axis=0) * dt > EPS).sum()),

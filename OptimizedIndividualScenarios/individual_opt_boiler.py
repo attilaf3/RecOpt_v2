@@ -23,10 +23,10 @@ def individual_opt_boiler(
     grid_a_low_cap_kwh=2523.0,
     run_lp=False,
     msg=True,
-    enforce_cl_rules=False,
-    cl_min_on_hours_per_day=0.0,
-    cl_max_on_hours_per_day=24.0,
-    cl_min_midday_hours_per_day=0.0,
+    enforce_cl_rules=True,
+    cl_min_activation_hours=2.0,
+    cl_max_on_hours_per_day=12.0,
+    cl_min_midday_hours_per_day=4.0,
     gapRel=None,
     timeLimit=None,
     objective="bill"
@@ -96,13 +96,23 @@ def individual_opt_boiler(
             pulp.LpVariable(f"t_hss_{t}", lowBound=T_min, upBound=T_max)
             for t in range(T + 1)
         ]
-        d_cl = [pulp.LpVariable(f"d_cl_{t}", cat=pulp.LpBinary) if not run_lp else 0 for t in time_set]
+        d_cl = [
+            pulp.LpVariable(f"d_cl_{t}", cat=pulp.LpBinary)
+            if not run_lp else 0
+            for t in time_set
+        ]
+        d_cl_start = [
+            pulp.LpVariable(f"d_cl_start_{t}", cat=pulp.LpBinary)
+            if not run_lp else 0
+            for t in time_set
+        ]
     else:
         p_elh_in = [0.0] * T
         p_hss_in = [0.0] * T
         p_hss_out = [0.0] * T
         t_hss = [0.0] * T
         d_cl = [0.0] * T
+        d_cl_start = [0.0] * T
 
     # Tarifa blokk
     # 15 perces bruttó elszámolás
@@ -173,8 +183,6 @@ def individual_opt_boiler(
                 prob += p_elh_in[t] <= size_elh * d_cl[t], f"elh_onoff_{t}"
 
 
-            if not run_lp and t != 0 and t != T - 1:
-                prob += d_cl[t + 1] >= d_cl[t] - d_cl[t - 1], f"cl_min_on_time_{t}"
 
         else:
             prob += p_pv_elh[t] == 0, f"no_hss_pv_elh_{t}"
@@ -195,27 +203,99 @@ def individual_opt_boiler(
 
     if hss_active and enforce_cl_rules and not run_lp:
         n_timesteps_in_a_day = round(24 / dt)
-        assert abs(n_timesteps_in_a_day * dt - 24) < 1e-9, "dt must divide 24h exactly"
+        assert abs(n_timesteps_in_a_day * dt - 24) < 1e-9, (
+            "dt must divide 24h exactly"
+        )
 
-        # 10:00–16:00 közötti "középső" időszak
-        start_mid = round(10 / dt)
-        mid_len = round(6 / dt)
+        min_activation_steps = round(cl_min_activation_hours / dt)
+        max_on_steps_per_day = round(cl_max_on_hours_per_day / dt)
+        min_midday_steps_per_day = round(
+            cl_min_midday_hours_per_day / dt
+        )
 
-        y_middle_day = [0] * n_timesteps_in_a_day
-        for i in range(start_mid, min(start_mid + mid_len, n_timesteps_in_a_day)):
-            y_middle_day[i] = 1
+        if min_activation_steps < 1:
+            raise ValueError("cl_min_activation_hours must be positive.")
+        if max_on_steps_per_day > n_timesteps_in_a_day:
+            raise ValueError(
+                "cl_max_on_hours_per_day cannot exceed 24 hours."
+            )
 
-        min_on_steps = round(cl_min_on_hours_per_day / dt)
-        max_on_steps = round(cl_max_on_hours_per_day / dt)
-        min_mid_steps = round(cl_min_midday_hours_per_day / dt)
+        # ------------------------------------------------------------------
+        # 1) Bekapcsolási esemény azonosítása
+        #
+        # d_cl_start[t] = 1, ha az engedélyezőjel t-ben 0-ról 1-re vált.
+        # A horizont előtt kikapcsolt állapotot feltételezünk.
+        # ------------------------------------------------------------------
+        prob += d_cl_start[0] >= d_cl[0], "cl_start_initial"
+        prob += d_cl_start[0] <= d_cl[0], "cl_start_initial_upper"
 
-        for j in range(0, T, n_timesteps_in_a_day):
-            day_idx = range(j, min(j + n_timesteps_in_a_day, T))
-            if len(list(day_idx)) < n_timesteps_in_a_day:
+        for t in range(1, T):
+            prob += (
+                d_cl_start[t] >= d_cl[t] - d_cl[t - 1]
+            ), f"cl_start_lower_{t}"
+            prob += (
+                d_cl_start[t] <= d_cl[t]
+            ), f"cl_start_upper_on_{t}"
+            prob += (
+                d_cl_start[t] <= 1 - d_cl[t - 1]
+            ), f"cl_start_upper_prev_{t}"
+
+        # ------------------------------------------------------------------
+        # 2) Minimum 2 órás engedélyezőjel-aktivitás minden aktiválás után
+        #
+        # Ha d_cl_start[t] = 1, akkor a következő
+        # min_activation_steps darab időlépésben d_cl = 1.
+        # A horizont végén már nem engedünk olyan új indítást, amelyhez
+        # nem maradna meg a teljes kötelező aktív idő.
+        # ------------------------------------------------------------------
+        last_valid_start = T - min_activation_steps
+
+        for t in range(T):
+            if t <= last_valid_start:
+                prob += (
+                    pulp.lpSum(
+                        d_cl[k]
+                        for k in range(t, t + min_activation_steps)
+                    )
+                    >= min_activation_steps * d_cl_start[t]
+                ), f"cl_min_activation_{t}"
+            else:
+                prob += d_cl_start[t] == 0, f"cl_no_late_start_{t}"
+
+        # ------------------------------------------------------------------
+        # 3) Napi szabályok
+        #
+        # - az engedélyezőjel legfeljebb 12 órán át lehet aktív / 24 óra;
+        # - 10:00 és 16:00 között legalább 4 órán át aktívnak kell lennie.
+        # ------------------------------------------------------------------
+        midday_start_step = round(10 / dt)
+        midday_end_step = round(16 / dt)
+
+        for day_start in range(0, T, n_timesteps_in_a_day):
+            day_stop = min(
+                day_start + n_timesteps_in_a_day,
+                T,
+            )
+
+            # Csak teljes 24 órás napra írjuk fel a napi szabályokat.
+            if day_stop - day_start < n_timesteps_in_a_day:
                 continue
 
-            prob += pulp.lpSum(d_cl[t] for t in day_idx) >= min_on_steps, f"day_{j}_cl_minon"
-            prob += pulp.lpSum(d_cl[t] for t in day_idx) <= max_on_steps, f"day_{j}_cl_maxon"
+            day_steps = range(day_start, day_stop)
+            midday_steps = range(
+                day_start + midday_start_step,
+                day_start + midday_end_step,
+            )
+
+            prob += (
+                pulp.lpSum(d_cl[t] for t in day_steps)
+                <= max_on_steps_per_day
+            ), f"day_{day_start}_cl_max_on"
+
+            prob += (
+                pulp.lpSum(d_cl[t] for t in midday_steps)
+                >= min_midday_steps_per_day
+            ), f"day_{day_start}_cl_midday_min"
 
     if objective == "bill":
         prob += pulp.lpSum(
@@ -271,8 +351,13 @@ def individual_opt_boiler(
 
     if hss_active and not run_lp:
         d_cl_v = np.array([_val(v) for v in d_cl], dtype=float)
+        d_cl_start_v = np.array(
+            [_val(v) for v in d_cl_start],
+            dtype=float,
+        )
     else:
         d_cl_v = np.zeros(T)
+        d_cl_start_v = np.zeros(T)
 
     if not run_lp:
         d_export_v = np.array([_val(v) for v in d_export], dtype=float)
@@ -331,6 +416,7 @@ def individual_opt_boiler(
         "status": status_str,
         "hss_active": int(hss_active),
         "d_cl": d_cl_v,
+        "d_cl_start": d_cl_start_v,
         "d_export": d_export_v,
         "boiler_tariff": "A",
         "T_set": T_set,

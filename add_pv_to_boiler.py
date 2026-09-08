@@ -40,9 +40,20 @@ PV_SCALE_MAX = 1.20
 # Ha kizárólag HSS-es felhasználókat szeretnél: "hss_only"
 BOILER_DEFINITION = "hss_or_ut"  # "hss_only" vagy "hss_or_ut"
 
-# Ha megadod a háztartáskódokat, nem véletlenszerűen választ.
-# Példa: FORCED_RECIPIENTS = ["101", "113", "62"]
-FORCED_RECIPIENTS: list[str] | None = None
+# Ha megadod a háztartásokat, pontosan ezek kapnak új PV-t.
+# Elfogadott példák ugyanarra a háztartásra:
+#   "load_0420144653458813", "0420144653458813", vagy az egyedi "813" végződés.
+# None esetén az eredeti, véletlenszerű kiválasztás fut N_NEW_PV_USERS darabbal.
+RECIPIENT_HOUSEHOLDS: list[str] | None = ["load_0420144653449093",
+"load_0420144888235070",
+"load_0420144888295341",
+"load_0420144888340898",
+"load_0420144888397058",
+"load_0420144888460007",
+"load_0420144888377089",
+"load_0420144888444271",
+"load_0420144888481697",
+"load_0420144888447785"]
 
 
 @dataclass
@@ -148,19 +159,49 @@ def select_recipients(
     seed: int,
     forced_codes: list[str] | None,
 ) -> list[UserRecord]:
-    by_code = {u.code: u for u in candidates}
-
     if forced_codes is not None:
-        normalized = [str(code) for code in forced_codes]
-        missing = [code for code in normalized if code not in by_code]
-        if missing:
+        requested = [str(code).strip() for code in forced_codes]
+        if not requested:
             raise ValueError(
-                "A megadott háztartások között van olyan, amely nem bojleres, már PV-s, "
-                f"vagy nem található: {missing}"
+                "A RECIPIENT_HOUSEHOLDS üres lista. Adj meg legalább egy háztartást, "
+                "vagy használj None értéket a véletlenszerű módhoz."
             )
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("A FORCED_RECIPIENTS listában ismétlődő háztartáskód van.")
-        return [by_code[code] for code in normalized]
+        if any(not value for value in requested):
+            raise ValueError("A RECIPIENT_HOUSEHOLDS nem tartalmazhat üres azonosítót.")
+
+        selected: list[UserRecord] = []
+        unresolved: list[str] = []
+        for value in requested:
+            stem = Path(value).stem
+            without_prefix = stem.removeprefix("timeseries_").removeprefix("load_")
+            matches = [
+                user for user in candidates
+                if user.code == stem
+                or user.code.removeprefix("load_") == without_prefix
+                or user.code.removeprefix("load_").endswith(without_prefix)
+            ]
+            if not matches:
+                unresolved.append(value)
+                continue
+            if len(matches) > 1:
+                raise ValueError(
+                    f"A(z) {value!r} azonosító nem egyértelmű. Találatok: "
+                    f"{[user.code for user in matches]}. Adj meg hosszabb azonosítót."
+                )
+            selected.append(matches[0])
+
+        if unresolved:
+            raise ValueError(
+                "A megadott háztartások között van olyan, amely nem bojleres, "
+                "az eredeti adatokban már PV-s, vagy nem található: "
+                f"{unresolved}"
+            )
+        resolved_codes = [user.code for user in selected]
+        if len(set(resolved_codes)) != len(resolved_codes):
+            raise ValueError(
+                "A RECIPIENT_HOUSEHOLDS ugyanazt a háztartást többször jelöli ki."
+            )
+        return selected
 
     if count < 0:
         raise ValueError("N_NEW_PV_USERS nem lehet negatív.")
@@ -184,7 +225,7 @@ def prepare_output_paths(
     if existing and not overwrite:
         text = "\n".join(f"  - {p}" for p in existing)
         raise FileExistsError(
-            "A következő v2 kimenetek már léteznek, ezért biztonsági okból nem írom felül őket:\n"
+            "A következő v3 kimenetek már léteznek, ezért biztonsági okból nem írom felül őket:\n"
             f"{text}\nÁllítsd az OVERWRITE_OUTPUTS értékét True-ra, vagy adj meg más kimeneti nevet."
         )
 
@@ -201,7 +242,7 @@ def prepare_output_paths(
 
 
 def make_unique_profile_name(recipient_code: str, existing_columns: set[str]) -> str:
-    base = f"pv_v2_{recipient_code}"
+    base = f"pv_v3_{recipient_code}"
     name = base
     counter = 2
     while name in existing_columns:
@@ -232,6 +273,16 @@ def assign_pv_profiles(
         raise ValueError("A PV-skálázási korlátoknak pozitívnak kell lenniük.")
     if pv_scale_min > pv_scale_max:
         raise ValueError("PV_SCALE_MIN nem lehet nagyobb, mint PV_SCALE_MAX.")
+    if users_dir.resolve() == output_users_dir.resolve():
+        raise ValueError(
+            "Az eredeti users mappa és a kimeneti users mappa nem lehet azonos. "
+            "A hibás korábbi PV-k biztonságos javításához mindig az eredeti "
+            "Input/Users mappából kell újraépíteni a users_v3 mappát."
+        )
+    if measurements_csv.resolve() == output_measurements_csv.resolve():
+        raise ValueError(
+            "Az eredeti és a kimeneti mérési CSV nem lehet azonos."
+        )
 
     users = load_users(users_dir, boiler_definition)
     df = pd.read_csv(measurements_csv)
@@ -260,7 +311,8 @@ def assign_pv_profiles(
         overwrite,
     )
 
-    # Minden eredeti YAML változatlan másolata bekerül a users_v2 mappába.
+    # A kimenetet minden futáskor az eredeti YAML-okból építjük újra.
+    # Emiatt egy korábbi, téves PV-hozzárendelés nem marad bent a users_v3-ban.
     shutil.copytree(users_dir, output_users_dir)
 
     donor_order = sorted(donors, key=lambda u: u.code)
@@ -377,6 +429,11 @@ def assign_pv_profiles(
     print(f"Eredeti PV-s donorok száma  : {len(donors)}")
     print(f"Bojleres, nem PV-s jelöltek : {len(candidates)}")
     print(f"Új PV-s háztartások száma   : {len(recipients)}")
+    print(
+        "Kimeneti PV-s háztartások     : "
+        f"{sum(user.has_pv for user in users) + len(recipients)} "
+        "(eredeti PV-sek + most kijelölt háztartások)"
+    )
     print("\nPV-T KAPOTT HÁZTARTÁSOK:")
     for row in report:
         print(
@@ -418,8 +475,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--recipients",
         nargs="*",
-        default=FORCED_RECIPIENTS,
-        help="Opcionális konkrét háztartáskódok; felülírja a --count értékét.",
+        default=RECIPIENT_HOUSEHOLDS,
+        help=(
+            "Konkrét háztartáskódok; felülírja a --count értékét. "
+            "Elfogad teljes load_ azonosítót, számazonosítót vagy egyedi végződést."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true", default=OVERWRITE_OUTPUTS)
     parser.add_argument("--pv-scale-min", type=float, default=PV_SCALE_MIN)

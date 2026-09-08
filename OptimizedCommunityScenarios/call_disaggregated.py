@@ -71,7 +71,7 @@ def build_inputs(
     profiles_csv_path = Path(profiles_csv_path)
 
     if search_roots is None:
-        search_roots = [sim_yaml_path.parent / "Users", sim_yaml_path.parent]
+        search_roots = [sim_yaml_path.parent / "Users_v2", sim_yaml_path.parent]
 
     sim = yaml.safe_load(sim_yaml_path.read_text(encoding="utf-8")) or {}
     users_list = list(sim.get("users_list", []))[: int(max_users)]
@@ -379,17 +379,17 @@ def main(argv: list[str] | None = None) -> None:
 
 
 SIM_YAML = "../Input/simulation_config_disaggregated_with_userlist.yaml"
-PROFILES_CSV = "../Input/measurements_disaggregated.csv"
-DHW_PROFILES_CSV = "../Input/dhw.csv"
+PROFILES_CSV = "../Input/measurements_disaggregated_v2.csv"
+DHW_PROFILES_CSV = "../Input/dhw_v2.csv"
 
 MAX_USERS = 105
 
 INCLUDE_BESS = True
-BESS_SHARE_PCT = 100.0
+BESS_SHARE_PCT = 40.0
 
 # "A": bojler ugyanazon a körön van, saját PV/BESS is kiszolgálhatja.
-# "B": bojler külön körön van, saját PV/BESS nem szolgálhatja ki,
-#      de közösségi megosztott energiát kaphat.
+# "B": bojler külön körön van, saját PV/BESS és közösségi megosztás sem szolgálhatja ki;
+#      kizárólag B tarifás hálózati import látja el.
 BOILER_TARIFF: str = "B"
 
 # "proportional": fogyasztásarányosan osztja a megosztott energiát.
