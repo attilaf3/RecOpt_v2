@@ -17,6 +17,11 @@ from HeatPump.simulate_ata import (HOUSES_RAW,
                                    load_or_make_inputs as load_hp_weather, simulate_5r2c, solar_gain_sepsi,
                                    tabula_to_5r2c_iso_sepsi, )
 from InputReading import read_simulation_inputs
+from Utility.bess_periodic import periodic_simulation
+from Utility.bess_dispatch import pv_charge, load_discharge, minimum_grid_charge
+from Utility.result_schema import add_bess_states, add_bess_flows
+from functools import wraps
+from inspect import signature
 from Utility.configuration import config
 from Visualization import (
     plot_community_energy_balance,
@@ -534,10 +539,11 @@ def split_grid_import_base_boiler(e_base_load: np.ndarray, e_boiler_load: np.nda
         "e_grid_to_base": e_grid_to_base, "e_grid_to_boiler": e_grid_to_boiler, }
 
 
-def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp: np.ndarray, e_pv: np.ndarray,
+def _simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp: np.ndarray, e_pv: np.ndarray,
         use_bess: bool, bess_size_kwh: float, eta_bess_in: float, eta_bess_out: float, eta_bess_stor: float,
         soc_bess_min: float, soc_bess_max: float, t_bess_min_h: float, e_boiler_load: np.ndarray | None = None,
-        boiler_tariff: str = "B", ) -> dict:
+        boiler_tariff: str = "B", allow_grid_charge_for_min_soc=False,
+        initial_soc_kwh=None, ) -> dict:
     """Greedy simulator that tracks PV/bess/grid interactions and attributes grid imports
     to base, boiler and heat-pump loads separately so separate tariffs can be applied.
     """
@@ -647,7 +653,7 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
 
         e_bess_max_step = p_bess_max_kw * DT
 
-        soc = 0.5 * bess_size_kwh
+        soc = 0.5 * bess_size_kwh if initial_soc_kwh is None else float(initial_soc_kwh)
         soc = min(max(soc, soc_min_kwh), soc_max_kwh)
 
         min_mode_steps = 4
@@ -712,9 +718,7 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
 
             charge = 0.0
             if surplus > 1e-12 and can_charge:
-                room_kwh = max(soc_max_kwh - soc, 0.0)
-                max_charge_by_soc = room_kwh / max(eta_bess_in, 1e-12)
-                charge = min(surplus, e_bess_max_step, max_charge_by_soc)
+                charge = pv_charge(soc, surplus, soc_max_kwh, eta_bess_in, e_bess_max_step)
                 soc += charge * eta_bess_in
                 surplus -= charge
 
@@ -727,9 +731,7 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
             # discharge to cover deficit
             discharge = 0.0
             if deficit > 1e-12 and can_discharge:
-                avail_kwh = max(soc - soc_min_kwh, 0.0)
-                max_discharge_by_soc = avail_kwh * eta_bess_out
-                discharge = min(deficit, e_bess_max_step, max_discharge_by_soc)
+                discharge = load_discharge(soc, deficit, soc_min_kwh, eta_bess_out, e_bess_max_step)
                 # distribute discharge proportionally to component deficits
                 if deficit > 1e-12:
                     frac = discharge / deficit
@@ -767,11 +769,10 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
             e_grid_to_load_boiler[t] = def_boiler
             e_grid_to_load_hp[t] = def_hp
 
-            grid_charge = 0.0
-            if soc < soc_min_kwh - 1e-12 and can_charge and surplus <= 1e-12:
-                need_to_soc = soc_min_kwh - soc
-                grid_charge = min(e_bess_max_step, need_to_soc / max(eta_bess_in, 1e-12), )
-                soc += grid_charge * eta_bess_in
+            grid_charge = minimum_grid_charge(soc, soc_min_kwh, eta_bess_in,
+                e_bess_max_step, charge, enabled=allow_grid_charge_for_min_soc,
+                allowed=can_charge and discharge <= 1e-12)
+            soc += grid_charge * eta_bess_in
 
             if charge > 1e-12 or grid_charge > 1e-12:
                 if mode != "charge":
@@ -867,6 +868,25 @@ def simulate_one_user_greedy(e_load_base: np.ndarray, e_boiler: np.ndarray, e_hp
             "self_consumed_pv_kwh": self_consumed_pv_kwh, "locally_supplied_load_kwh": locally_supplied_load_kwh,
             "self_consumption_ratio": self_consumption_ratio, "self_sufficiency_ratio": self_sufficiency_ratio,
             **bill, }, }
+
+
+@wraps(_simulate_one_user_greedy)
+def simulate_one_user_greedy(*args, **kwargs):
+    bound = signature(_simulate_one_user_greedy).bind(*args, **kwargs)
+    bound.apply_defaults()
+    values = dict(bound.arguments)
+    if not values["use_bess"] or values["bess_size_kwh"] <= 0:
+        result = _simulate_one_user_greedy(**values)
+        add_bess_states(result["timeseries"], np.zeros(len(result["timeseries"]["e_bess"])+1))
+        add_bess_flows(result["timeseries"], DT)
+        return result
+    size = values["bess_size_kwh"]
+    lower, upper = size*values["soc_bess_min"], size*values["soc_bess_max"]
+    initial = np.clip(0.5*size if values["initial_soc_kwh"] is None else values["initial_soc_kwh"], lower, upper)
+    def simulate(state):
+        result = _simulate_one_user_greedy(**{**values, "initial_soc_kwh": float(state)})
+        return result, result["timeseries"]["e_bess"][-1], lower, upper
+    return periodic_simulation(simulate, initial, dt=DT)
 
 
 def _legacy_plot_household_percentiles_by_group(per_user_df: pd.DataFrame, out_case: Path):
@@ -971,7 +991,8 @@ def _legacy_plot_household_percentiles_by_group_with_global_scurve(per_user_df: 
 def _run_case_a(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_csv: str, out_dir: str,
         max_users: int | None,
         include_bess: bool, include_boiler: bool, include_heat_pump: bool = False, heat_pump_share_pct: float = 0.0,
-        bess_share_pct: float = 100.0, boiler_tariff: str = "B", pv_ratio: float = 1.0, ) -> dict:
+        bess_share_pct: float = 100.0, boiler_tariff: str = "B", pv_ratio: float = 1.0,
+        allow_grid_charge_for_min_soc=False, ) -> dict:
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
 
@@ -1057,6 +1078,7 @@ def _run_case_a(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_c
     ts_e_grid_to_boiler = np.zeros((T, U), dtype=float)
     ts_e_inj = np.zeros((T, U), dtype=float)
     ts_e_bess = np.zeros((T, U), dtype=float)
+    ts_e_bess_boundary = np.zeros((T+1, U), dtype=float)
     ts_d_bess_ch = np.zeros((T, U), dtype=float)
     ts_d_bess_dis = np.zeros((T, U), dtype=float)
     ts_e_base_load = np.zeros((T, U), dtype=float)
@@ -1083,7 +1105,8 @@ def _run_case_a(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_c
         print(f"[INFO] BESS-t kapó PV-s háztartások száma: {n_bess_users}")
 
     for u in range(U):
-        sim = simulate_one_user_greedy(e_load_base=e_ue[:, u], e_boiler=e_boiler[:, u], e_hp=ts_e_hp[:, u],
+        sim = simulate_one_user_greedy(allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
+            e_load_base=e_ue[:, u], e_boiler=e_boiler[:, u], e_hp=ts_e_hp[:, u],
             e_pv=e_pv[:, u], e_boiler_load=e_boiler[:, u], use_bess=bool(bess_enabled_arr[u]),
             bess_size_kwh=float(size_bess[u]), eta_bess_in=float(eta_bess_in_u[u]),
             eta_bess_out=float(eta_bess_out_u[u]), eta_bess_stor=float(eta_bess_stor_u[u]),
@@ -1144,6 +1167,7 @@ def _run_case_a(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_c
         ts_e_grid_to_boiler[:, u] = times["e_grid_to_boiler"]
         ts_e_inj[:, u] = times["e_inj"]
         ts_e_bess[:, u] = times["e_bess"]
+        ts_e_bess_boundary[:, u] = times["e_bess_boundary"]
         ts_d_bess_ch[:, u] = times["d_bess_ch"]
         ts_d_bess_dis[:, u] = times["d_bess_dis"]
         ts_e_base_load[:, u] = e_ue[:, u]
@@ -1217,6 +1241,13 @@ def _run_case_a(case_name: str, sim_yaml: str, profiles_csv: str, dhw_profiles_c
     save_ts(ts_e_grid_to_boiler, "e_grid_to_boiler.csv")
     save_ts(ts_e_inj, "e_inj.csv")
     save_ts(ts_e_bess, "e_bess.csv")
+    save_ts(ts_e_bess_boundary, "e_bess_boundary.csv")
+    save_ts(ts_e_bess_boundary[:-1], "e_bess_start.csv")
+    save_ts(ts_e_bess_boundary[1:], "e_bess_end.csv")
+    from Utility.result_schema import save_bess_result
+    save_bess_result({"e_bess_boundary": ts_e_bess_boundary,
+        "e_pv_to_bess": ts_e_pv_to_bess, "e_grid_to_bess": ts_e_grid_to_bess,
+        "e_bess_to_load": ts_e_bess_to_load}, out_case, DT, user_names)
     save_ts(ts_d_bess_ch, "d_bess_ch.csv")
     save_ts(ts_d_bess_dis, "d_bess_dis.csv")
     save_ts(ts_e_base_load, "e_base_load.csv")
@@ -1262,6 +1293,7 @@ def run_case(
         boiler_tariff: str = "B",
         pv_ratio: float = 1.0,
         scenario: str = "a",
+        allow_grid_charge_for_min_soc: bool = False,
         sharing_mode: str = "proportional",
 ) -> dict:
     """Run non-optimized scenario ``a`` (individual) or ``b`` (community sharing).
@@ -1286,6 +1318,7 @@ def run_case(
             include_heat_pump=include_heat_pump,
             heat_pump_share_pct=heat_pump_share_pct,
             bess_share_pct=bess_share_pct,
+            allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
             boiler_tariff=boiler_tariff,
             pv_ratio=pv_ratio,
         )
@@ -1305,6 +1338,7 @@ def run_case(
         include_bess=include_bess,
         include_boiler=include_boiler,
         bess_share_pct=bess_share_pct,
+        allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
         sharing_mode=sharing_mode,
         boiler_tariff=boiler_tariff,
         pv_ratio=pv_ratio,

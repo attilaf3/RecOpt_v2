@@ -7,10 +7,7 @@ import numpy as np
 import pandas as pd
 from Utility.configuration import config
 
-try:
-    from .simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
-except ImportError:  # direct script execution
-    from simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
+from HeatPump.simulate_ata import HOUSES_RAW, load_or_make_inputs, simulate_5r2c, solar_gain_sepsi, tabula_to_5r2c_iso_sepsi
 
 DEFAULT_GEOPROFIL = config.getpath("paths", "heat_pump_geoprofile_csv")
 

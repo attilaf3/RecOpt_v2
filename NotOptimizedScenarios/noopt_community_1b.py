@@ -37,10 +37,16 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from InputReading import read_simulation_inputs
+from Utility.bess_periodic import periodic_simulation
+from Utility.bess_dispatch import pv_charge, load_discharge, minimum_grid_charge
+from Utility.result_schema import add_bess_states, add_bess_flows
+from Utility.energy_allocation import allocate_pool, match_energy
+from functools import wraps
+from inspect import signature
 from Utility.configuration import config
 
 try:
-    from .nonopt_common import (
+    from NotOptimizedScenarios.nonopt_common import (
         DT,
         EXPORT_FT_PER_KWH,
         HIGH_TARIFF_FT_PER_KWH,
@@ -114,145 +120,22 @@ def _two_tier_cost_steps(
     return low_kwh, high_kwh, cost_ft
 
 
-def _split_two_streams_by_shared_low_cap(
-    e_grid_a_step: float,
-    e_shared_in_step: float,
-    remaining_low_kwh: float,
-) -> tuple[float, float, float, float, float]:
-    """
-    Egy vevő adott időlépésbeli A-tarifás hálózati importját és
-    megosztott energiavásárlását ugyanarra a 2523 kWh/év-es kedvezményes
-    vevői keretre könyveli.
-
-    Visszatér:
-        grid_a_low, grid_a_high, shared_low, shared_high, new_remaining_low
-
-    Ha ugyanabban az időlépésben hálózati A-import és megosztott vásárlás is
-    van, a még rendelkezésre álló kedvezményes mennyiség arányosan oszlik meg
-    a két energiaáram között. Ez elkerüli az önkényes "előbb grid, aztán shared"
-    vagy fordított sorrendet.
-    """
-    e_grid = max(float(e_grid_a_step), 0.0)
-    e_shared = max(float(e_shared_in_step), 0.0)
-    total = e_grid + e_shared
-    remaining = max(float(remaining_low_kwh), 0.0)
-
-    if total <= EPS:
-        return 0.0, 0.0, 0.0, 0.0, remaining
-
-    low_total = min(total, remaining)
-    high_total = total - low_total
-
-    grid_weight = e_grid / total
-    shared_weight = e_shared / total
-
-    grid_low = low_total * grid_weight
-    shared_low = low_total * shared_weight
-    grid_high = high_total * grid_weight
-    shared_high = high_total * shared_weight
-
-    return grid_low, grid_high, shared_low, shared_high, remaining - low_total
-
-
-def settle_shared_payments_buyer_tiered(
-    e_shared_in: np.ndarray,
-    e_shared_out: np.ndarray,
-    e_grid_import_a: np.ndarray,
-) -> dict:
-    """
-    Megosztási elszámolás vevői 2523 kWh-os sáv alapján.
-
-    A vevőnél ugyanaz a kedvezményes éves keret fogy az A-tarifás hálózati
-    importból és a közösségből vásárolt energiából. A megosztott energia
-    energiadíja vevői sáv szerint 5 vagy 21 Ft/kWh, ezt kapja meg a PV-s eladó.
-    Az RHD mindig 31 Ft/kWh a teljes shared_in mennyiségre.
-    """
-    e_shared_in = _as_nonnegative_2d(e_shared_in, "e_shared_in")
-    e_shared_out = _as_nonnegative_2d(e_shared_out, "e_shared_out")
-    e_grid_import_a = _as_nonnegative_2d(e_grid_import_a, "e_grid_import_a")
-
-    if e_shared_in.shape != e_shared_out.shape or e_shared_in.shape != e_grid_import_a.shape:
-        raise ValueError("e_shared_in, e_shared_out és e_grid_import_a alakja nem egyezik")
-
-    T, U = e_shared_in.shape
-    pair_kwh = np.zeros((U, U), dtype=float)
-    pair_energy_payment_ft = np.zeros((U, U), dtype=float)
-
-    buyer_low_remaining = np.full(U, SHARED_BUYER_LOW_LIMIT_KWH, dtype=float)
-    grid_a_low_kwh = np.zeros(U, dtype=float)
-    grid_a_high_kwh = np.zeros(U, dtype=float)
-    shared_buyer_low_kwh = np.zeros(U, dtype=float)
-    shared_buyer_high_kwh = np.zeros(U, dtype=float)
-    buyer_energy_cost_ft = np.zeros(U, dtype=float)
-    buyer_rhd_ft = e_shared_in.sum(axis=0) * SHARED_RHD_FT_PER_KWH
-    seller_revenue_ft = np.zeros(U, dtype=float)
-
-    for t in range(T):
-        shared_low_t = np.zeros(U, dtype=float)
-        shared_high_t = np.zeros(U, dtype=float)
-
-        for b in range(U):
-            g_low, g_high, s_low, s_high, new_remaining = _split_two_streams_by_shared_low_cap(
-                e_grid_a_step=float(e_grid_import_a[t, b]),
-                e_shared_in_step=float(e_shared_in[t, b]),
-                remaining_low_kwh=float(buyer_low_remaining[b]),
-            )
-            buyer_low_remaining[b] = new_remaining
-            grid_a_low_kwh[b] += g_low
-            grid_a_high_kwh[b] += g_high
-            shared_buyer_low_kwh[b] += s_low
-            shared_buyer_high_kwh[b] += s_high
-            shared_low_t[b] = s_low
-            shared_high_t[b] = s_high
-
-        shared_energy_cost_t = (
-            shared_low_t * SHARED_BUYER_LOW_FT_PER_KWH
-            + shared_high_t * SHARED_BUYER_HIGH_FT_PER_KWH
-        )
-        buyer_energy_cost_ft += shared_energy_cost_t
-
-        sin = e_shared_in[t, :]
-        sout = e_shared_out[t, :]
-        total_share = min(float(sin.sum()), float(sout.sum()))
-        if total_share <= EPS:
-            continue
-
-        sellers = np.flatnonzero(sout > EPS)
-        buyers = np.flatnonzero(sin > EPS)
-        if len(sellers) == 0 or len(buyers) == 0:
-            continue
-
-        buyer_avg_rates = np.divide(
-            shared_energy_cost_t,
-            sin,
-            out=np.zeros(U, dtype=float),
-            where=sin > EPS,
-        )
-
-        # Virtuális párosítás: az eladók a shared_out arányában, a vevők
-        # a kiosztott shared_in szerint kapcsolódnak össze. Az egységárat
-        # mindig a vevő aktuális éves sávja adja.
-        buyer_weights = sin[buyers] / total_share
-        pair_kwh_t = np.outer(sout[sellers], buyer_weights)
-        pair_payment_t = pair_kwh_t * buyer_avg_rates[buyers][None, :]
-
-        idx = np.ix_(sellers, buyers)
-        pair_kwh[idx] += pair_kwh_t
-        pair_energy_payment_ft[idx] += pair_payment_t
-        seller_revenue_ft[sellers] += pair_payment_t.sum(axis=1)
-
-    return {
-        "pair_kwh": pair_kwh,
-        "pair_energy_payment_ft": pair_energy_payment_ft,
-        "grid_a_low_kwh": grid_a_low_kwh,
-        "grid_a_high_kwh": grid_a_high_kwh,
-        "shared_buyer_low_kwh": shared_buyer_low_kwh,
-        "shared_buyer_high_kwh": shared_buyer_high_kwh,
-        "buyer_energy_cost_ft": buyer_energy_cost_ft,
-        "buyer_rhd_ft": buyer_rhd_ft,
-        "buyer_total_shared_cost_ft": buyer_energy_cost_ft + buyer_rhd_ft,
-        "seller_revenue_ft": seller_revenue_ft,
-    }
+def settle_shared_payments_buyer_tiered(e_shared_in, e_shared_out, e_grid_import_a):
+    """kWh compatibility adapter; preserve proportional tariff-block allocation."""
+    from dataclasses import replace
+    from Economics.calculate_economics import DEFAULT_TARIFFS, settle_shared_payments as settle
+    tariffs = replace(DEFAULT_TARIFFS,
+        shared_buyer_low_limit_kwh=SHARED_BUYER_LOW_LIMIT_KWH,
+        shared_buyer_low_ft_per_kwh=SHARED_BUYER_LOW_FT_PER_KWH,
+        shared_buyer_high_ft_per_kwh=SHARED_BUYER_HIGH_FT_PER_KWH,
+        shared_rhd_ft_per_kwh=SHARED_RHD_FT_PER_KWH)
+    result = settle(e_shared_in, e_shared_out, e_grid_import_a,
+        tariffs=tariffs, pairing_mode="proportional", shared_low_cap_mode="proportional")
+    return {**result,
+        "grid_a_low_kwh": result["buyer_grid_a_low_kwh"],
+        "grid_a_high_kwh": result["buyer_grid_a_high_kwh"],
+        "shared_buyer_low_kwh": result["buyer_shared_low_kwh"],
+        "shared_buyer_high_kwh": result["buyer_shared_high_kwh"]}
 
 def allocate_shared_in(deficit: np.ndarray, total_share_kwh: float, mode: SharingMode) -> np.ndarray:
     """
@@ -265,33 +148,7 @@ def allocate_shared_in(deficit: np.ndarray, total_share_kwh: float, mode: Sharin
         azonos kWh-kvótát próbál adni minden aktív hiányos háztartásnak;
         aki ennél kevesebbet tud felvenni, annál a maradék újraosztódik.
     """
-    d = np.maximum(np.asarray(deficit, dtype=float), 0.0)
-    total_share = min(max(float(total_share_kwh), 0.0), float(d.sum()))
-    out = np.zeros_like(d)
-
-    if total_share <= EPS or d.sum() <= EPS:
-        return out
-
-    if mode == "proportional":
-        return d * (total_share / d.sum())
-
-    if mode != "equal":
-        raise ValueError("sharing_mode csak 'proportional' vagy 'equal' lehet")
-
-    remaining = total_share
-    while remaining > EPS:
-        room = d - out
-        active = room > EPS
-        n_active = int(active.sum())
-        if n_active == 0:
-            break
-
-        quota = remaining / n_active
-        take = np.minimum(room[active], quota)
-        out[active] += take
-        remaining -= float(take.sum())
-
-    return out
+    return allocate_pool(deficit, total_share_kwh, mode)
 
 
 def _select_bess_users(
@@ -318,7 +175,7 @@ def _select_bess_users(
     return enabled
 
 
-def simulate_nonopt_disaggregated_shared(
+def _simulate_nonopt_disaggregated_shared(
     e_pv: np.ndarray,
     e_ue: np.ndarray,
     e_boiler: np.ndarray | None,
@@ -336,7 +193,7 @@ def simulate_nonopt_disaggregated_shared(
     sharing_mode: SharingMode = "proportional",
     boiler_tariff: BoilerTariff = "B",
     initial_soc_fraction: float = 0.5,
-    allow_grid_charge_for_min_soc: bool = True,
+    allow_grid_charge_for_min_soc: bool = False,
 ) -> dict:
     """
     Disaggregált, prioritásos BESS + energiaközösségi megosztás.
@@ -428,7 +285,7 @@ def simulate_nonopt_disaggregated_shared(
     # BESS állapotok.
     soc_min_kwh = np.maximum(soc_bess_min, 0.0) * np.maximum(size_bess, 0.0)
     soc_max_kwh = np.maximum(soc_min_kwh, soc_bess_max * np.maximum(size_bess, 0.0))
-    soc = np.clip(float(initial_soc_fraction) * np.maximum(size_bess, 0.0), soc_min_kwh, soc_max_kwh)
+    soc = np.clip(np.asarray(initial_soc_fraction) * np.maximum(size_bess, 0.0), soc_min_kwh, soc_max_kwh)
 
     # Eredetkövetés SSI-hez: a gridből töltött BESS-kisütést ne számítsuk helyi ellátásnak.
     soc_local = soc.copy()
@@ -463,15 +320,6 @@ def simulate_nonopt_disaggregated_shared(
                 soc_local[u] *= eta_stor
                 soc_grid[u] *= eta_stor
 
-                # Minimum SOC-védelem: külső hálózati töltés megengedett.
-                if allow_grid_charge_for_min_soc and soc[u] < soc_min_kwh[u] - EPS:
-                    need_soc = soc_min_kwh[u] - soc[u]
-                    grid_charge = need_soc / max(float(eta_bess_in[u]), EPS)
-                    soc[u] += grid_charge * float(eta_bess_in[u])
-                    soc_grid[u] += grid_charge * float(eta_bess_in[u])
-                    ts_e_grid_to_bess[t, u] += grid_charge
-                    ts_d_bess_ch[t, u] = 1.0
-
             # Saját PV közvetlenül saját fogyasztásra.
             pv_to_load = min(pv_t, load_t)
             remaining_load = max(load_t - pv_to_load, 0.0)
@@ -484,10 +332,8 @@ def simulate_nonopt_disaggregated_shared(
             discharge_local_output = 0.0
 
             if use_bess_u and remaining_pv > EPS:
-                room_kwh = max(soc_max_kwh[u] - soc[u], 0.0)
-                charge_by_soc = room_kwh / max(float(eta_bess_in[u]), EPS)
-                charge = min(remaining_pv, e_bess_max_step[u], charge_by_soc)
-                charge = max(charge, 0.0)
+                charge = pv_charge(soc[u], remaining_pv, soc_max_kwh[u],
+                                   eta_bess_in[u], e_bess_max_step[u])
 
                 soc_add = charge * float(eta_bess_in[u])
                 soc[u] += soc_add
@@ -499,10 +345,8 @@ def simulate_nonopt_disaggregated_shared(
                     ts_d_bess_ch[t, u] = 1.0
 
             elif use_bess_u and remaining_load > EPS:
-                available_soc = max(soc[u] - soc_min_kwh[u], 0.0)
-                discharge_by_soc = available_soc * max(float(eta_bess_out[u]), EPS)
-                discharge = min(remaining_load, e_bess_max_step[u], discharge_by_soc)
-                discharge = max(discharge, 0.0)
+                discharge = load_discharge(soc[u], remaining_load, soc_min_kwh[u],
+                                           eta_bess_out[u], e_bess_max_step[u])
 
                 if discharge > EPS:
                     soc_need = discharge / max(float(eta_bess_out[u]), EPS)
@@ -536,6 +380,16 @@ def simulate_nonopt_disaggregated_shared(
 
                 ts_e_bess_to_load[t, u] = discharge
                 ts_e_bess_local_to_load[t, u] = discharge_local_output
+
+            if use_bess_u:
+                grid_charge = minimum_grid_charge(soc[u], soc_min_kwh[u],
+                    eta_bess_in[u], e_bess_max_step[u], charge,
+                    enabled=allow_grid_charge_for_min_soc, allowed=discharge <= EPS)
+                soc[u] += grid_charge * eta_bess_in[u]
+                soc_grid[u] += grid_charge * eta_bess_in[u]
+                ts_e_grid_to_bess[t, u] = grid_charge
+                if grid_charge > EPS:
+                    ts_d_bess_ch[t, u] = 1.0
 
             # Saját PV/BESS által ellátott energia komponensbontása.
             # A bontás elszámolási célú; a fizikai prioritás: alapfogyasztás előbb, bojler utána.
@@ -579,16 +433,7 @@ def simulate_nonopt_disaggregated_shared(
         # --- 2) Közösségi megosztás ---
         surplus = ts_e_surplus_before_share[t, :]
         deficit = ts_e_deficit_before_share[t, :]
-        S = float(surplus.sum())
-        D = float(deficit.sum())
-        total_share = min(S, D)
-
-        if total_share > EPS:
-            shared_in = allocate_shared_in(deficit, total_share, sharing_mode)
-            shared_out = surplus * (total_share / S) if S > EPS else np.zeros(U, dtype=float)
-        else:
-            shared_in = np.zeros(U, dtype=float)
-            shared_out = np.zeros(U, dtype=float)
+        shared_in, shared_out = match_energy(deficit, surplus, sharing_mode, "proportional")
 
         ts_e_shared_in[t, :] = shared_in
         ts_e_shared_out[t, :] = shared_out
@@ -868,6 +713,30 @@ def simulate_nonopt_disaggregated_shared(
     }
 
 
+@wraps(_simulate_nonopt_disaggregated_shared)
+def simulate_nonopt_disaggregated_shared(*args, **kwargs):
+    bound = signature(_simulate_nonopt_disaggregated_shared).bind(*args, **kwargs)
+    bound.apply_defaults()
+    values = dict(bound.arguments)
+    size = np.asarray(values["size_bess"], dtype=float)
+    enabled = _select_bess_users(np.asarray(values["e_pv"]).sum(axis=0)>EPS,
+        size, values["include_bess"], values["bess_share_pct"])
+    if not np.any(enabled):
+        result = _simulate_nonopt_disaggregated_shared(**values)
+        shape = result["timeseries"]["e_bess"].shape
+        add_bess_states(result["timeseries"], np.zeros((shape[0]+1, shape[1])))
+        add_bess_flows(result["timeseries"], DT)
+        return result
+    lower = np.where(enabled, size*np.asarray(values["soc_bess_min"]), 0)
+    upper = np.where(enabled, size*np.asarray(values["soc_bess_max"]), 0)
+    initial = np.clip(np.asarray(values["initial_soc_fraction"])*size, lower, upper)
+    def simulate(state):
+        fractions = np.divide(state, size, out=np.zeros_like(size), where=size>0)
+        result = _simulate_nonopt_disaggregated_shared(**{**values, "initial_soc_fraction": fractions})
+        return result, result["timeseries"]["e_bess"][-1], lower, upper
+    return periodic_simulation(simulate, initial, dt=DT)
+
+
 def run_case_disaggregated_nonopt_shared(
     case_name: str,
     sim_yaml: str,
@@ -882,6 +751,7 @@ def run_case_disaggregated_nonopt_shared(
     sharing_mode: SharingMode = "proportional",
     boiler_tariff: BoilerTariff = "B",
     pv_ratio: float = 1.0,
+    allow_grid_charge_for_min_soc: bool = False,
 ) -> dict:
     out_case = Path(out_dir)
     out_case.mkdir(parents=True, exist_ok=True)
@@ -910,6 +780,7 @@ def run_case_disaggregated_nonopt_shared(
         e_el_heater = np.zeros_like(e_el_heater)
 
     result = simulate_nonopt_disaggregated_shared(
+        allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
         e_pv=e_pv,
         e_ue=e_ue,
         e_boiler=e_el_heater,
@@ -933,6 +804,8 @@ def run_case_disaggregated_nonopt_shared(
     user_names = result["user_names"]
 
     total["case_name"] = case_name
+    from Utility.result_schema import save_bess_result
+    save_bess_result(timeseries, out_case, DT, user_names)
 
     per_user_df.to_csv(out_case / "per_user_summary.csv", index=False)
     (out_case / "summary.json").write_text(json.dumps(total, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -969,7 +842,7 @@ def run_case_disaggregated_nonopt_shared(
         "e_grid_import_total",
         "e_grid_export",
         "e_inj",
-        "e_bess",
+        "e_bess", "e_bess_start", "e_bess_end", "e_bess_boundary",
         "d_bess_ch",
         "d_bess_dis",
     ]:

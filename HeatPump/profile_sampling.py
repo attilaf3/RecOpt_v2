@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .simulate_ata import build_setpoint_profile
+from HeatPump.simulate_ata import build_setpoint_profile
 
 __all__ = ["perturb_hp_house", "build_hp_setpoint_profile"]
 

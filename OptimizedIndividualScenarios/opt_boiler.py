@@ -1,7 +1,20 @@
-# Ez a fájl felel minden bojler-specifikus kódért az optimalizálásban, csak megkapja az opt. problémát és hozzáadja a
-# constrainteket (ha van bojler optimalizálás) vagy feltölti a bojler fogyasztást (ha a bojlert nem optimalizáljuk)
+"""Backward-compatible entry points for the implemented boiler optimizer."""
 
-def add_boiler_constraints(prob, boiler_params):
-    # Definiáljuk a constrainteket a bojlerhez
-    pass
+from OptimizedIndividualScenarios.individual_opt_boiler import individual_opt_boiler
+
+
+def optimize_boiler(*args, **kwargs):
+    """Delegate to :func:`individual_opt_boiler`."""
+    return individual_opt_boiler(*args, **kwargs)
+
+
+opt_boiler = optimize_boiler
+add_boiler_constraints = optimize_boiler
+
+__all__ = [
+    "add_boiler_constraints",
+    "individual_opt_boiler",
+    "opt_boiler",
+    "optimize_boiler",
+]
 

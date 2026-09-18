@@ -47,11 +47,14 @@ class SimulationInputs:
     user_keys: list[str]
     user_names: list[str]
     user_yaml_paths: list[Path]
+    heat_pump_profile_ids: list[str | None]
+    heat_pump_parameters: list[dict | None]
 
     # Villamos energia-idősorok [kWh / step]
     e_pv_kwh: np.ndarray
     e_ue_kwh: np.ndarray
     e_el_heater_kwh: np.ndarray
+    e_heat_pump_kwh: np.ndarray
 
     # DHW hőenergia-idősor [kWhth / step]
     e_dhw_kwh: np.ndarray
@@ -60,6 +63,7 @@ class SimulationInputs:
     p_pv_kw: np.ndarray
     p_ue_kw: np.ndarray
     p_el_heater_kw: np.ndarray
+    p_heat_pump_kw: np.ndarray
 
     # DHW hőteljesítmény-idősor [kWth]
     p_dhw_kw: np.ndarray
@@ -432,10 +436,13 @@ def read_simulation_inputs(
     user_keys: list[str] = []
     user_names: list[str] = []
     user_yaml_paths: list[Path] = []
+    heat_pump_profile_ids: list[str | None] = []
+    heat_pump_parameters: list[dict | None] = []
 
     e_pv_cols: list[np.ndarray] = []
     e_ue_cols: list[np.ndarray] = []
     e_el_heater_cols: list[np.ndarray] = []
+    e_heat_pump_cols: list[np.ndarray] = []
     e_dhw_cols: list[np.ndarray] = []
 
     size_elh: list[float] = []
@@ -526,6 +533,28 @@ def read_simulation_inputs(
         e_el_heater_cols.append(e_el_heater)
 
         # ---------------------------------------------------------------------
+        # Hőszivattyú: új YAML-struktúra
+        # units.heat_pump.profile_id -> villamos profil azonosító
+        # A két paraméterblokkot változtatás nélkül megőrizzük.
+        # ---------------------------------------------------------------------
+        heat_pump = units.get("heat_pump") or {}
+        hp_profile = heat_pump.get("profile_id")
+        hp_profile = str(hp_profile) if hp_profile is not None else None
+        heat_pump_profile_ids.append(hp_profile)
+        heat_pump_parameters.append({
+            "household_parameters": heat_pump.get("household_parameters") or {},
+            "heat_pump_parameters": heat_pump.get("heat_pump_parameters") or {},
+            "profile_unit": heat_pump.get("profile_unit", "kWh/step"),
+        } if heat_pump else None)
+        e_heat_pump_cols.append(_profile_energy_from_df(
+            profiles_df,
+            hp_profile,
+            n_steps=n_steps,
+            label=f"HP - {name}",
+            default_zero=True,
+        ))
+
+        # ---------------------------------------------------------------------
         # BESS paraméterek
         # ---------------------------------------------------------------------
         bess = units.get("bess") or {}
@@ -592,11 +621,13 @@ def read_simulation_inputs(
     e_pv_kwh = np.column_stack(e_pv_cols).astype(float)
     e_ue_kwh = np.column_stack(e_ue_cols).astype(float)
     e_el_heater_kwh = np.column_stack(e_el_heater_cols).astype(float)
+    e_heat_pump_kwh = np.column_stack(e_heat_pump_cols).astype(float)
     e_dhw_kwh = np.column_stack(e_dhw_cols).astype(float)
 
     p_pv_kw = e_pv_kwh / float(dt)
     p_ue_kw = e_ue_kwh / float(dt)
     p_el_heater_kw = e_el_heater_kwh / float(dt)
+    p_heat_pump_kw = e_heat_pump_kwh / float(dt)
     p_dhw_kw = e_dhw_kwh / float(dt)
 
     return SimulationInputs(
@@ -605,15 +636,19 @@ def read_simulation_inputs(
         user_keys=user_keys,
         user_names=user_names,
         user_yaml_paths=user_yaml_paths,
+        heat_pump_profile_ids=heat_pump_profile_ids,
+        heat_pump_parameters=heat_pump_parameters,
 
         e_pv_kwh=e_pv_kwh,
         e_ue_kwh=e_ue_kwh,
         e_el_heater_kwh=e_el_heater_kwh,
+        e_heat_pump_kwh=e_heat_pump_kwh,
         e_dhw_kwh=e_dhw_kwh,
 
         p_pv_kw=p_pv_kw,
         p_ue_kw=p_ue_kw,
         p_el_heater_kw=p_el_heater_kw,
+        p_heat_pump_kw=p_heat_pump_kw,
         p_dhw_kw=p_dhw_kw,
 
         size_elh=np.asarray(size_elh, dtype=float),

@@ -27,7 +27,9 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import pulp
+from Optimization import extract_vector, variable_value, extract_matrix, solve_problem
 from Utility.configuration import config
+from Optimization.bess_constraints import build_bess
 
 DT_DEFAULT = config.getfloat("simulation", "dt_hours")
 EPS = 1e-9
@@ -59,11 +61,6 @@ def _as_2d_power(a: np.ndarray, name: str) -> np.ndarray:
     return np.maximum(arr, 0.0)
 
 
-def _val(x) -> float:
-    v = pulp.value(x)
-    return 0.0 if v is None else float(v)
-
-
 def _var_matrix(name: str, T: int, U: int, low: float = 0.0) -> list[list[pulp.LpVariable]]:
     return [[pulp.LpVariable(f"{name}_{t}_{u}", lowBound=low) for u in range(U)] for t in range(T)]
 
@@ -74,200 +71,18 @@ def _bin_matrix(name: str, T: int, U: int, run_lp: bool) -> list[list[pulp.LpVar
     return [[pulp.LpVariable(f"{name}_{t}_{u}", cat=pulp.LpBinary) for u in range(U)] for t in range(T)]
 
 
-def _extract_matrix(var: list[list[pulp.LpVariable | float]], T: int, U: int) -> np.ndarray:
-    out = np.zeros((T, U), dtype=float)
-    for t in range(T):
-        for u in range(U):
-            out[t, u] = _val(var[t][u]) if hasattr(var[t][u], "name") else float(var[t][u])
-    return out
-
-
-def _split_low_high_step(
-    e_kwh: float,
-    remaining_low_kwh: float,
-) -> tuple[float, float, float]:
-    """Egy időlépés energiájának bontása a vevő megmaradó kedvezményes sávja szerint."""
-    e = max(float(e_kwh), 0.0)
-    low = min(e, max(float(remaining_low_kwh), 0.0))
-    high = max(e - low, 0.0)
-    return low, high, max(float(remaining_low_kwh) - low, 0.0)
-
-def _allocate_equal_waterfill(demand: np.ndarray, total_share: float) -> np.ndarray:
-    d = np.maximum(np.asarray(demand, dtype=float), 0.0)
-    total_share = min(max(float(total_share), 0.0), float(d.sum()))
-    out = np.zeros_like(d)
-    remaining = total_share
-    while remaining > EPS:
-        room = d - out
-        active = room > EPS
-        n = int(active.sum())
-        if n == 0:
-            break
-        quota = remaining / n
-        take = np.minimum(room[active], quota)
-        out[active] += take
-        remaining -= float(take.sum())
-    return out
-
-
-def _allocate_seller_to_buyers(
-    seller_energy_kwh: float,
-    remaining_buyer_need_kwh: np.ndarray,
-    pairing_mode: PairingMode,
-) -> np.ndarray:
-    """Egy eladó energiájának párosítása a vevőkkel úgy, hogy a vevői oszlopösszegek megmaradjanak."""
-    need = np.maximum(np.asarray(remaining_buyer_need_kwh, dtype=float), 0.0)
-    e = min(max(float(seller_energy_kwh), 0.0), float(need.sum()))
-    out = np.zeros_like(need)
-    if e <= EPS or need.sum() <= EPS:
-        return out
-
-    if pairing_mode == "proportional":
-        return need * (e / need.sum())
-
-    if pairing_mode == "equal":
-        # Azonos kWh-kvótát próbál adni az aktív vevőknek, de sosem lépi túl
-        # az adott vevő még hátralévő shared_in mennyiségét.
-        remaining = e
-        while remaining > EPS:
-            room = need - out
-            active = room > EPS
-            n = int(active.sum())
-            if n == 0:
-                break
-            quota = remaining / n
-            take = np.minimum(room[active], quota)
-            out[active] += take
-            remaining -= float(take.sum())
-        return out
-
-    raise ValueError("pairing_mode csak 'proportional' vagy 'equal' lehet")
-
-
-def settle_shared_payments(
-    p_shared_in: np.ndarray,
-    p_shared_out: np.ndarray,
-    p_grid_import_a: np.ndarray,
-    dt: float = DT_DEFAULT,
-    pairing_mode: PairingMode = "proportional",
-    buyer_low_limit_kwh: float = LOW_TARIFF_LIMIT_KWH,
-) -> dict:
-    """
-    Eladó-vevő pénzügyi elszámolás a megoldott idősorok alapján.
-
-    Fontos: a 2523 kWh-os kedvezményes sáv a VEVŐ éves sávja.
-    A megosztott energia nem kap külön eladói keretet, hanem ugyanazt a
-    buyer_low_remaining keretet fogyasztja, mint az A-tarifás hálózati import.
-
-    Időlépésen belül elszámolási sorrend:
-        1) A-tarifás hálózati import,
-        2) közösségből vett energia.
-
-    Ez az éves közös sávot modellezi; egy 15 perces időlépésen belül az
-    elszámolási sorrend csak akkor számít, ha pont a sávhatáron vagyunk.
-
-    Ez biztosítja, hogy a megosztott energia ára:
-        low sávban:  5 + 31 Ft/kWh,
-        high sávban: 21 + 31 Ft/kWh,
-    az eladó pedig ugyanebből az energiadíjból kap 5 vagy 21 Ft/kWh-t.
-    """
-    p_shared_in = _as_2d_power(p_shared_in, "p_shared_in")
-    p_shared_out = _as_2d_power(p_shared_out, "p_shared_out")
-    p_grid_import_a = _as_2d_power(p_grid_import_a, "p_grid_import_a")
-    if p_shared_in.shape != p_shared_out.shape:
-        raise ValueError("p_shared_in és p_shared_out alakja nem egyezik")
-    if p_shared_in.shape != p_grid_import_a.shape:
-        raise ValueError("p_grid_import_a alakja nem egyezik a megosztási idősorokkal")
-
-    T, U = p_shared_in.shape
-    e_shared_in = p_shared_in * float(dt)
-    e_shared_out = p_shared_out * float(dt)
-    e_grid_import_a = p_grid_import_a * float(dt)
-
-    pair_kwh = np.zeros((U, U), dtype=float)  # seller x buyer
-    pair_energy_payment_ft = np.zeros((U, U), dtype=float)
-
-    buyer_low_remaining = np.full(U, float(buyer_low_limit_kwh), dtype=float)
-    buyer_shared_low_kwh = np.zeros(U, dtype=float)
-    buyer_shared_high_kwh = np.zeros(U, dtype=float)
-    buyer_grid_a_low_kwh = np.zeros(U, dtype=float)
-    buyer_grid_a_high_kwh = np.zeros(U, dtype=float)
-
-    seller_revenue_ft = np.zeros(U, dtype=float)
-    buyer_energy_cost_ft = np.zeros(U, dtype=float)
-    buyer_rhd_ft = e_shared_in.sum(axis=0) * SHARED_RHD_FT_PER_KWH
-
-    for t in range(T):
-        sin = e_shared_in[t, :]
-        sout = e_shared_out[t, :]
-        total_share = min(float(sin.sum()), float(sout.sum()))
-
-        # Vevői közös sáv fogyasztása: először A hálózati import, utána shared.
-        # Így a post-process elszámolás összhangban marad a MILP sávkorlátjaival.
-        buyer_shared_low_t = np.zeros(U, dtype=float)
-        buyer_shared_high_t = np.zeros(U, dtype=float)
-        for b in range(U):
-            low_g, high_g, rem = _split_low_high_step(e_grid_import_a[t, b], buyer_low_remaining[b])
-            buyer_grid_a_low_kwh[b] += low_g
-            buyer_grid_a_high_kwh[b] += high_g
-
-            low_s, high_s, rem = _split_low_high_step(sin[b], rem)
-            buyer_shared_low_t[b] = low_s
-            buyer_shared_high_t[b] = high_s
-            buyer_shared_low_kwh[b] += low_s
-            buyer_shared_high_kwh[b] += high_s
-            buyer_low_remaining[b] = rem
-
-        if total_share <= EPS:
-            continue
-
-        sellers = np.flatnonzero(sout > EPS)
-        buyers = np.flatnonzero(sin > EPS)
-        if len(sellers) == 0 or len(buyers) == 0:
-            continue
-
-        # A vevő által fizetendő és az eladónak továbbadandó energiadíj
-        # a vevői sáv szerint: 5 Ft/kWh low, 21 Ft/kWh high.
-        buyer_energy_cost_ft[buyers] += (
-            buyer_shared_low_t[buyers] * SHARED_BUYER_LOW_FT_PER_KWH
-            + buyer_shared_high_t[buyers] * SHARED_BUYER_HIGH_FT_PER_KWH
-        )
-        buyer_avg_energy_rate = np.divide(
-            buyer_shared_low_t * SHARED_BUYER_LOW_FT_PER_KWH
-            + buyer_shared_high_t * SHARED_BUYER_HIGH_FT_PER_KWH,
-            sin,
-            out=np.zeros(U, dtype=float),
-            where=sin > EPS,
-        )
-
-        remaining_buyers = sin[buyers].copy()
-        remaining_buyer_rates = buyer_avg_energy_rate[buyers].copy()
-        for s in sellers:
-            alloc_to_buyers = _allocate_seller_to_buyers(
-                seller_energy_kwh=float(sout[s]),
-                remaining_buyer_need_kwh=remaining_buyers,
-                pairing_mode=pairing_mode,
-            )
-            if alloc_to_buyers.sum() <= EPS:
-                continue
-            pair_kwh[s, buyers] += alloc_to_buyers
-            pair_payment = alloc_to_buyers * remaining_buyer_rates
-            pair_energy_payment_ft[s, buyers] += pair_payment
-            seller_revenue_ft[s] += float(pair_payment.sum())
-            remaining_buyers = np.maximum(remaining_buyers - alloc_to_buyers, 0.0)
-
-    return {
-        "pair_kwh": pair_kwh,
-        "pair_energy_payment_ft": pair_energy_payment_ft,
-        "buyer_shared_low_kwh": buyer_shared_low_kwh,
-        "buyer_shared_high_kwh": buyer_shared_high_kwh,
-        "buyer_grid_a_low_kwh": buyer_grid_a_low_kwh,
-        "buyer_grid_a_high_kwh": buyer_grid_a_high_kwh,
-        "seller_revenue_ft": seller_revenue_ft,
-        "buyer_energy_cost_ft": buyer_energy_cost_ft,
-        "buyer_rhd_ft": buyer_rhd_ft,
-        "buyer_total_shared_cost_ft": buyer_energy_cost_ft + buyer_rhd_ft,
-    }
+def settle_shared_payments(p_shared_in, p_shared_out, p_grid_import_a,
+        dt=DT_DEFAULT, pairing_mode="proportional", buyer_low_limit_kwh=LOW_TARIFF_LIMIT_KWH):
+    """kW compatibility adapter; preserve grid-first tariff-block allocation."""
+    from dataclasses import replace
+    from Economics.calculate_economics import DEFAULT_TARIFFS, settle_shared_payments as settle
+    tariffs = replace(DEFAULT_TARIFFS, shared_buyer_low_limit_kwh=buyer_low_limit_kwh,
+        shared_buyer_low_ft_per_kwh=SHARED_BUYER_LOW_FT_PER_KWH,
+        shared_buyer_high_ft_per_kwh=SHARED_BUYER_HIGH_FT_PER_KWH,
+        shared_rhd_ft_per_kwh=SHARED_RHD_FT_PER_KWH)
+    return settle(np.asarray(p_shared_in)*dt, np.asarray(p_shared_out)*dt,
+        np.asarray(p_grid_import_a)*dt, tariffs=tariffs,
+        pairing_mode=pairing_mode, shared_low_cap_mode="grid_first")
 
 def disaggregated_opt_bess_shared(
     p_pv: np.ndarray,
@@ -300,6 +115,7 @@ def disaggregated_opt_bess_shared(
     gapRel: float | None = 0.005,
     timeLimit: float | None = None,
     bess_min_mode_steps: int = 4,
+    allow_grid_charge_for_min_soc: bool = False,
     sharing_mode: SharingMode = "proportional",
     pairing_mode: PairingMode | None = None,
 ) -> dict:
@@ -387,43 +203,42 @@ def disaggregated_opt_bess_shared(
     user_set = range(U)
 
     # --- Döntési változók ---
-    p_pv_bess = _var_matrix("p_pv_bess", T, U)
     p_pv_shared = _var_matrix("p_pv_shared", T, U)
     p_pv_grid = _var_matrix("p_pv_grid", T, U)
 
-    p_bess_ue = _var_matrix("p_bess_ue", T, U)
-    p_bess_elh = _var_matrix("p_bess_elh", T, U)
     p_shared_ue = _var_matrix("p_shared_ue", T, U)
     p_shared_elh = _var_matrix("p_shared_elh", T, U)
     p_grid_ue = _var_matrix("p_grid_ue", T, U)
     p_grid_elh = _var_matrix("p_grid_elh", T, U)
 
-    p_bess_in = _var_matrix("p_bess_in", T, U)
-    p_bess_out = _var_matrix("p_bess_out", T, U)
-    p_grid_bess = _var_matrix("p_grid_bess", T, U)
 
     p_grid_import = _var_matrix("p_grid_import", T, U)
     p_grid_export = _var_matrix("p_grid_export", T, U)
     d_grid = _bin_matrix("d_grid", T, U, run_lp)
-    d_bess_ch = _bin_matrix("d_bess_ch", T, U, run_lp)
-    d_bess_dis = _bin_matrix("d_bess_dis", T, U, run_lp)
-    d_grid_bess_guard = _bin_matrix("d_grid_bess_guard", T, U, run_lp)
 
-    e_bess: list[list[pulp.LpVariable | float]] = [[0.0 for _ in user_set] for _ in time_set]
-    e_bess_pre: list[list[pulp.LpVariable | float]] = [[0.0 for _ in user_set] for _ in time_set]
-    for t in time_set:
-        for u in user_set:
-            if bess_enabled[u] and size_bess[u] > EPS:
-                e_bess[t][u] = pulp.LpVariable(
-                    f"e_bess_{t}_{u}",
-                    lowBound=float(size_bess[u]) * float(soc_bess_min[u]),
-                    upBound=float(size_bess[u]) * float(soc_bess_max[u]),
-                )
-                e_bess_pre[t][u] = pulp.LpVariable(
-                    f"e_bess_pre_{t}_{u}",
-                    lowBound=0,
-                    upBound=float(size_bess[u]) * float(soc_bess_max[u]),
-                )
+    batteries = [build_bess(prob, T, dt=dt,
+        size=float(size_bess[u]) if bess_enabled[u] else 0.0,
+        eta_in=float(eta_bess_in[u]), eta_out=float(eta_bess_out[u]),
+        retention=float(eta_bess_stor[u]), soc_min=float(soc_bess_min[u]),
+        soc_max=float(soc_bess_max[u]), soc_init=float(soc_bess_init),
+        min_hours=float(t_bess_min[u]), run_lp=run_lp,
+        min_mode_steps=bess_min_mode_steps,
+        allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
+        prefix=f"user_{u}_") for u in user_set]
+    def battery_matrix(attribute):
+        return [[getattr(batteries[u], attribute)[t] for u in user_set] for t in time_set]
+    p_pv_bess = battery_matrix("pv")
+    p_bess_ue = battery_matrix("base")
+    p_bess_elh = battery_matrix("boiler")
+    p_bess_in = battery_matrix("charge")
+    p_bess_out = battery_matrix("discharge")
+    p_grid_bess = battery_matrix("grid")
+    d_bess_ch = battery_matrix("charge_on")
+    d_bess_dis = battery_matrix("discharge_on")
+    e_bess = battery_matrix("state")
+    for u in user_set:
+        for t in time_set:
+            prob += batteries[u].fixed[t] == 0, f"unused_fixed_battery_load_{t}_{u}"
 
     e_grid_a_low_step = _var_matrix("e_grid_a_low_step", T, U)
     e_grid_a_high_step = _var_matrix("e_grid_a_high_step", T, U)
@@ -509,56 +324,6 @@ def disaggregated_opt_bess_shared(
                 prob += p_grid_import_a_t <= float(M_grid_u[u]) * d_grid[t][u], f"grid_import_a_gate_{t}_{u}"
                 prob += p_grid_export[t][u] <= float(M_pv_u[u]) * (1 - d_grid[t][u]), f"grid_export_gate_{t}_{u}"
 
-            if not (bess_enabled[u] and size_bess[u] > EPS):
-                prob += p_pv_bess[t][u] == 0, f"no_bess_pv_bess_{t}_{u}"
-                prob += p_bess_ue[t][u] == 0, f"no_bess_ue_{t}_{u}"
-                prob += p_bess_elh[t][u] == 0, f"no_bess_elh_{t}_{u}"
-                prob += p_bess_in[t][u] == 0, f"no_bess_in_{t}_{u}"
-                prob += p_bess_out[t][u] == 0, f"no_bess_out_{t}_{u}"
-                prob += p_grid_bess[t][u] == 0, f"no_grid_bess_{t}_{u}"
-            else:
-                prob += (
-                    p_bess_in[t][u] == p_pv_bess[t][u] + p_grid_bess[t][u]
-                ), f"bess_in_def_{t}_{u}"
-                prob += (
-                    p_bess_out[t][u] == p_bess_ue[t][u] + p_bess_elh[t][u]
-                ), f"bess_out_def_{t}_{u}"
-
-                if t < T - 1:
-                    soc_min_abs = float(size_bess[u]) * float(soc_bess_min[u])
-                    M_soc = max(float(size_bess[u]), 1.0)
-                    prob += e_bess_pre[t + 1][u] == (
-                        e_bess[t][u] * float(eta_bess_stor[u])
-                        + dt * (
-                            p_pv_bess[t][u] * float(eta_bess_in[u])
-                            - p_bess_out[t][u] / max(float(eta_bess_out[u]), EPS)
-                        )
-                    ), f"bess_pre_dyn_{t}_{u}"
-
-                    prob += e_bess[t + 1][u] == (
-                        e_bess_pre[t + 1][u]
-                        + dt * float(eta_bess_in[u]) * p_grid_bess[t][u]
-                    ), f"bess_dyn_with_grid_guard_{t}_{u}"
-
-                    if not run_lp:
-                        grid_added = dt * float(eta_bess_in[u]) * p_grid_bess[t][u]
-                        deficit_to_min = soc_min_abs - e_bess_pre[t + 1][u]
-                        prob += grid_added >= deficit_to_min, f"grid_bess_guard_lb_{t}_{u}"
-                        prob += grid_added <= deficit_to_min + M_soc * (1 - d_grid_bess_guard[t][u]), f"grid_bess_guard_exact_{t}_{u}"
-                        prob += grid_added <= M_soc * d_grid_bess_guard[t][u], f"grid_bess_guard_ub_{t}_{u}"
-                    else:
-                        prob += dt * float(eta_bess_in[u]) * p_grid_bess[t][u] >= soc_min_abs - e_bess_pre[t + 1][u], f"grid_bess_guard_lp_{t}_{u}"
-                else:
-                    prob += p_grid_bess[t][u] == 0, f"no_grid_bess_last_{t}_{u}"
-
-                if run_lp:
-                    prob += p_bess_in[t][u] <= float(battery_power[u]), f"bess_in_cap_{t}_{u}"
-                    prob += p_bess_out[t][u] <= float(battery_power[u]), f"bess_out_cap_{t}_{u}"
-                else:
-                    prob += d_bess_ch[t][u] + d_bess_dis[t][u] <= 1, f"bess_no_simultaneous_{t}_{u}"
-                    prob += p_bess_in[t][u] <= d_bess_ch[t][u] * float(battery_power[u]), f"bess_in_gate_{t}_{u}"
-                    prob += p_bess_out[t][u] <= d_bess_dis[t][u] * float(battery_power[u]), f"bess_out_gate_{t}_{u}"
-
             # A/B tarifa energia-lépcsők.
             if boiler_tariff == "A":
                 e_imp_a_t = dt * (p_grid_ue[t][u] + p_grid_elh[t][u] + p_grid_bess[t][u])
@@ -588,30 +353,6 @@ def disaggregated_opt_bess_shared(
                 prob += rem_b_low[t][u] == rem_b_low[t - 1][u] - e_grid_b_low_step[t][u], f"rem_b_dyn_{t}_{u}"
                 prob += e_grid_b_low_step[t][u] <= rem_b_low[t - 1][u], f"b_low_remaining_{t}_{u}"
 
-    # Kezdeti SOC.
-    for u in user_set:
-        if bess_enabled[u] and size_bess[u] > EPS:
-            prob += e_bess[0][u] == float(size_bess[u]) * float(soc_bess_init), f"bess_init_{u}"
-
-    # Minimum töltési/kisütési üzemmódhossz.
-    if not run_lp:
-        min_steps = max(1, int(bess_min_mode_steps))
-        if min_steps > 1:
-            for u in user_set:
-                if not (bess_enabled[u] and size_bess[u] > EPS):
-                    continue
-                for t in range(1, T - min_steps + 1):
-                    start_ch = d_bess_ch[t][u] - d_bess_ch[t - 1][u]
-                    start_dis = d_bess_dis[t][u] - d_bess_dis[t - 1][u]
-                    prob += (
-                        pulp.lpSum(d_bess_ch[tau][u] for tau in range(t, t + min_steps))
-                        >= min_steps * start_ch
-                    ), f"bess_min_charge_{t}_{u}"
-                    prob += (
-                        pulp.lpSum(d_bess_dis[tau][u] for tau in range(t, t + min_steps))
-                        >= min_steps * start_dis
-                    ), f"bess_min_discharge_{t}_{u}"
-
     # --- Célfüggvény ---
     if objective == "grid":
         prob += pulp.lpSum(
@@ -635,38 +376,37 @@ def disaggregated_opt_bess_shared(
     else:
         raise ValueError("objective csak 'bill' vagy 'grid' lehet")
 
-    solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
-    status = prob.solve(solver)
-    status_str = pulp.LpStatus.get(status, str(status))
-    if status_str not in {"Optimal", "Integer Feasible"}:
-        raise RuntimeError(f"Optimalizálási hiba: {status_str}")
+    solve_result = solve_problem(
+        prob, msg=msg, gap_rel=gapRel, time_limit=timeLimit
+    )
+    status_str = solve_result.status
 
     # --- Eredmények kinyerése ---
-    p_pv_bess_v = _extract_matrix(p_pv_bess, T, U)
-    p_pv_shared_v = _extract_matrix(p_pv_shared, T, U)
-    p_pv_grid_v = _extract_matrix(p_pv_grid, T, U)
-    p_bess_ue_v = _extract_matrix(p_bess_ue, T, U)
-    p_bess_elh_v = _extract_matrix(p_bess_elh, T, U)
-    p_shared_ue_v = _extract_matrix(p_shared_ue, T, U)
-    p_shared_elh_v = _extract_matrix(p_shared_elh, T, U)
-    p_grid_ue_v = _extract_matrix(p_grid_ue, T, U)
-    p_grid_elh_v = _extract_matrix(p_grid_elh, T, U)
-    p_bess_in_v = _extract_matrix(p_bess_in, T, U)
-    p_bess_out_v = _extract_matrix(p_bess_out, T, U)
-    p_grid_bess_v = _extract_matrix(p_grid_bess, T, U)
-    p_grid_import_v = _extract_matrix(p_grid_import, T, U)
-    p_grid_export_v = _extract_matrix(p_grid_export, T, U)
-    d_bess_ch_v = _extract_matrix(d_bess_ch, T, U) if not run_lp else np.zeros((T, U))
-    d_bess_dis_v = _extract_matrix(d_bess_dis, T, U) if not run_lp else np.zeros((T, U))
-    d_grid_v = _extract_matrix(d_grid, T, U) if not run_lp else np.zeros((T, U))
-    e_bess_v = _extract_matrix(e_bess, T, U)
+    p_pv_bess_v = extract_matrix(p_pv_bess)
+    p_pv_shared_v = extract_matrix(p_pv_shared)
+    p_pv_grid_v = extract_matrix(p_pv_grid)
+    p_bess_ue_v = extract_matrix(p_bess_ue)
+    p_bess_elh_v = extract_matrix(p_bess_elh)
+    p_shared_ue_v = extract_matrix(p_shared_ue)
+    p_shared_elh_v = extract_matrix(p_shared_elh)
+    p_grid_ue_v = extract_matrix(p_grid_ue)
+    p_grid_elh_v = extract_matrix(p_grid_elh)
+    p_bess_in_v = extract_matrix(p_bess_in)
+    p_bess_out_v = extract_matrix(p_bess_out)
+    p_grid_bess_v = extract_matrix(p_grid_bess)
+    p_grid_import_v = extract_matrix(p_grid_import)
+    p_grid_export_v = extract_matrix(p_grid_export)
+    d_bess_ch_v = extract_matrix(d_bess_ch) if not run_lp else np.zeros((T, U))
+    d_bess_dis_v = extract_matrix(d_bess_dis) if not run_lp else np.zeros((T, U))
+    d_grid_v = extract_matrix(d_grid) if not run_lp else np.zeros((T, U))
+    e_bess_v = extract_matrix(e_bess)
 
-    e_grid_a_low_step_v = _extract_matrix(e_grid_a_low_step, T, U)
-    e_grid_a_high_step_v = _extract_matrix(e_grid_a_high_step, T, U)
-    e_shared_a_low_step_v = _extract_matrix(e_shared_a_low_step, T, U)
-    e_shared_a_high_step_v = _extract_matrix(e_shared_a_high_step, T, U)
-    e_grid_b_low_step_v = _extract_matrix(e_grid_b_low_step, T, U)
-    e_grid_b_high_step_v = _extract_matrix(e_grid_b_high_step, T, U)
+    e_grid_a_low_step_v = extract_matrix(e_grid_a_low_step)
+    e_grid_a_high_step_v = extract_matrix(e_grid_a_high_step)
+    e_shared_a_low_step_v = extract_matrix(e_shared_a_low_step)
+    e_shared_a_high_step_v = extract_matrix(e_shared_a_high_step)
+    e_grid_b_low_step_v = extract_matrix(e_grid_b_low_step)
+    e_grid_b_high_step_v = extract_matrix(e_grid_b_high_step)
 
     p_pv_load_v = p_pv_ue_fixed + p_pv_elh_fixed
     p_bess_load_v = p_bess_ue_v + p_bess_elh_v
@@ -746,7 +486,7 @@ def disaggregated_opt_bess_shared(
             "grid_import_b_high_kwh": b_high,
             "grid_import_low_kwh": a_low + b_low,
             "grid_import_high_kwh": a_high + b_high,
-            "final_bess_energy_kwh": float(e_bess_v[-1, u]) if T else 0.0,
+            "final_bess_energy_kwh": float(variable_value(batteries[u].state[T])),
             "self_consumed_pv_kwh": self_consumed_pv,
             "locally_supplied_load_kwh": locally_supplied,
             "self_consumption_ratio": sci,
@@ -778,8 +518,9 @@ def disaggregated_opt_bess_shared(
 
     summary = {
         "status": status_str,
+        "solver": solve_result.solver,
         "objective": objective,
-        "objective_value": float(pulp.value(prob.objective)),
+        "objective_value": variable_value(prob.objective),
         "n_users": int(U),
         "T": int(T),
         "dt": float(dt),
@@ -787,6 +528,8 @@ def disaggregated_opt_bess_shared(
         "sharing_mode": sharing_mode,
         "pairing_mode": pairing_mode,
         "bess_min_mode_steps": int(bess_min_mode_steps),
+        "bess_terminal": "cyclic",
+        "allow_grid_charge_for_min_soc": allow_grid_charge_for_min_soc,
         "bess_min_mode_minutes": float(bess_min_mode_steps) * dt * 60.0,
         "pv_user_count": int((p_pv.sum(axis=0) * dt > EPS).sum()),
         "bess_enabled_user_count": int(np.asarray(bess_enabled, dtype=bool).sum()),
@@ -854,14 +597,20 @@ def disaggregated_opt_bess_shared(
         "p_grid_ue": p_grid_ue_v,
         "p_grid_elh": p_grid_elh_v,
         "p_grid_bess": p_grid_bess_v,
+        "p_bess_in": p_bess_in_v,
+        "p_bess_out": p_bess_out_v,
         "p_grid_import": p_grid_import_v,
         "p_grid_export": p_grid_export_v,
         "e_bess": e_bess_v,
+        "e_bess_boundary": np.column_stack([extract_vector(b.state) for b in batteries]),
         "d_bess_ch": d_bess_ch_v,
         "d_bess_dis": d_bess_dis_v,
         "d_grid": d_grid_v,
     }
 
+    from Utility.result_schema import add_bess_states, add_bess_flows
+    add_bess_states(timeseries, timeseries["e_bess_boundary"])
+    add_bess_flows(timeseries, dt)
     return {
         "summary": summary,
         "per_user_df": per_user_df,
@@ -871,10 +620,14 @@ def disaggregated_opt_bess_shared(
         "user_names": list(user_names),
         "bess_enabled": np.asarray(bess_enabled, dtype=bool),
         "status": status_str,
+        "solver": solve_result.solver,
+        "dt_hours": float(dt),
     }
 
 
 def save_disaggregated_opt_results(result: dict, out_dir: str | Path, *, save_user_timeseries: bool = True) -> None:
+    from Utility.result_schema import save_bess_result
+    save_bess_result(result["timeseries"], out_dir, result["dt_hours"], result["user_names"])
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     user_names = result["user_names"]
@@ -894,9 +647,18 @@ def save_disaggregated_opt_results(result: dict, out_dir: str | Path, *, save_us
         "p_pv_bess", "p_pv_shared", "p_pv_grid", "p_bess_load", "p_bess_ue", "p_bess_elh",
         "p_shared_in", "p_shared_ue", "p_shared_elh", "p_shared_out", "p_grid_load", "p_grid_ue",
         "p_grid_elh", "p_grid_bess", "p_grid_import", "p_grid_export", "e_bess", "d_bess_ch",
-        "d_bess_dis", "d_grid",
+        "d_bess_dis", "d_grid", "p_bess_in", "p_bess_out", "e_bess_boundary",
+        "e_bess_start", "e_bess_end",
     ]:
         save_matrix(key)
+
+    for key in (
+        "p_individual_settlement_grid_import_a",
+        "p_individual_settlement_grid_import_b",
+        "p_individual_settlement_grid_export",
+    ):
+        if key in ts:
+            save_matrix(key)
 
     pd.DataFrame(result["shared_pair_kwh"], index=user_names, columns=user_names).to_csv(
         out / "shared_pair_kwh_seller_x_buyer.csv"
@@ -923,10 +685,21 @@ def save_disaggregated_opt_results(result: dict, out_dir: str | Path, *, save_us
         "p_grid_export_sum": ts["p_grid_export"].sum(axis=1),
         "e_bess_sum": ts["e_bess"].sum(axis=1),
     })
+    if "p_individual_settlement_grid_import_a" in ts:
+        community_ts["p_individual_settlement_grid_import_a_sum"] = ts[
+            "p_individual_settlement_grid_import_a"
+        ].sum(axis=1)
+        community_ts["p_individual_settlement_grid_import_b_sum"] = ts[
+            "p_individual_settlement_grid_import_b"
+        ].sum(axis=1)
+        community_ts["p_individual_settlement_grid_export_sum"] = ts[
+            "p_individual_settlement_grid_export"
+        ].sum(axis=1)
     community_ts.to_csv(out / "community_timeseries.csv", index=False)
 
     if save_user_timeseries:
         for i, name in enumerate(user_names):
             safe_name = str(name).replace("/", "_").replace("\\", "_")
-            user_df = pd.DataFrame({key: arr[:, i] for key, arr in ts.items() if arr.ndim == 2})
+            user_df = pd.DataFrame({key: arr[:, i] for key, arr in ts.items()
+                                    if arr.ndim == 2 and key != "e_bess_boundary"})
             user_df.to_csv(out / f"timeseries_{safe_name}.csv", index=False)

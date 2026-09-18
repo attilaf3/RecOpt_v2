@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from Economics import settle_community_optimization_as_individual
 from InputReading import read_simulation_inputs
 from Utility.configuration import config
 
@@ -20,6 +21,89 @@ from optimize_disaggregated import (
     disaggregated_opt_bess_shared,
     save_disaggregated_opt_results,
 )
+
+
+def _apply_settlement_mode(result: dict, settlement_mode: str, boiler_tariff: str, dt: float) -> dict:
+    settlement_mode = str(settlement_mode).lower().strip()
+    if settlement_mode not in {"community", "individual"}:
+        raise ValueError("settlement_mode csak 'community' vagy 'individual' lehet.")
+
+    result["summary"]["settlement_mode"] = settlement_mode
+    result["summary"]["scenario_code"] = "4d-I" if settlement_mode == "individual" else "4d-K"
+    if settlement_mode == "community":
+        return result
+
+    ts = result["timeseries"]
+    zeros = np.zeros_like(ts["p_grid_ue"], dtype=float)
+    if boiler_tariff == "A":
+        e_grid_a = (ts["p_grid_ue"] + ts["p_grid_elh"] + ts["p_grid_bess"]) * dt
+        e_grid_b = zeros
+        e_shared_a = (ts["p_shared_ue"] + ts["p_shared_elh"]) * dt
+        e_shared_b = zeros
+    else:
+        e_grid_a = (ts["p_grid_ue"] + ts["p_grid_bess"]) * dt
+        e_grid_b = ts["p_grid_elh"] * dt
+        e_shared_a = ts["p_shared_ue"] * dt
+        e_shared_b = ts["p_shared_elh"] * dt
+
+    individual = settle_community_optimization_as_individual(
+        e_grid_import_a=e_grid_a,
+        e_grid_import_b=e_grid_b,
+        e_grid_export=ts["p_grid_export"] * dt,
+        e_shared_to_a=e_shared_a,
+        e_shared_to_b=e_shared_b,
+        e_shared_out=ts["p_shared_out"] * dt,
+        user_names=result["user_names"],
+    )
+
+    community_df = result["per_user_df"].copy()
+    selected_df = community_df.copy()
+    for column in ("grid_import_kwh", "grid_export_kwh", "shared_in_kwh", "shared_out_kwh",
+                   "import_cost_ft", "export_revenue_ft", "brt_bill_ft"):
+        if column in community_df:
+            selected_df[f"community_settlement_{column}"] = community_df[column]
+    individual_df = individual["per_user_df"].set_index("household")
+    for column in individual_df.columns:
+        selected_df[column] = selected_df["household"].map(individual_df[column])
+
+    original_summary = dict(result["summary"])
+    result["community_settlement_per_user_df"] = community_df
+    result["community_settlement_summary"] = original_summary
+    result["community_shared_pair_kwh"] = np.asarray(result["shared_pair_kwh"], dtype=float).copy()
+    result["community_shared_pair_energy_payment_ft"] = np.asarray(
+        result["shared_pair_energy_payment_ft"], dtype=float
+    ).copy()
+    result["per_user_df"] = selected_df
+    result["settlement_economics"] = individual
+    result["shared_pair_energy_payment_ft"] = np.zeros_like(
+        result["shared_pair_energy_payment_ft"], dtype=float
+    )
+
+    summary = result["summary"]
+    summary["physical_external_grid_import_kwh"] = original_summary["total_grid_import_kwh"]
+    summary["physical_external_grid_export_kwh"] = original_summary["total_grid_export_kwh"]
+    summary["physical_shared_in_kwh"] = original_summary["total_shared_in_kwh"]
+    summary["physical_shared_out_kwh"] = original_summary["total_shared_out_kwh"]
+    summary["community_settlement_brt_bill_ft"] = original_summary["total_brt_bill_ft"]
+    summary["total_grid_import_kwh"] = individual["summary"]["grid_import_kwh"]
+    summary["total_grid_export_kwh"] = individual["summary"]["grid_export_kwh"]
+    summary["total_shared_in_kwh"] = 0.0
+    summary["total_shared_out_kwh"] = 0.0
+    summary["total_import_cost_a_ft"] = individual["summary"]["grid_import_a_cost_ft"]
+    summary["total_import_cost_b_ft"] = individual["summary"]["grid_import_b_cost_ft"]
+    summary["total_import_cost_ft"] = individual["summary"]["grid_import_cost_ft"]
+    summary["total_export_revenue_ft"] = individual["summary"]["grid_export_revenue_ft"]
+    summary["total_shared_purchase_energy_cost_ft"] = 0.0
+    summary["total_shared_purchase_rhd_ft"] = 0.0
+    summary["total_shared_purchase_cost_ft"] = 0.0
+    summary["total_shared_revenue_ft"] = 0.0
+    summary["total_brt_bill_ft"] = individual["summary"]["brt_bill_ft"]
+
+    ind_ts = individual["timeseries"]
+    ts["p_individual_settlement_grid_import_a"] = ind_ts["e_grid_import_a"] / dt
+    ts["p_individual_settlement_grid_import_b"] = ind_ts["e_grid_import_b"] / dt
+    ts["p_individual_settlement_grid_export"] = ind_ts["e_grid_export"] / dt
+    return result
 
 
 def build_inputs(
@@ -85,10 +169,12 @@ def run(
     sharing_mode: str = "proportional",
     pairing_mode: str | None = None,
     bess_min_mode_steps: int = 4,
+    allow_grid_charge_for_min_soc: bool = False,
     gap_rel: float | None = 0.005,
     time_limit: float | None = None,
     msg: bool = False,
     save_user_timeseries: bool = True,
+    settlement_mode: str = "community",
 ) -> dict:
     dt = config.getfloat("simulation", "dt_hours")
     boiler_tariff = str(boiler_tariff).upper().strip()
@@ -156,9 +242,11 @@ def run(
         gapRel=gap_rel,
         timeLimit=time_limit,
         bess_min_mode_steps=bess_min_mode_steps,
+        allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
         sharing_mode=sharing_mode,
         pairing_mode=pairing_mode,
     )
+    result = _apply_settlement_mode(result, settlement_mode, boiler_tariff, dt)
 
     result["summary"]["out_dir"] = str(out)
     result["summary"]["bess_share_pct"] = float(bess_share_pct)
@@ -166,6 +254,24 @@ def run(
     result["summary"]["include_bess"] = bool(include_bess)
 
     save_disaggregated_opt_results(result, out, save_user_timeseries=save_user_timeseries)
+    if settlement_mode == "individual":
+        result["community_settlement_per_user_df"].to_csv(
+            out / "community_settlement_reference.csv", index=False
+        )
+        (out / "community_settlement_reference_summary.json").write_text(
+            json.dumps(result["community_settlement_summary"], indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        pd.DataFrame(
+            result["community_shared_pair_kwh"],
+            index=result["user_names"],
+            columns=result["user_names"],
+        ).to_csv(out / "community_settlement_reference_pair_kwh.csv")
+        pd.DataFrame(
+            result["community_shared_pair_energy_payment_ft"],
+            index=result["user_names"],
+            columns=result["user_names"],
+        ).to_csv(out / "community_settlement_reference_pair_energy_payment_ft.csv")
     print(json.dumps(result["summary"], indent=2, ensure_ascii=False))
     return result["summary"]
 
@@ -186,10 +292,12 @@ def run_case(
     run_lp: bool = False,
     pv_ratio: float = 1.0,
     bess_min_mode_steps: int = 4,
+    allow_grid_charge_for_min_soc: bool = False,
     gap_rel: float | None = 0.005,
     time_limit: float | None = None,
     msg: bool = False,
     save_user_timeseries: bool = True,
+    settlement_mode: str = "community",
 ) -> dict:
     """Egyszerű hívó wrapper. A dhw_profiles_csv itt csak kompatibilitási paraméter;
     az optimalizált kód a bojlerprofilt a profiles_csv-ből olvassa."""
@@ -207,13 +315,26 @@ def run_case(
         sharing_mode=sharing_mode,
         pairing_mode=None,
         bess_min_mode_steps=bess_min_mode_steps,
+        allow_grid_charge_for_min_soc=allow_grid_charge_for_min_soc,
         gap_rel=gap_rel,
         time_limit=time_limit,
         msg=msg,
         save_user_timeseries=save_user_timeseries,
+        settlement_mode=settlement_mode,
     )
     summary["case_name"] = case_name
     return summary
+
+
+def run_4d_i(**kwargs) -> dict:
+    """Run community optimization with individual settlement (scenario 4d-I)."""
+    kwargs = dict(kwargs)
+    kwargs["case_name"] = "4d-I"
+    kwargs["settlement_mode"] = "individual"
+    kwargs.setdefault("objective", "grid")
+    kwargs.setdefault("boiler_tariff", "A")
+    kwargs.setdefault("out_dir", config.getpath("paths", "scenario_4d_i_output"))
+    return run_case(**kwargs)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -235,6 +356,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--time-limit", type=float, default=None)
     ap.add_argument("--msg", action="store_true")
     ap.add_argument("--no-user-timeseries", action="store_true", help="Ne írjon külön timeseries_*.csv fájlokat háztartásonként.")
+    ap.add_argument("--settlement-mode", choices=["community", "individual"], default="community")
     args = ap.parse_args(argv)
 
     run(
@@ -255,6 +377,7 @@ def main(argv: list[str] | None = None) -> None:
         time_limit=args.time_limit,
         msg=args.msg,
         save_user_timeseries=not args.no_user_timeseries,
+        settlement_mode=args.settlement_mode,
     )
 
 

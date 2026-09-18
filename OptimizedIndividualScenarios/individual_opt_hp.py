@@ -1,6 +1,12 @@
 import numpy as np
 import pulp
+from Optimization import extract_vector, solve_problem, variable_value
 from Utility.configuration import config
+from OptimizedIndividualScenarios.optimization_constraints import (
+    add_import_export_exclusivity,
+    add_two_tier_step_constraints,
+    create_two_tier_tariff_block,
+)
 
 
 def hp_profiles_from_temperature(
@@ -168,9 +174,10 @@ def individual_opt_hp(
     d_grid = [pulp.LpVariable(f"d_grid_{t}", cat=pulp.LpBinary) if not run_lp else 0 for t in time_set]
 
     # Tariff blocks, matching individual_opt_bess.py.
-    e_grid_low_step = [pulp.LpVariable(f"e_grid_low_step_{t}", lowBound=0) for t in time_set]
-    e_grid_high_step = [pulp.LpVariable(f"e_grid_high_step_{t}", lowBound=0) for t in time_set]
-    rem_low = [pulp.LpVariable(f"rem_low_{t}", lowBound=0, upBound=grid_low_cap_kwh) for t in time_set]
+    tariff = create_two_tier_tariff_block(T, grid_low_cap_kwh, "e_grid")
+    e_grid_low_step = tariff.low_step
+    e_grid_high_step = tariff.high_step
+    rem_low = tariff.remaining_low
 
     for t in time_set:
         # PV split.
@@ -186,17 +193,20 @@ def individual_opt_hp(
 
         # No simultaneous import/export in MIP mode.
         if not run_lp:
-            prob += p_grid_import[t] <= M_grid * d_grid[t], f"grid_import_gate_{t}"
-            prob += p_grid_export[t] <= M_pv * (1 - d_grid[t]), f"grid_export_gate_{t}"
+            add_import_export_exclusivity(
+                prob,
+                p_grid_import[t],
+                p_grid_export[t],
+                d_grid[t],
+                M_grid,
+                M_pv,
+                t,
+            )
 
         # Gross 15-minute import split into regulated/above-cap tariff blocks.
-        prob += e_grid_low_step[t] + e_grid_high_step[t] == p_grid_import[t], f"grid_step_split_{t}"
-        if t == 0:
-            prob += rem_low[t] == grid_low_cap_kwh - e_grid_low_step[t], "rem_low_init"
-            prob += e_grid_low_step[t] <= grid_low_cap_kwh, f"grid_low_step_cap_{t}"
-        else:
-            prob += rem_low[t] == rem_low[t - 1] - e_grid_low_step[t], f"rem_low_balance_{t}"
-            prob += e_grid_low_step[t] <= rem_low[t - 1], f"grid_low_step_cap_{t}"
+        add_two_tier_step_constraints(
+            prob, tariff, t, p_grid_import[t], grid_low_cap_kwh, "grid"
+        )
 
     cost_grid = pulp.lpSum(
         price_grid_low * e_grid_low_step[t] + price_grid_high * e_grid_high_step[t]
@@ -205,28 +215,22 @@ def individual_opt_hp(
     revenue_export = pulp.lpSum(price_pv_grid * p_pv_grid[t] for t in time_set)
     prob += cost_grid - revenue_export
 
-    solver = pulp.GUROBI_CMD(msg=msg, gapRel=gapRel, timeLimit=timeLimit)
-    status = prob.solve(solver)
+    solve_result = solve_problem(
+        prob, msg=msg, gap_rel=gapRel, time_limit=timeLimit
+    )
+    status_str = solve_result.status
 
-    status_str = pulp.LpStatus.get(status, str(status))
-    if status_str not in {"Optimal", "Not Solved", "Integer Feasible", "Undefined"}:
-        raise RuntimeError(f"Hiba: {status_str}")
-
-    def _val(x):
-        v = pulp.value(x)
-        return 0.0 if v is None else float(v)
-
-    p_pv_load_v = np.array([_val(v) for v in p_pv_load], dtype=float)
-    p_pv_hp_v = np.array([_val(v) for v in p_pv_hp], dtype=float)
-    p_pv_grid_v = np.array([_val(v) for v in p_pv_grid], dtype=float)
-    p_grid_load_v = np.array([_val(v) for v in p_grid_load], dtype=float)
-    p_grid_hp_v = np.array([_val(v) for v in p_grid_hp], dtype=float)
-    p_grid_import_v = np.array([_val(v) for v in p_grid_import], dtype=float)
-    p_grid_export_v = np.array([_val(v) for v in p_grid_export], dtype=float)
-    d_grid_v = np.array([_val(v) if not run_lp else 0.0 for v in d_grid], dtype=float)
-    e_grid_low_step_v = np.array([_val(v) for v in e_grid_low_step], dtype=float)
-    e_grid_high_step_v = np.array([_val(v) for v in e_grid_high_step], dtype=float)
-    rem_low_v = np.array([_val(v) for v in rem_low], dtype=float)
+    p_pv_load_v = extract_vector(p_pv_load)
+    p_pv_hp_v = extract_vector(p_pv_hp)
+    p_pv_grid_v = extract_vector(p_pv_grid)
+    p_grid_load_v = extract_vector(p_grid_load)
+    p_grid_hp_v = extract_vector(p_grid_hp)
+    p_grid_import_v = extract_vector(p_grid_import)
+    p_grid_export_v = extract_vector(p_grid_export)
+    d_grid_v = extract_vector(d_grid) if not run_lp else np.zeros(T)
+    e_grid_low_step_v = extract_vector(e_grid_low_step)
+    e_grid_high_step_v = extract_vector(e_grid_high_step)
+    rem_low_v = extract_vector(rem_low)
 
     e_grid_low_v = float(np.sum(e_grid_low_step_v))
     e_grid_high_v = float(np.sum(e_grid_high_step_v))
@@ -262,8 +266,9 @@ def individual_opt_hp(
         "grid_cost_Ft": float(grid_cost),
         "grid_export_revenue_Ft": float(export_revenue),
         "net_cost_Ft": float(net_cost),
-        "objective_Ft": float(_val(prob.objective)),
+        "objective_Ft": variable_value(prob.objective),
         "status": status_str,
+        "solver": solve_result.solver,
         "e_grid_low_step": e_grid_low_step_v,
         "e_grid_high_step": e_grid_high_step_v,
         "remaining_low_block_kwh": rem_low_v,

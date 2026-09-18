@@ -31,3 +31,7 @@ Thumbs.db
 results_*/
 run_*
 config/config.ini
+.codex-test-deps/
+!OptimizedScenarios/run_individual_optimization.py
+!OptimizedIndividualScenarios/run_individual_opt_boiler.py
+results/
