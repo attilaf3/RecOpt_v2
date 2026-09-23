@@ -15,7 +15,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.append(str(HERE))
-from OptimizedIndividualScenarios.individual_opt_boiler_A_only import individual_opt_boiler
+from OptimizedIndividualScenarios.individual_opt_boiler import individual_opt_boiler
 
 
 # --- helpers -------------------------------------------------------------------
@@ -106,6 +106,7 @@ def build_inputs(
             raise RuntimeError(
                 f"A megadott háztartás nem található a users_list-ben: {target_user}"
             )
+
     else:
         users_list = users_list_all[: int(max_users)]
 
