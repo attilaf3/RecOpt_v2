@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pulp
 
 
 def individual_opt_bess_boiler(
@@ -19,15 +18,15 @@ def individual_opt_bess_boiler(
     vol_hss_water=0.0,
     T_env=20.0,
     T_max=65.0,
-    T_min=35.0,
+    T_abs_min=10.0,
     T_in=10.0,
-    T_set=50.0,
+    T_comfort=40.0,
+    T_setpoint_min=50.0,
+    T_initial=50.0,
+    morning_block=(6.0, 9.0),
+    evening_block=(17.0, 22.0),
     a_hss=0.01275,
     eta_elh=0.95,
-    enforce_cl_rules=True,
-    cl_min_activation_hours=2.0,
-    cl_max_on_hours_per_day=12.0,
-    cl_min_midday_hours_per_day=4.0,
     size_bess=0.0,
     eta_bess_in=0.98,
     eta_bess_out=0.96,
@@ -53,9 +52,10 @@ def individual_opt_bess_boiler(
 ):
     """Minimalizálja az éves villanyszámlát bruttó elszámolás mellett.
 
-    A dinamikusan optimalizált HSS A tarifás, ezért saját PV-ből és
-    BESS-ből is ellátható. A változatlan mért bojlerprofil automatikusan
-    B tarifás, és csak a külön B hálózati körről kap energiát.
+    A HSS állapota eltárolt hőenergia. A 40 °C-os használati meleg víz
+    igénye energiaelvételként jelenik meg, ezért nincs 40 °C-os hard
+    átlaghőmérséklet-korlát. A reggeli és esti tiltott sávban a bojler
+    sem hálózatból, sem PV-ből, sem BESS-ből nem működhet.
     """
     p_pv = np.maximum(np.asarray(p_pv, dtype=float).ravel(), 0.0)
     p_ue = np.maximum(np.asarray(p_ue, dtype=float).ravel(), 0.0)
@@ -77,13 +77,65 @@ def individual_opt_bess_boiler(
     fixed_boiler_active = bool(not hss_active and p_el_heater_fixed.sum() > 1e-9)
     bess_active = bool(size_bess > 1e-9)
 
-    if hss_active and not (T_min <= T_set <= T_max):
-        raise ValueError("A HSS-nél T_min <= T_set <= T_max szükséges.")
+    if hss_active and not (
+        T_in <= T_abs_min <= T_comfort <= T_setpoint_min <= T_max
+        and T_abs_min <= T_initial <= T_max
+    ):
+        raise ValueError(
+            "A HSS-nél T_in <= T_abs_min <= T_comfort <= "
+            "T_setpoint_min <= T_max és T_abs_min <= T_initial <= T_max szükséges."
+        )
     if bess_active:
         if not (0 <= soc_bess_min <= soc_bess_init <= soc_bess_max <= 1):
             raise ValueError("Hibás BESS SOC-határok vagy kezdeti SOC.")
         if min(eta_bess_in, eta_bess_out, eta_bess_stor, t_bess_min) <= 0:
             raise ValueError("A BESS hatásfokai és t_bess_min legyenek pozitívak.")
+
+    if not hss_active and not bess_active:
+        # Nincs döntési változó: saját PV az alapfogyasztást fedezi,
+        # a mért bojler továbbra is kizárólag a külön B-körön marad.
+        result = {key: np.zeros(T) for key in (
+            "p_pv_boiler", "p_pv_bess", "p_grid_bess", "p_bess_base",
+            "p_bess_boiler", "p_bess_charge", "p_bess_discharge",
+            "d_bess_charge", "d_bess_discharge", "p_elh", "p_hss_in",
+            "p_hss_out", "d_cl", "d_cl_start", "d_heat", "e_hss",
+            "d_below_comfort", "below_comfort", "heating_blocked",
+            "boiler_target_C",
+        )}
+        result.update({
+            "status": "Direct",
+            "calculation_mode": "direct",
+            "p_pv_base": np.minimum(p_pv, p_ue),
+            "p_pv_export": np.maximum(p_pv - p_ue, 0.0),
+            "p_grid_base": np.maximum(p_ue - p_pv, 0.0),
+            "p_grid_boiler": p_el_heater_fixed.copy(),
+            "e_bess": np.zeros(T + 1), "e_hss": np.zeros(T + 1),
+            "t_hss": np.zeros(T + 1),
+            "hss_active": 0, "bess_active": 0, "battery_power_kw": 0.0,
+            "boiler_tariff": "B" if fixed_boiler_active else "",
+            "longest_continuous_below_40_h": 0.0,
+            "dhw_while_below_40_steps": 0,
+            "minimum_dhw_energy_margin_kwhth": 0.0,
+            "dhw_energy_shortfall_steps": 0,
+            "optimized_setpoint_min_C": 0.0,
+            "optimized_setpoint_max_C": 0.0,
+            "boiler_control_status": "NOT_APPLICABLE",
+        })
+        result["p_grid_import"] = result["p_grid_base"] + result["p_grid_boiler"]
+        for tariff, flow, cap in (
+            ("a", result["p_grid_base"], grid_a_low_cap_kwh),
+            ("b", result["p_grid_boiler"], grid_b_low_cap_kwh),
+        ):
+            energy = float(flow.sum() * dt)
+            result[f"grid_import_{tariff}_low_kwh"] = min(energy, cap)
+            result[f"grid_import_{tariff}_high_kwh"] = max(energy - cap, 0.0)
+        result = _finish_bill(result, dt, price_grid_a_low, price_grid_a_high,
+                              price_grid_b_low, price_grid_b_high, price_pv_grid)
+        result["objective_value"] = result["bill_ft"]
+        print("[INFO] Közvetlen számítás: nincs aktív BESS vagy dinamikus bojler.")
+        return result
+
+    import pulp  # Csak az aktív eszközök optimalizálásához szükséges.
 
     model = pulp.LpProblem("individual_opt_bess_boiler", pulp.LpMinimize)
     binary = pulp.LpContinuous if run_lp else pulp.LpBinary
@@ -91,6 +143,11 @@ def individual_opt_bess_boiler(
     max_boiler = max(float(size_elh), float(np.max(p_el_heater_fixed)), 0.0)
     m_grid = float(np.max(p_ue) + max_boiler + battery_power + 1.0)
     m_pv = float(np.max(p_pv) + 1.0)
+
+    def in_window(hour, window):
+        """Félig nyílt napi időablak: [kezdés, befejezés)."""
+        start, stop = map(float, window)
+        return start <= hour < stop if start <= stop else hour >= start or hour < stop
 
     def vars_(prefix, upper=None, count=T):
         return [pulp.LpVariable(f"{prefix}_{t}", lowBound=0, upBound=upper) for t in range(count)]
@@ -104,16 +161,45 @@ def individual_opt_bess_boiler(
     d_export = [pulp.LpVariable(f"d_export_{t}", 0, 1, cat=binary) for t in steps]
 
     if hss_active:
+        thermal_capacity = vol_hss_water * c_hss
+        e_abs_min = thermal_capacity * (T_abs_min - T_in)
+        e_comfort = thermal_capacity * (T_comfort - T_in)
+        e_setpoint_min = thermal_capacity * (T_setpoint_min - T_in)
+        e_hss_max = thermal_capacity * (T_max - T_in)
+        e_initial = thermal_capacity * (T_initial - T_in)
         p_elh = vars_("p_elh", float(size_elh))
         p_hss_in = vars_("p_hss_in")
         p_hss_out = vars_("p_hss_out")
-        t_hss = [pulp.LpVariable(f"t_hss_{t}", T_min, T_max) for t in range(T + 1)]
-        d_cl = [pulp.LpVariable(f"d_cl_{t}", 0, 1, cat=binary) for t in steps]
-        d_cl_start = [pulp.LpVariable(f"d_cl_start_{t}", 0, 1, cat=binary) for t in steps]
+        e_hss = [
+            pulp.LpVariable(f"e_hss_{t}", e_abs_min, e_hss_max)
+            for t in range(T + 1)
+        ]
+
+        day_steps = int(round(24.0 / dt))
+        if abs(day_steps * dt - 24.0) > 1e-9:
+            raise ValueError("A dt-nek maradék nélkül kell osztania a 24 órát.")
+        setpoint_at_step = {}
+        setpoint_windows = []
+        for day_start in range(0, T, day_steps):
+            for label, window in (("morning", morning_block), ("evening", evening_block)):
+                start_hour = float(window[0])
+                start_offset = int(round(start_hour / dt))
+                if abs(start_offset * dt - start_hour) > 1e-9:
+                    raise ValueError("A tiltott sávok kezdetének a dt időrácsára kell esnie.")
+                start_step = day_start + start_offset
+                if start_step < T:
+                    setpoint = pulp.LpVariable(
+                        f"boiler_setpoint_{label}_{day_start // day_steps}",
+                        T_setpoint_min,
+                        T_max,
+                    )
+                    setpoint_at_step[start_step] = setpoint
+                    setpoint_windows.append((start_step, window, setpoint))
     else:
         p_elh = p_hss_in = p_hss_out = [0.0] * T
-        t_hss = [0.0] * (T + 1)
-        d_cl = d_cl_start = [0.0] * T
+        e_hss = [0.0] * (T + 1)
+        setpoint_at_step = {}
+        setpoint_windows = []
 
     if bess_active:
         e_min, e_max = size_bess * soc_bess_min, size_bess * soc_bess_max
@@ -137,12 +223,32 @@ def individual_opt_bess_boiler(
             model += pv_boiler[t] + bess_boiler[t] + grid_boiler[t] == p_elh[t]
             model += p_hss_in[t] == eta_elh * p_elh[t]
             model += p_hss_out[t] == p_dhw[t]
-            model += vol_hss_water * c_hss * (t_hss[t + 1] - t_hss[t]) == dt * (
-                p_hss_in[t] - p_hss_out[t] - a_hss * (t_hss[t] - T_env)
+            equivalent_temperature = T_in + e_hss[t] / thermal_capacity
+            model += e_hss[t + 1] == e_hss[t] + dt * (
+                p_hss_in[t]
+                - p_hss_out[t]
+                - a_hss * (equivalent_temperature - T_env)
             )
-            model += p_hss_out[t] <= vol_hss_water * c_hss * (t_hss[t] - T_in) / dt
-            model += p_hss_in[t] <= vol_hss_water * c_hss * (T_max - t_hss[t]) / dt
-            model += p_elh[t] <= size_elh * d_cl[t]
+            # A vételezéshez szükséges hőenergiának már a lépés elején a
+            # tárolóban kell lennie. Nincs külön 40 °C-os átlaghőmérséklet-korlát.
+            model += dt * p_hss_out[t] <= e_hss[t] - e_abs_min
+            model += dt * p_hss_in[t] <= e_hss_max - e_hss[t]
+
+            hour = (t * dt) % 24.0
+            blocked = in_window(hour, morning_block) or in_window(hour, evening_block)
+            if blocked:
+                # A bojler a tiltott sávban sem hálózatból, sem saját PV-ből,
+                # sem BESS-ből nem kaphat energiát.
+                model += p_elh[t] == 0
+                model += grid_boiler[t] == 0
+                model += pv_boiler[t] == 0
+                model += bess_boiler[t] == 0
+
+            if t in setpoint_at_step:
+                # Lineáris kapcsolat: E = V*c*(T_setpoint-T_in).
+                model += e_hss[t] == thermal_capacity * (
+                    setpoint_at_step[t] - T_in
+                )
         elif fixed_boiler_active:
             # A mért profil változatlanul a külön B tarifás körön marad.
             model += pv_boiler[t] == 0
@@ -187,8 +293,8 @@ def individual_opt_bess_boiler(
         model += pv_export[t] <= m_pv * d_export[t]
 
     if hss_active:
-        model += t_hss[0] == T_set
-        model += t_hss[T] >= T_set
+        model += e_hss[0] == e_initial
+        model += e_hss[T] >= e_setpoint_min
     if bess_active:
         model += e_bess[0] == size_bess * soc_bess_init
 
@@ -207,20 +313,6 @@ def individual_opt_bess_boiler(
                 )
             else:
                 model.addConstraint(starts[t] == 0, f"{prefix}_no_late_start_{t}")
-
-    if hss_active and enforce_cl_rules:
-        add_start_and_minimum(d_cl, d_cl_start, cl_min_activation_hours, "cl")
-        day_steps = int(round(24 / dt))
-        if abs(day_steps * dt - 24) > 1e-9:
-            raise ValueError("A dt-nek maradék nélkül kell osztania a 24 órát.")
-        max_steps = int(round(cl_max_on_hours_per_day / dt))
-        midday_min = int(round(cl_min_midday_hours_per_day / dt))
-        midday_start, midday_stop = int(round(10 / dt)), int(round(16 / dt))
-        for start in range(0, T, day_steps):
-            if start + day_steps > T:
-                continue
-            model += pulp.lpSum(d_cl[t] for t in range(start, start + day_steps)) <= max_steps
-            model += pulp.lpSum(d_cl[t] for t in range(start + midday_start, start + midday_stop)) >= midday_min
 
     if bess_active:
         add_start_and_minimum(d_charge, d_charge_start, bess_min_activation_hours, "charge")
@@ -263,6 +355,21 @@ def individual_opt_bess_boiler(
     def values(items):
         return np.asarray([float(pulp.value(v) or 0.0) for v in items], dtype=float)
 
+    e_hss_values = values(e_hss)
+    if hss_active:
+        t_hss_values = T_in + e_hss_values / thermal_capacity
+        d_cl_values = (values(p_elh) > 1e-6).astype(float)
+        d_cl_start_values = np.zeros(T)
+        if T:
+            d_cl_start_values[0] = d_cl_values[0]
+            d_cl_start_values[1:] = np.maximum(
+                d_cl_values[1:] - d_cl_values[:-1], 0.0
+            )
+    else:
+        t_hss_values = np.zeros(T + 1)
+        d_cl_values = np.zeros(T)
+        d_cl_start_values = np.zeros(T)
+
     result = {
         "status": status_text,
         "objective_value": float(pulp.value(model.objective)),
@@ -284,9 +391,12 @@ def individual_opt_bess_boiler(
         "p_elh": values(p_elh),
         "p_hss_in": values(p_hss_in),
         "p_hss_out": values(p_hss_out),
-        "t_hss": values(t_hss),
-        "d_cl": values(d_cl),
-        "d_cl_start": values(d_cl_start),
+        "e_hss": e_hss_values,
+        # Diagnosztikai ekvivalens átlaghőmérséklet; nem vezérlési korlát.
+        "t_hss": t_hss_values,
+        "d_cl": d_cl_values,
+        "d_cl_start": d_cl_start_values,
+        "d_below_comfort": np.zeros(T),
         "hss_active": int(hss_active),
         "bess_active": int(bess_active),
         "battery_power_kw": float(battery_power),
@@ -296,6 +406,82 @@ def individual_opt_bess_boiler(
         "grid_import_b_low_kwh": float(pulp.value(import_b_low) or 0.0),
         "grid_import_b_high_kwh": float(pulp.value(import_b_high) or 0.0),
     }
+    if hss_active:
+        temperatures = result["t_hss"][:T]
+        below = temperatures < T_comfort - 1e-6
+        blocked_mask = np.asarray([
+            in_window((t * dt) % 24.0, morning_block)
+            or in_window((t * dt) % 24.0, evening_block)
+            for t in steps
+        ], dtype=float)
+        target = np.full(T, T_setpoint_min, dtype=float)
+        optimized_setpoints = []
+        for start_step, window, setpoint_var in setpoint_windows:
+            setpoint_value = float(pulp.value(setpoint_var) or T_setpoint_min)
+            optimized_setpoints.append(setpoint_value)
+            day_start = (start_step // day_steps) * day_steps
+            for t in range(day_start, min(day_start + day_steps, T)):
+                if in_window((t * dt) % 24.0, window):
+                    target[t] = setpoint_value
+        longest_steps = current_steps = 0
+        for is_below in below:
+            current_steps = current_steps + 1 if is_below else 0
+            longest_steps = max(longest_steps, current_steps)
+        result["below_comfort"] = below.astype(float)
+        result["d_below_comfort"] = below.astype(float)
+        result["d_heat"] = (result["p_elh"] > 1e-6).astype(float)
+        result["heating_blocked"] = blocked_mask
+        result["boiler_target_C"] = target
+        result["longest_continuous_below_40_h"] = float(longest_steps * dt)
+        below_with_dhw = below & (p_dhw > 1e-9)
+        result["dhw_while_below_40_steps"] = int(np.count_nonzero(below_with_dhw))
+        dhw_energy_margin = result["e_hss"][:T] - e_abs_min - dt * p_dhw
+        result["minimum_dhw_energy_margin_kwhth"] = float(np.min(dhw_energy_margin))
+        result["dhw_energy_shortfall_steps"] = int(
+            np.count_nonzero(dhw_energy_margin < -1e-6)
+        )
+        result["optimized_setpoint_min_C"] = (
+            float(np.min(optimized_setpoints)) if optimized_setpoints else T_setpoint_min
+        )
+        result["optimized_setpoint_max_C"] = (
+            float(np.max(optimized_setpoints)) if optimized_setpoints else T_setpoint_min
+        )
+        blocked_boiler_power = (
+            result["p_grid_boiler"]
+            + result["p_pv_boiler"]
+            + result["p_bess_boiler"]
+        )
+        if float(np.min(result["e_hss"])) < e_abs_min - 1e-5:
+            control_status = "FAIL_ABSOLUTE_MIN"
+        elif np.any((blocked_boiler_power > 1e-6) & (blocked_mask > 0.5)):
+            control_status = "FAIL_BOILER_ENERGY_IN_BLOCKED_WINDOW"
+        elif result["dhw_energy_shortfall_steps"]:
+            control_status = "FAIL_DHW_ENERGY_SHORTFALL"
+        else:
+            control_status = "PASS"
+        result["boiler_control_status"] = control_status
+    else:
+        result.update({
+            "below_comfort": np.zeros(T),
+            "d_heat": np.zeros(T),
+            "heating_blocked": np.zeros(T),
+            "boiler_target_C": np.zeros(T),
+            "longest_continuous_below_40_h": 0.0,
+            "dhw_while_below_40_steps": 0,
+            "minimum_dhw_energy_margin_kwhth": 0.0,
+            "dhw_energy_shortfall_steps": 0,
+            "optimized_setpoint_min_C": 0.0,
+            "optimized_setpoint_max_C": 0.0,
+            "boiler_control_status": "NOT_APPLICABLE",
+        })
+    result["calculation_mode"] = "optimization"
+    return _finish_bill(result, dt, price_grid_a_low, price_grid_a_high,
+                        price_grid_b_low, price_grid_b_high, price_pv_grid)
+
+
+def _finish_bill(result, dt, price_grid_a_low, price_grid_a_high,
+                 price_grid_b_low, price_grid_b_high, price_pv_grid):
+    """Azonos pénzügyi összesítés a közvetlen és optimalizált ágon."""
     result["grid_import_a_kwh"] = result["grid_import_a_low_kwh"] + result["grid_import_a_high_kwh"]
     result["grid_import_b_kwh"] = result["grid_import_b_low_kwh"] + result["grid_import_b_high_kwh"]
     result["grid_import_total_kwh"] = result["grid_import_a_kwh"] + result["grid_import_b_kwh"]

@@ -10,6 +10,14 @@ import numpy as np
 import pandas as pd
 
 
+
+RESULTS_DIR = "../OptimizedScenarios/results_3d_I"
+HOUSEHOLD = "0420144653449093"
+WINDOW_DAYS = 3
+DT = 0.25
+DPI = 200
+
+
 def _load(results_dir: Path, household: str) -> tuple[pd.DataFrame, Path]:
     exact = results_dir / f"timeseries_{household}.csv"
     matches = [exact] if exact.exists() else sorted(results_dir.glob(f"timeseries_*{household}*.csv"))
@@ -91,12 +99,37 @@ def plot_household(results_dir, household, *, window_days=3, dt=0.25, dpi=200):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results", default="results_3d_I")
-    parser.add_argument("--household", required=True)
-    parser.add_argument("--window-days", type=int, default=3)
-    parser.add_argument("--dt", type=float, default=0.25)
+    parser.add_argument("--results", default=None)
+    parser.add_argument("--household", default=None)
+    parser.add_argument("--window-days", type=int, default=None)
+    parser.add_argument("--dt", type=float, default=None)
+    parser.add_argument("--dpi", type=int, default=None)
     args = parser.parse_args(argv)
-    for path in plot_household(args.results, args.household, window_days=args.window_days, dt=args.dt):
+
+    script_dir = Path(__file__).resolve().parent
+    configured_results = Path(RESULTS_DIR).expanduser()
+    if not configured_results.is_absolute():
+        configured_results = script_dir / configured_results
+
+    results_dir = Path(args.results).expanduser() if args.results else configured_results
+    if args.results and not results_dir.is_absolute():
+        results_dir = Path.cwd() / results_dir
+
+    household = args.household or HOUSEHOLD
+    window_days = args.window_days if args.window_days is not None else WINDOW_DAYS
+    dt = args.dt if args.dt is not None else DT
+    dpi = args.dpi if args.dpi is not None else DPI
+
+    if not household:
+        raise ValueError("Add meg a HOUSEHOLD értékét a FUTTATÁSI BEÁLLÍTÁSOK blokkban.")
+
+    for path in plot_household(
+        results_dir,
+        household,
+        window_days=window_days,
+        dt=dt,
+        dpi=dpi,
+    ):
         print(f"Mentve: {path}")
 
 
