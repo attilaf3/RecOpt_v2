@@ -37,6 +37,9 @@ def simulate(
     bess_share_pct: float,
     sharing_mode: SharingMode = "proportional",
     boiler_min_activation_hours: float = 2.0,
+    hp_baseline: bool = False,
+    hp_tariff_mode: str = "GEO",
+    save_outputs: bool = True,
 ) -> dict:
     tariff = boiler_tariff.upper()
     if rule_based_boiler and tariff != "A":
@@ -51,11 +54,21 @@ def simulate(
         min_activation_hours=boiler_min_activation_hours,
     )
     e_pv, e_base = data.e_pv, data.e_base
+    e_hp = data.e_hp if hp_baseline else np.zeros_like(e_base)
+    if hp_tariff_mode == "GEO":
+        hp_on_a = np.zeros(e_base.shape[1], dtype=bool)
+    elif hp_tariff_mode == "PV_A_ELSE_GEO":
+        hp_on_a = e_pv.sum(axis=0) > EPS
+    else:
+        raise ValueError(f"Unknown HP tariff mode: {hp_tariff_mode}")
+    e_hp_a = np.where(hp_on_a[None, :], e_hp, 0.0)
+    e_hp_geo = e_hp - e_hp_a
+    e_base_a = e_base + e_hp_a
     n, users = e_base.shape
     dynamic_boiler = np.asarray(boiler_diag["dynamic"], dtype=bool)
     e_boiler_a = np.where(dynamic_boiler[None, :], e_boiler, 0.0)
     e_boiler_b = np.where(dynamic_boiler[None, :], 0.0, e_boiler)
-    e_load = e_base + e_boiler_a + e_boiler_b
+    e_load = e_base_a + e_boiler_a + e_boiler_b + e_hp_geo
     bess_enabled = _select_bess(data, bess_share_pct)
 
     names = (
@@ -82,7 +95,7 @@ def simulate(
         boiler_need = np.zeros(users)
         for u in range(users):
             use_bess = bool(bess_enabled[u])
-            dispatch_load = e_base[t, u] + e_boiler_a[t, u]
+            dispatch_load = e_base_a[t, u] + e_boiler_a[t, u]
             pv = e_pv[t, u]
 
             if use_bess:
@@ -144,9 +157,9 @@ def simulate(
                 flow["e_bess_local_to_load"][t, u] = local_discharge
 
             local_supply = pv_to_load + discharge
-            local_base = min(e_base[t, u], local_supply)
+            local_base = min(e_base_a[t, u], local_supply)
             local_boiler = min(e_boiler_a[t, u], max(local_supply - local_base, 0.0))
-            base_need[u] = max(e_base[t, u] - local_base, 0.0)
+            base_need[u] = max(e_base_a[t, u] - local_base, 0.0)
             boiler_need[u] = max(e_boiler_a[t, u] - local_boiler, 0.0)
             flow["e_local_to_base"][t, u] = local_base
             flow["e_local_to_boiler"][t, u] = local_boiler
@@ -194,24 +207,29 @@ def simulate(
         blocked_boiler = e_boiler_a * boiler_diag["heating_blocked"]
         if np.max(np.abs(blocked_boiler)) > 1e-9:
             raise RuntimeError("A rule-based bojler energiát kapott a tiltott időszakban.")
-    finance = settle(grid_a, grid_b, flow["e_grid_export"], flow["e_shared_in"], flow["e_shared_out"])
+    grid_geo = e_hp_geo.copy()
+    finance = settle(grid_a, grid_b, flow["e_grid_export"], flow["e_shared_in"],
+                     flow["e_shared_out"], grid_geo=grid_geo)
     per_user, summary = _summaries(
-        data, e_boiler, e_load, flow, finance, bess_enabled,
+        data, e_boiler, e_hp, e_hp_geo, e_load, flow, finance, bess_enabled,
         case_name, tariff, community_settlement, bess_share_pct, boiler_diag,
     )
-    flow.update({"e_load": e_load, "e_base": e_base, "e_boiler": e_boiler,
+    flow.update({"e_load": e_load, "e_base": e_base, "e_hp": e_hp,
+                 "e_hp_a": e_hp_a, "e_hp_geo": e_hp_geo,
+                 "e_grid_import_geo": grid_geo, "e_boiler": e_boiler,
                  "e_boiler_a": e_boiler_a, "e_boiler_b": e_boiler_b, "e_pv": e_pv,
                  "e_grid_import_a": grid_a, "e_grid_import_b": grid_b})
-    save_results(
-        out_dir, data.user_names, per_user, summary, flow,
-        sharing=community_settlement, bess=bool(bess_enabled.any()),
-        boiler_diagnostics=boiler_diag if rule_based_boiler else None,
-        pair_kwh=finance["pair_kwh"], pair_payment=finance["pair_payment"],
-    )
+    if save_outputs:
+        save_results(
+            out_dir, data.user_names, per_user, summary, flow,
+            sharing=community_settlement, bess=bool(bess_enabled.any()),
+            boiler_diagnostics=boiler_diag if rule_based_boiler else None,
+            pair_kwh=finance["pair_kwh"], pair_payment=finance["pair_payment"],
+        )
     return {"per_user": per_user, "summary": summary, "timeseries": flow}
 
 
-def _summaries(data, e_boiler, e_load, flow, finance, bess_enabled, case_name, tariff,
+def _summaries(data, e_boiler, e_hp, e_hp_geo, e_load, flow, finance, bess_enabled, case_name, tariff,
                community_settlement, bess_share_pct, boiler_diag):
     rows = []
     for u, name in enumerate(data.user_names):
@@ -222,15 +240,22 @@ def _summaries(data, e_boiler, e_load, flow, finance, bess_enabled, case_name, t
         row = {
             "user_name": name, "has_pv": bool(pv > EPS), "has_bess": bool(bess_enabled[u]),
             "has_boiler": bool(e_boiler[:, u].sum() > EPS), "base_load_kwh": float(data.e_base[:, u].sum()),
-            "boiler_kwh": float(e_boiler[:, u].sum()), "total_load_kwh": load, "pv_kwh": pv,
+            "boiler_kwh": float(e_boiler[:, u].sum()),
+            "hp_kwh": float(e_hp[:, u].sum()), "has_hp": bool(e_hp[:, u].sum() > EPS),
+            "hp_tariff": ("GEO" if e_hp_geo[:, u].sum() > EPS else "A")
+                         if e_hp[:, u].sum() > EPS else "",
+            "total_load_kwh": load, "pv_kwh": pv,
             "group_label": "PV+BESS" if bess_enabled[u] else "PV" if pv > EPS else "Nincs PV",
             "Pmax_kw": float(np.max(e_load[:, u] / DT)) if len(e_load) else 0.0,
             "grid_import_a_kwh": float((flow["e_grid_to_base"][:, u] + flow["e_grid_to_bess"][:, u] + flow["e_grid_to_boiler_a"][:, u]).sum()),
             "grid_import_b_kwh": float(flow["e_grid_to_boiler_b"][:, u].sum()),
+            "grid_import_geo_kwh": float(e_hp_geo[:, u].sum()),
+            "geo_cost_ft": float(finance["grid_geo_cost"][u]),
             "grid_export_kwh": float(flow["e_grid_export"][:, u].sum()),
             "SCI": float(np.clip(self_consumed / pv if pv > EPS else 0.0, 0.0, 1.0)),
             "SSI": float(np.clip(local_supply / load if load > EPS else 0.0, 0.0, 1.0)),
-            "grid_import_cost_ft": float(finance["grid_a_cost"][u] + finance["grid_b_cost"][u]),
+            "grid_import_cost_ft": float(finance["grid_a_cost"][u] + finance["grid_b_cost"][u]
+                                         + finance["grid_geo_cost"][u]),
             "grid_export_revenue_ft": float(finance["grid_export_revenue"][u]),
             "brt_bill_ft": float(finance["bill"][u]),
         }
@@ -282,3 +307,4 @@ def _summaries(data, e_boiler, e_load, flow, finance, bess_enabled, case_name, t
     summary["SCI"] = consumed / total_pv if total_pv > EPS else 0.0
     summary["SSI"] = supplied / total_load if total_load > EPS else 0.0
     return frame, summary
+

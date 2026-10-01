@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from nonopt_hp import load_hp_profiles
+
 
 DT = 0.25
 N_STEPS = 35040
@@ -39,6 +41,7 @@ class NonoptInput:
     t_set: np.ndarray
     a_hss: np.ndarray
     eta_elh: np.ndarray
+    e_hp: np.ndarray
 
 
 def _profile(frame: pd.DataFrame, name: object) -> np.ndarray:
@@ -64,12 +67,14 @@ def load_inputs(
     profiles_csv: str | Path,
     dhw_profiles_csv: str | Path,
     max_users: int = 105,
+    hp_profiles_csv: str | Path | None = None,
 ) -> NonoptInput:
     sim_path = Path(sim_yaml)
     profiles = pd.read_csv(profiles_csv, index_col=0)
     profiles.columns = profiles.columns.map(str)
     dhw = pd.read_csv(dhw_profiles_csv, index_col=0)
     dhw.columns = dhw.columns.map(str)
+    hp_profiles = load_hp_profiles(hp_profiles_csv) if hp_profiles_csv is not None else None
 
     config = yaml.safe_load(sim_path.read_text(encoding="utf-8")) or {}
     excluded = {"battery", "bess", "community"}
@@ -82,8 +87,9 @@ def load_inputs(
     ]
 
     names: list[str] = []
+    matched_hp_cols: set[str] = set()
     columns: dict[str, list] = {key: [] for key in (
-        "e_pv e_base e_boiler_measured p_dhw size_bess eta_bess_in eta_bess_out "
+        "e_pv e_base e_boiler_measured e_hp p_dhw size_bess eta_bess_in eta_bess_out "
         "eta_bess_stor soc_bess_min soc_bess_max t_bess_min size_elh vol_hss_water "
         "t_env t_max t_min t_in t_set a_hss eta_elh"
     ).split()}
@@ -101,6 +107,15 @@ def load_inputs(
         columns["e_base"].append(_profile(profiles, ue.get("profile")))
         columns["e_pv"].append(_profile(profiles, pv.get("profile")))
         columns["e_boiler_measured"].append(_profile(profiles, ut.get("profile")))
+        hp_block = units.get("heat_pump") or {}
+        hp_col = str(hp_block.get("profile_id", "")) if isinstance(hp_block, dict) else ""
+        if hp_profiles is not None and hp_col in hp_profiles.columns:
+            if hp_col in matched_hp_cols:
+                raise ValueError(f"Repeated HP profile_id: {hp_col}")
+            columns["e_hp"].append(hp_profiles[hp_col].to_numpy(dtype=float))
+            matched_hp_cols.add(hp_col)
+        else:
+            columns["e_hp"].append(np.zeros(N_STEPS))
 
         liters = _profile(dhw, hss.get("profile"))
         delta_t = max(float(hss.get("T_out", 40.0)) - float(hss.get("T_in", 10.0)), 0.0)
@@ -129,9 +144,13 @@ def load_inputs(
 
     if not names:
         raise RuntimeError("Nincs feldolgozható felhasználó.")
+    if hp_profiles is not None and matched_hp_cols != set(hp_profiles.columns):
+        missing = sorted(set(hp_profiles.columns) - matched_hp_cols)
+        raise ValueError(f"HP profiles without a selected users_v3 YAML: {missing}")
 
     matrices = {key: np.column_stack(columns[key]).astype(float) for key in (
-        "e_pv", "e_base", "e_boiler_measured", "p_dhw"
+        "e_pv", "e_base", "e_boiler_measured", "e_hp", "p_dhw"
     )}
     vectors = {key: np.asarray(columns[key], dtype=float) for key in columns if key not in matrices}
     return NonoptInput(user_names=names, **matrices, **vectors)
+

@@ -12,9 +12,10 @@ B_LOW_LIMIT = 2523.0
 B_LOW_PRICE = 22.962
 B_HIGH_PRICE = 60.935
 GRID_EXPORT_PRICE = 5.25
+GEO_PRICE_FT_PER_KWH = 23.368
 SHARED_LOW_PRICE = 5.25
-SHARED_HIGH_PRICE = 22.0
-SHARED_RHD = A_LOW_PRICE - SHARED_LOW_PRICE
+SHARED_HIGH_PRICE = 23.527
+SHARED_RHD = 29.718
 EPS = 1e-12
 
 
@@ -31,13 +32,14 @@ def settle(
     grid_export: np.ndarray,
     shared_in: np.ndarray,
     shared_out: np.ndarray,
+    grid_geo: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Felhasználói elszámolás; a shared és grid A ugyanazt a kedvezményes sávot használja."""
     n, users = grid_a.shape
     remaining = np.full(users, A_LOW_LIMIT)
     arrays = {name: np.zeros(users) for name in (
         "grid_a_low", "grid_a_high", "grid_b_low", "grid_b_high",
-        "grid_a_cost", "grid_b_cost", "shared_low", "shared_high",
+        "grid_a_cost", "grid_b_cost", "grid_geo_cost", "shared_low", "shared_high",
         "shared_energy_cost", "shared_rhd_cost", "shared_revenue",
         "grid_export_revenue", "bill"
     )}
@@ -83,10 +85,15 @@ def settle(
         arrays["grid_b_high"][u] = b_high
         arrays["grid_b_cost"][u] = b_cost
     arrays["grid_a_cost"] = arrays["grid_a_low"] * A_LOW_PRICE + arrays["grid_a_high"] * A_HIGH_PRICE
+    if grid_geo is not None:
+        geo = np.asarray(grid_geo, dtype=float)
+        if geo.shape != grid_a.shape or not np.isfinite(geo).all() or (geo < 0).any():
+            raise ValueError("Invalid separate Geo load array")
+        arrays["grid_geo_cost"] = geo.sum(axis=0) * GEO_PRICE_FT_PER_KWH
     arrays["shared_rhd_cost"] = shared_in.sum(axis=0) * SHARED_RHD
     arrays["grid_export_revenue"] = grid_export.sum(axis=0) * GRID_EXPORT_PRICE
     arrays["bill"] = (
-        arrays["grid_a_cost"] + arrays["grid_b_cost"]
+        arrays["grid_a_cost"] + arrays["grid_b_cost"] + arrays["grid_geo_cost"]
         + arrays["shared_energy_cost"] + arrays["shared_rhd_cost"]
         - arrays["shared_revenue"] - arrays["grid_export_revenue"]
     )
