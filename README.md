@@ -180,16 +180,3 @@ Annual savings relative to the baseline are calculated as:
 savings_HUF = annual_bill_0-I - annual_bill_selected_scenario
 savings_pct = 100 * savings_HUF / annual_bill_0-I
 ```
-
-## Troubleshooting
-
-- **Missing household YAML:** check the `users_list` entries, search directory and letter case. Skipped households can reduce the actual household count below `MAX_USERS`.
-- **Missing CSV column:** check the YAML profile references. Some loaders continue with a zero profile when a referenced profile is missing.
-- **Incorrect profile length:** the annual runner expects 35,040 rows. Shorter or leap-year datasets may require changes to the loading logic.
-- **Gurobi fails to start:** check the installation, licence and availability of `gurobi_cl` when using the command-line solver.
-- **High memory usage:** first check the configuration with a small number of households. The annual community model can require substantial memory; passive consumer aggregation must be supported by the implementation for the selected sharing mode.
-- **Infeasible or interrupted optimisation:** inspect the solver status and logs, device sizes, initial states and operational constraints. The existence of an output file alone does not confirm an optimal solution.
-
-## Reproducibility
-
-For each result, retain the code version, input data version, actual household list, BESS allocation, tariff parameters, sharing mode and solver settings. This documentation is based on the available runners; the file names and configurations in the selected checkout are authoritative.
