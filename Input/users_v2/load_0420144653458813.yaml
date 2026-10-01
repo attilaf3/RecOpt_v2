@@ -1,0 +1,82 @@
+units:
+  hss:
+    T_env: '20.0'
+    T_in: '10.0'
+    T_max: '65.0'
+    T_min: '18.0'
+    T_out: '40.0'
+    T_set: '50.0'
+    a_hss: 0.00125
+    c_hss: 0.00116667
+    eta_elh: 0.95
+    profile: 0420144653458813
+    size: 120.0
+    size_elh: 1.8
+    t_hss_in: 4.2
+    t_hss_min_in: 4
+    t_hss_min_out: 1
+    vol_hss_water: 120.0
+  name:
+    name: 0420144653458813
+  pv:
+    profile: '8'
+    size: 8184.378
+  ue:
+    profile: '25'
+    size: 3280.853
+  ut:
+    profile: '29'
+    size: 2520.8995
+  bess:
+    bess_size: '22.656'
+    eta_bess_in: '0.98'
+    eta_bess_out: '0.96'
+    eta_bess_stor: '0.995'
+    eta_self_discharge: '1.0'
+    soc_bess_max: '0.9'
+    soc_bess_min: '0.1'
+    t_bess_min: '3'
+  heat_pump:
+    profile_id: hp_load_0420144653458813
+    source_profile_id: hp_load_0420144888235617
+    profile_unit: kWh/step
+    household_parameters:
+      Aref: 116.53546383102743
+      h: 2.542219259524266
+      Htr: 148.10146337337866
+      Hve: 52.90714413588475
+      U_window: 1.0342717593026611
+      window_total: 18.399375887625727
+      Awin_raw:
+        E: 8.885924114683233
+        S: 0.227931837204153
+        W: 8.69167462827873
+        N: 0.17595773249520186
+      model_5r2c:
+        C_air_kWh_per_K: 0.5036397909670135
+        C_mass_kWh_per_K: 9.063869409079912
+        H_tr_kW_per_K: 0.14810146337337865
+        H_tr_op_kW_per_K: 0.12907150850401305
+        H_em_kW_per_K: 0.13452942537764753
+        H_w_kW_per_K: 0.019029954869365623
+        H_ms_kW_per_K: 3.1814181625870486
+        H_is_kW_per_K: 1.809213075976701
+        H_v_kW_per_K: 0.05290714413588475
+        R_em_K_per_kW: 7.433318006026012
+        R_w_K_per_kW: 52.54873208395243
+        R_ms_K_per_kW: 0.3143252313574602
+        R_is_K_per_kW: 0.5527264937879977
+        R_v_K_per_kW: 18.901039100346015
+    heat_pump_parameters:
+      tariff: A
+      cop_heating: 3.5
+      eer_cooling: 3.2
+      p_heat_th_max_kw: 7.95994085736683
+      p_cool_th_max_kw: 7.95994085736683
+      heating_setpoint_c: 22.0
+      cooling_setpoint_c: 25.0
+      heating_critical_c: 20.0
+      heating_emergency_c: 18.0
+      cooling_critical_c: 26.0
+      cooling_emergency_c: 27.0
+      precondition_delta_c: 1.0

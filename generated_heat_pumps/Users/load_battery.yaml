@@ -1,0 +1,14 @@
+units:
+  bess:
+    bess_params:
+      bess_size: 50.0
+      eta_bess_in: 0.98
+      eta_bess_out: 0.96
+      eta_bess_stor: 0.995
+      eta_self_discharge: 1.0
+      soc_bess_max: 1
+      soc_bess_min: 0.2
+      t_bess_min: 2
+    size: 50
+  name:
+    name: battery

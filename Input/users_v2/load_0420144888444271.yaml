@@ -1,0 +1,29 @@
+units:
+  hss:
+    T_env: '20.0'
+    T_in: '10.0'
+    T_max: '65.0'
+    T_min: '18.0'
+    T_out: '40.0'
+    T_set: '50.0'
+    a_hss: 0.00125
+    c_hss: 0.00116667
+    eta_elh: 0.95
+    profile: 0420144888444271
+    size: 120.0
+    size_elh: 1.8
+    t_hss_in: 4.2
+    t_hss_min_in: 4
+    t_hss_min_out: 1
+    vol_hss_water: 120.0
+  name:
+    name: 0420144888444271
+  ue:
+    profile: '146'
+    size: 3398.556
+  ut:
+    profile: '135'
+    size: 1481.5685
+  pv:
+    profile: pv_v3_load_0420144888444271
+    size: 4880.1245

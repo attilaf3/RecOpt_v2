@@ -1,0 +1,38 @@
+units:
+  hss:
+    T_env: '20.0'
+    T_in: '10.0'
+    T_max: '65.0'
+    T_min: '18.0'
+    T_out: '40.0'
+    T_set: '50.0'
+    a_hss: 0.00125
+    c_hss: 0.00116667
+    eta_elh: 0.95
+    profile: 0420144888295341
+    size: 120.0
+    size_elh: 1.8
+    t_hss_in: 4.2
+    t_hss_min_in: 4
+    t_hss_min_out: 1
+    vol_hss_water: 120.0
+  name:
+    name: 0420144888295341
+  ue:
+    profile: '70'
+    size: 3036.1485000000002
+  ut:
+    profile: '55'
+    size: 1758.54775
+  pv:
+    profile: pv_v3_load_0420144888295341
+    size: 4794.69625
+  bess:
+    bess_size: '10.549'
+    eta_bess_in: '0.98'
+    eta_bess_out: '0.96'
+    eta_bess_stor: '0.995'
+    eta_self_discharge: '1.0'
+    soc_bess_max: '0.9'
+    soc_bess_min: '0.1'
+    t_bess_min: '3'

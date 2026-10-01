@@ -1,0 +1,50 @@
+units:
+  name:
+    name: 0420144653463289
+  ue:
+    profile: '35'
+    size: 7058.02125
+  heat_pump:
+    profile_id: hp_load_0420144653463289
+    source_profile_id: hp_load_0420144653462282
+    profile_unit: kWh/step
+    household_parameters:
+      Aref: 110.02031878479501
+      h: 2.4672606152285304
+      Htr: 64.68615292160226
+      Hve: 45.716946585439004
+      U_window: 0.9509757694493101
+      window_total: 18.59809694173342
+      Awin_raw:
+        E: 6.062131650379962
+        S: 4.1600328064615795
+        W: 6.057596980886437
+        N: 3.7729504616469467
+      model_5r2c:
+        C_air_kWh_per_K: 0.46146295900144113
+        C_mass_kWh_per_K: 8.557135905484056
+        H_tr_kW_per_K: 0.06468615292160226
+        H_tr_op_kW_per_K: 0.046999813372144456
+        H_em_kW_per_K: 0.04774696082572185
+        H_w_kW_per_K: 0.017686339549457798
+        H_ms_kW_per_K: 3.003554702824904
+        H_is_kW_per_K: 1.7080654491339426
+        H_v_kW_per_K: 0.045716946585439004
+        R_em_K_per_kW: 20.94374139644273
+        R_w_K_per_kW: 56.54081203199881
+        R_ms_K_per_kW: 0.33293883379566214
+        R_is_K_per_kW: 0.5854576594281208
+        R_v_K_per_kW: 21.873726805685298
+    heat_pump_parameters:
+      tariff: A
+      cop_heating: 3.5
+      eer_cooling: 3.2
+      p_heat_th_max_kw: 4.371962740478834
+      p_cool_th_max_kw: 4.371962740478834
+      heating_setpoint_c: 22.0
+      cooling_setpoint_c: 25.0
+      heating_critical_c: 20.0
+      heating_emergency_c: 18.0
+      cooling_critical_c: 26.0
+      cooling_emergency_c: 27.0
+      precondition_delta_c: 1.0

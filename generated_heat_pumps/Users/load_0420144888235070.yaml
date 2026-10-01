@@ -1,0 +1,53 @@
+units:
+  hss:
+    T_env: 20.0
+    T_in: 10.0
+    T_max: 80.0
+    T_min: 10.0
+    T_out: 40.0
+    T_set: 50.0
+    a_hss: 0.001527778
+    c_hss: 0.00116667
+    eta_elh: 0.95
+    profile: 0420144888235070
+    size: 150.0
+    size_elh: 1.8
+    t_hss_in: 5.3
+    t_hss_min_in: 4
+    t_hss_min_out: 1
+    vol_hss_water: 150.0
+  name:
+    name: 0420144888235070
+  ue:
+    profile: '52'
+    size: 2224.7230000000004
+  ut:
+    profile: '56'
+    size: 3135.3255
+  heat_pump:
+    profile_id: hp_load_0420144888235070
+    profile_unit: kWh/step
+    household_parameters:
+      Aref: 106.39437407302881
+      h: 2.4926235659879823
+      Htr: 62.42346482733008
+      Hve: 48.08117069747686
+      U_window: 1.0399929698764119
+      window_total: 18.77010771172893
+      Awin_raw:
+        E: 5.954996749084952
+        S: 4.137771864866245
+        W: 5.7323082376274765
+        N: 3.612526996057807
+    heat_pump_parameters:
+      Aref: 103.16370621159545
+      h: 2.5166346277243195
+      Htr: 133.4721178030295
+      Hve: 42.271926903284054
+      U_window: 0.997608453672808
+      window_total: 13.291319537737628
+      Awin_raw:
+        E: 0.0
+        S: 0.0
+        W: 6.912792913650773
+        N: 6.908738589668775
