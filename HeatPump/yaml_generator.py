@@ -36,6 +36,23 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def save_solar_gain_profiles(
+    output_dir: Path,
+    q_sol_profiles: dict[str, np.ndarray],
+    reference_profiles: pd.DataFrame,
+) -> pd.DataFrame:
+    """Save HP-household solar gains with the same index and columns as HP profiles.
+
+    The values are thermal solar gains in kW, unlike ``heat_pump_profiles.csv``
+    whose values are electric energy in kWh/step.  Only households selected for
+    a heat pump have a ``Q_sol`` column.
+    """
+    q_sol_df = pd.DataFrame(q_sol_profiles, index=reference_profiles.index)
+    q_sol_df.index.name = reference_profiles.index.name or "timestamp"
+    q_sol_df.to_csv(output_dir / "solar_gain_profiles.csv")
+    return q_sol_df
+
+
 def generate(
     input_users: Path,
     output_dir: Path,
@@ -62,6 +79,7 @@ def generate(
     hp_indices = set(np.sort(rng.choice(len(source_files), size=n_hp, replace=False)).tolist())
     house_samples = make_house_samples(len(source_files), seed)
     hp_profiles: dict[str, np.ndarray] = {}
+    q_sol_profiles: dict[str, np.ndarray] = {}
     manifest: list[dict[str, Any]] = []
     household_rows: list[dict[str, Any]] = []
 
@@ -84,6 +102,7 @@ def generate(
             result = simulate_5r2c(idx, t_env, q_sol.values, pars, dt_h=0.25)
             profile_id = f"hp_{user_id}"
             hp_profiles[profile_id] = np.asarray(result["P_hp_el"], dtype=float) * 0.25
+            q_sol_profiles[profile_id] = q_sol.to_numpy(dtype=float)
             hp_meta = {
                 "profile_id": profile_id,
                 "profile_unit": "kWh/step",
@@ -103,10 +122,17 @@ def generate(
     if not parsed_index.isna().any():
         hp_df.index = parsed_index
     hp_df.to_csv(output_dir / "heat_pump_profiles.csv")
+    save_solar_gain_profiles(output_dir, q_sol_profiles, hp_df)
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     pd.DataFrame(household_rows).to_csv(output_dir / "household_parameters.csv", index=False)
     _plot_outputs(output_dir, hp_df, household_rows, manifest)
-    return {"users": len(source_files), "heat_pump_users": n_hp, "share_pct": 100 * n_hp / len(source_files), "output": str(output_dir)}
+    return {
+        "users": len(source_files),
+        "heat_pump_users": n_hp,
+        "share_pct": 100 * n_hp / len(source_files),
+        "output": str(output_dir),
+        "solar_gain_profiles": str(output_dir / "solar_gain_profiles.csv"),
+    }
 
 
 def _plot_outputs(output_dir: Path, profiles: pd.DataFrame, household_rows: list[dict[str, Any]], manifest: list[dict[str, Any]]) -> None:

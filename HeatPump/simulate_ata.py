@@ -520,6 +520,7 @@ def load_or_make_inputs() -> Tuple[pd.DatetimeIndex, np.ndarray, Dict[str, pd.Se
 
 # ===================== FŐPROGRAM =====================
 if __name__ == "__main__":
+
     idx, T_env, I_by_dir = load_or_make_inputs()
 
     all_params: Dict[str, R5R2CParams] = {}
@@ -558,8 +559,37 @@ if __name__ == "__main__":
     except Exception:
         mask = slice(None)
 
+    direction_labels = {"N": "Észak", "E": "Kelet", "S": "Dél", "W": "Nyugat"}
+    direction_colors = {"N": "tab:blue", "E": "tab:orange", "S": "tab:red", "W": "tab:green"}
+
     for name in HOUSES_RAW.keys():
         Q_sol, res = all_results[name]
+
+        # Az ablakfelületre beeső sugárzási teljesítmény homlokzatonként.
+        # Pontosan a solar_gain_sepsi() A_win * I részét mutatja, még az
+        # árnyékolási és üvegezési tényezők alkalmazása előtt.
+        plt.figure(figsize=(11, 3.5))
+        window_areas = all_params[name].Awin_by_dir_m2
+        for direction in ("N", "E", "S", "W"):
+            plt.plot(
+                idx[mask], I_by_dir[direction].iloc[mask] * window_areas.get(direction, 0.0),
+                label=direction_labels[direction], color=direction_colors[direction], lw=1.0,
+            )
+        window_text = "Ablakfelület [m²]\\n" + "\\n".join(
+            f"{direction_labels[direction]}: {window_areas.get(direction, 0.0):.1f}"
+            for direction in ("N", "E", "S", "W")
+        )
+        plt.gca().text(
+            0.01, 0.97, window_text,
+            transform=plt.gca().transAxes,
+            va="top", ha="left", fontsize=9,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85},
+        )
+        plt.title(f"{name}: ablakfelületre beeső sugárzási teljesítmény")
+        plt.ylabel("Sugárzási teljesítmény az ablakon (W)")
+        plt.legend(title="Homlokzat")
+        plt.tight_layout()
+        plt.show()
 
         # Hőmérsékletek
         plt.figure(figsize=(11, 4.0))
@@ -586,6 +616,12 @@ if __name__ == "__main__":
         plt.figure(figsize=(11, 3.0))
         plt.plot(idx[mask], Q_sol[mask], label="Q_sol (kW) – Sepsi (2.14)", lw=1.0)
         plt.title(f"{name}: szoláris hőnyereség")
+        plt.gca().text(
+            0.01, 0.97, window_text,
+            transform=plt.gca().transAxes,
+            va="top", ha="left", fontsize=9,
+            bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85},
+        )
         plt.legend()
         plt.tight_layout()
         plt.show()
