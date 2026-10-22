@@ -22,11 +22,15 @@ dist/
 # Logs
 *.log
 *.lp
+*.csv
+*.png
 
 # OS files
 .DS_Store
 Thumbs.db
+/Input/
 /Inputs/
+/generated_heat_pumps/
 /Discard/
 results_*/
 run_*
