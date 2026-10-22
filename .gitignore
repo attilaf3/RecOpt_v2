@@ -38,3 +38,6 @@ run_*
 outputs/
 .codex-test-deps/
 config/config.ini
+/boiler_profile_comparison/
+/figures/
+/figures_buildings/
